@@ -79,7 +79,7 @@ fn vs_leaf(@builtin(vertex_index) vid: u32,
     o.view_t = length(d);
     // Cheap time-of-day light + tumble glint (no shadow trace at this
     // budget - a falling leaf is lit as if exposed).
-    let s = sun_dir_at(camera.time);
+    let s = sun_dir_at(camera.sun_time);
     let glint = 0.55 + 0.45 * abs(cos(leaf.tilt_phase));
     let tint = unpack4x8unorm(leaf.tint).rgb;
     o.lit = tint * (vec3<f32>(0.30, 0.34, 0.40) + sun_color(s) * glint);

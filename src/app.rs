@@ -113,6 +113,7 @@ pub struct App {
     /// animating on a still camera — spread evenly instead of one hard full
     /// re-trace every 15 frames (which stuttered).
     refresh_phase: u32,
+    opts: ClientOpts,
     /// Falling-leaf simulation (None when VOXELG_NO_LEAVES is set).
     leaf_sim: Option<leaffall::LeafSim>,
     leaf_instances: Vec<leaffall::LeafInstance>,
@@ -137,13 +138,14 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(net: Option<net::NetClient>, server_addr: Option<String>) -> Self {
+    pub fn new(net: Option<net::NetClient>, server_addr: Option<String>, opts: ClientOpts) -> Self {
         let mut world = World::new();
         world.fill_demo_terrain();
         // Spawn above the surface at the spawn column. The default y (80) is
         // often *below* the terrain/mountains, which renders as an opaque black
         // screen ("you see nothing"); lift the camera to clear ground + water.
         let mut camera = Camera::new();
+        camera.move_speed *= opts.speed.clamp(0.1, 100.0);
         let s = voxel::sample_terrain(camera.pos.x, camera.pos.z, world.seed);
         let surface = s.h.max(s.water_top) as f32;
         camera.pos.y = surface + 10.0;
@@ -187,6 +189,7 @@ impl App {
             last_camera_pose: None,
             frame_counter: 0,
             refresh_phase: 0,
+            opts,
             leaf_sim: std::env::var("VOXELG_NO_LEAVES")
                 .is_err()
                 .then(|| leaffall::LeafSim::new(0x1eaf_5eed)),
@@ -487,6 +490,9 @@ impl App {
             (JITTER_PATTERN[(self.frame_counter & 7) as usize], 0.9_f32)
         };
         let t = (now - self.start_time).as_secs_f32();
+        // --freeze-time pins the DAY/NIGHT cycle only: the sun runs on its
+        // own clock while water, wind and falling leaves keep animating.
+        let sun_t = self.opts.freeze_time.unwrap_or(t);
 
         // GPU physics modifies the brick buffer directly (not via dirty_bricks),
         // so force a full re-trace each frame while it's on for the changes to show.
@@ -530,7 +536,7 @@ impl App {
             if gpu_physics {
                 renderer.run_gpu_physics();
             }
-            renderer.update_camera(&self.camera, t, world_origin, jitter, taa_blend);
+            renderer.update_camera(&self.camera, t, sun_t, world_origin, jitter, taa_blend);
             // Falling leaves: stepped under the already-held lock (a few
             // hundred leaves = tens of microseconds), uploaded after it.
             if let Some(sim) = &mut self.leaf_sim {
@@ -692,12 +698,29 @@ impl ApplicationHandler for App {
 }
 
 /// Build the winit event loop and run the client application.
-pub fn run_client(net: Option<net::NetClient>, server_addr: Option<String>) {
+/// Command-line client options.
+#[derive(Clone, Copy)]
+pub struct ClientOpts {
+    /// Pin the shader clock (sun, water, wind) at this many seconds instead
+    /// of advancing - the falling-leaf sim keeps its own clock and stays
+    /// alive. None = normal time.
+    pub freeze_time: Option<f32>,
+    /// Fly-speed multiplier applied to the camera's base move speed.
+    pub speed: f32,
+}
+
+impl Default for ClientOpts {
+    fn default() -> Self {
+        Self { freeze_time: None, speed: 1.0 }
+    }
+}
+
+pub fn run_client(net: Option<net::NetClient>, server_addr: Option<String>, opts: ClientOpts) {
     let event_loop = EventLoop::new().expect("event loop");
     // Frame-paced: the loop wakes on input or at the next scheduled frame
     // (see App::about_to_wait), not in a tight Poll spin.
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = App::new(net, server_addr);
+    let mut app = App::new(net, server_addr, opts);
     if let Err(e) = event_loop.run_app(&mut app) {
         log::error!("event loop exited with error: {e}");
     }

@@ -363,7 +363,7 @@ impl Renderer {
         surface.configure(&device, &config);
 
         // -- buffers --
-        let camera_init = CameraUniform::from_camera(&Camera::new(), width, height, 0.0, glam::IVec3::ZERO, [0.0, 0.0], 0.0);
+        let camera_init = CameraUniform::from_camera(&Camera::new(), width, height, 0.0, 0.0, glam::IVec3::ZERO, [0.0, 0.0], 0.0);
         let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("camera"),
             contents: bytemuck::bytes_of(&camera_init),
@@ -909,12 +909,13 @@ impl Renderer {
         &mut self,
         camera: &Camera,
         time: f32,
+        sun_time: f32,
         world_origin_voxel: glam::IVec3,
         jitter: [f32; 2],
         taa_blend: f32,
     ) {
         let mut u = CameraUniform::from_camera(
-            camera, self.size.0, self.size.1, time, world_origin_voxel, jitter, taa_blend,
+            camera, self.size.0, self.size.1, time, sun_time, world_origin_voxel, jitter, taa_blend,
         );
         // Lighting + colour-history reprojection runs only while ACCUMULATING
         // (taa_blend > 0 = static camera), with a previous frame and an unchanged
@@ -1799,7 +1800,7 @@ mod gpu_render_tests {
     ) -> Option<Vec<u8>> {
         let (device, queue) = headless_device()?;
         let wo = world.world_origin_voxel();
-        let cu = CameraUniform::from_camera(cam, w, h, 0.0, wo, [0.0, 0.0], 0.0);
+        let cu = CameraUniform::from_camera(cam, w, h, 0.0, 0.0, wo, [0.0, 0.0], 0.0);
 
         let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("camera"),
@@ -2732,7 +2733,7 @@ mod gpu_render_tests {
         leaves: &[crate::leaffall::LeafInstance],
     ) {
         // World buffers are shared across scenarios; only the camera changes.
-        let cu0 = CameraUniform::from_camera(&scenarios[0].1, w, h, 0.0, glam::IVec3::ZERO, [0.0, 0.0], 0.0);
+        let cu0 = CameraUniform::from_camera(&scenarios[0].1, w, h, 0.0, 0.0, glam::IVec3::ZERO, [0.0, 0.0], 0.0);
         let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None, contents: bytemuck::bytes_of(&cu0),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
@@ -2777,7 +2778,7 @@ mod gpu_render_tests {
         });
 
         for (name, cam) in scenarios {
-            let cu = CameraUniform::from_camera(cam, w, h, 0.0, glam::IVec3::ZERO, [0.0, 0.0], 0.0);
+            let cu = CameraUniform::from_camera(cam, w, h, 0.0, 0.0, glam::IVec3::ZERO, [0.0, 0.0], 0.0);
             queue.write_buffer(&camera_buf, 0, bytemuck::bytes_of(&cu));
             let encode_frame = || {
                 let mut e = device.create_command_encoder(&Default::default());

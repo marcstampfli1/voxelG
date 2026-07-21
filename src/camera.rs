@@ -96,7 +96,9 @@ pub struct CameraUniform {
     pub prev_origin: [f32; 3],
     pub wind_z: f32,
     pub prev_forward: [f32; 3],
-    pub _pad7: f32,
+    /// Day/night clock (sun position). Equals `time` normally; pinned by
+    /// --freeze-time while everything else animates on `time`.
+    pub sun_time: f32,
     pub prev_right: [f32; 3],
     pub _pad8: f32,
     pub prev_up: [f32; 3],
@@ -117,6 +119,7 @@ impl CameraUniform {
         width: u32,
         height: u32,
         time: f32,
+        sun_time: f32,
         world_origin_voxel: glam::IVec3,
         jitter: [f32; 2],
         taa_blend: f32,
@@ -141,7 +144,7 @@ impl CameraUniform {
             prev_origin: c.pos.to_array(),
             wind_z: wind_dir(time).y,
             prev_forward: c.forward().to_array(),
-            _pad7: 0.0,
+            sun_time,
             prev_right: c.right().to_array(),
             _pad8: 0.0,
             prev_up: c.up().to_array(),

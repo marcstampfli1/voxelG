@@ -2,6 +2,7 @@
 // code lives in the `voxelg` library crate (src/lib.rs); see app.rs (client),
 // server.rs (dedicated server) and voxel.rs (world).
 
+use voxelg::app::ClientOpts;
 use voxelg::{app, net, server};
 
 enum Mode {
@@ -10,8 +11,10 @@ enum Mode {
     Connect(String),
 }
 
-fn parse_mode() -> Mode {
+fn parse_args() -> (Mode, ClientOpts) {
     let args: Vec<String> = std::env::args().collect();
+    let mut mode = Mode::Solo;
+    let mut opts = ClientOpts::default();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -20,25 +23,49 @@ fn parse_mode() -> Mode {
                     .get(i + 1)
                     .and_then(|s| s.parse::<u16>().ok())
                     .unwrap_or(7878);
-                return Mode::Server(port);
+                mode = Mode::Server(port);
+                i += 1;
             }
             "--connect" => {
                 let addr = args
                     .get(i + 1)
                     .cloned()
                     .unwrap_or_else(|| "127.0.0.1:7878".to_string());
-                return Mode::Connect(addr);
+                mode = Mode::Connect(addr);
+                i += 1;
             }
-            _ => {}
+            // Pin the DAY/NIGHT cycle (sun position) at an optional second
+            // count (default 0 = the pleasant startup sun); water, wind and
+            // falling leaves keep animating.
+            "--freeze-time" => {
+                let val = args.get(i + 1).and_then(|s| s.parse::<f32>().ok());
+                if val.is_some() {
+                    i += 1;
+                }
+                opts.freeze_time = Some(val.unwrap_or(0.0));
+            }
+            // Fly-speed multiplier (e.g. --speed 3).
+            "--speed" => {
+                if let Some(m) = args.get(i + 1).and_then(|s| s.parse::<f32>().ok()) {
+                    opts.speed = m;
+                    i += 1;
+                } else {
+                    log::warn!("--speed needs a numeric multiplier, ignoring");
+                }
+            }
+            other => {
+                log::warn!("unknown argument {other:?} ignored");
+            }
         }
         i += 1;
     }
-    Mode::Solo
+    (mode, opts)
 }
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    match parse_mode() {
+    let (mode, opts) = parse_args();
+    match mode {
         Mode::Server(port) => server::run_server(port),
         mode => {
             let (net, server_addr) = match mode {
@@ -58,7 +85,7 @@ fn main() {
                 }
                 _ => (None, None),
             };
-            app::run_client(net, server_addr);
+            app::run_client(net, server_addr, opts);
         }
     }
 }

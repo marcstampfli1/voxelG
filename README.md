@@ -124,6 +124,8 @@ Requires a GPU and driver supported by wgpu (Vulkan, Metal or DX12).
 cargo run --release                          # solo
 cargo run --release -- --server 7878        # headless server
 cargo run --release -- --connect host:7878  # join a server
+cargo run --release -- --freeze-time 40     # pin sun/water/wind at t=40s (value optional)
+cargo run --release -- --speed 4            # 4x fly speed
 ```
 
 Controls: WASD + Space/Shift to fly, Alt to sprint, mouse to look. Left click destroys a sphere, right

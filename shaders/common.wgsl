@@ -27,7 +27,9 @@ struct Camera {
     prev_origin: vec3<f32>,
     wind_z: f32,
     prev_forward: vec3<f32>,
-    _pad7: f32,
+    // Day/night clock for the sun: equals `time` normally; pinned by
+    // --freeze-time while water/wind/leaves keep animating on `time`.
+    sun_time: f32,
     prev_right: vec3<f32>,
     _pad8: f32,
     prev_up: vec3<f32>,

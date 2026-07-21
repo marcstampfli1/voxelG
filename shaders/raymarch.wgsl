@@ -1327,9 +1327,11 @@ fn axis_from_face_normal(n: vec3<f32>) -> i32 {
 
 // Sun rotates east→up→west→under. Start near midday so the very first frame
 // isn't dim/orange; cycle slows to ~5 minutes for a less twitchy feel.
-// Bodies live in common.wgsl (shared with the falling-leaf pass).
+// Bodies live in common.wgsl (shared with the falling-leaf pass). The sun
+// runs on its own clock so --freeze-time can pin the day/night cycle
+// without stopping water, wind or leaves.
 fn sun_dir() -> vec3<f32> {
-    return sun_dir_at(camera.time);
+    return sun_dir_at(camera.sun_time);
 }
 
 // IQ-style fract hash. The previous sin-based hash had visible periodic
