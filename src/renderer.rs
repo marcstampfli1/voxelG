@@ -2561,7 +2561,7 @@ mod gpu_render_tests {
         world
     }
 
-    fn material_lab_cams() -> [(&'static str, Camera); 2] {
+    fn material_lab_cams() -> [(&'static str, Camera); 3] {
         let mut front = Camera::new();
         front.pos = glam::Vec3::new(124.0, 68.5, 76.0);
         front.yaw = 0.0;
@@ -2570,7 +2570,14 @@ mod gpu_render_tests {
         close.pos = glam::Vec3::new(101.0, 65.5, 98.5);
         close.yaw = 0.35;
         close.pitch = -0.02;
-        [("material_lab", front), ("material_lab_close", close)]
+        // Macro view of the stone cube's corner: two faces + the top edge
+        // in one frame, close enough to judge crack-line continuity per
+        // pixel.
+        let mut corner = Camera::new();
+        corner.pos = glam::Vec3::new(99.2, 66.8, 101.2);
+        corner.yaw = -0.65;
+        corner.pitch = -0.28;
+        [("material_lab", front), ("material_lab_close", close), ("material_lab_stone_corner", corner)]
     }
 
     /// Isolated leaf-rendering bench: a flat grass plain with four hand-built

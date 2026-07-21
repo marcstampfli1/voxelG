@@ -654,6 +654,25 @@ fn cs_compose(@builtin(global_invocation_id) gid: vec3<u32>) {
     let uv = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5) + camera.jitter) / camera.resolution;
     let dir = ray_dir_uv(uv);
 
+    // Depth-edge crevice shading: where the primary depth jumps between
+    // neighbouring pixels, darken the FARTHER side slightly. Adjacent
+    // parallel faces at different depths carry different slices of the 3D
+    // texture fields (correctly - they are different surfaces), but without
+    // a depth cue the step reads as a texture misalignment. The crevice
+    // line makes the geometry legible. Skips sky and distant pixels.
+    if (t_hit < 1.0e8) {
+        let d_r = textureLoad(depth_in, pix + vec2<i32>(1, 0), 0).r;
+        let d_l = textureLoad(depth_in, pix + vec2<i32>(-1, 0), 0).r;
+        let d_u = textureLoad(depth_in, pix + vec2<i32>(0, -1), 0).r;
+        let d_d = textureLoad(depth_in, pix + vec2<i32>(0, 1), 0).r;
+        let nearest = min(min(d_r, d_l), min(d_u, d_d));
+        // Farther than a neighbour by 0.4..3 voxels (scaled with distance
+        // so far geometry is not outlined into a toon look).
+        let jump = (t_hit - nearest) / max(t_hit * 0.02, 0.35);
+        let crevice = clamp(jump - 1.0, 0.0, 1.5) * 0.12;
+        col = col * (1.0 - min(crevice, 0.22));
+    }
+
     let uv_cloud = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5)) / camera.resolution;
     let clouds = textureSampleLevel(cloud_in, cloud_samp, uv_cloud, 0.0);
     if (t_hit >= cloud_slab_near(dir)) {
