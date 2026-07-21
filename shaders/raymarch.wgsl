@@ -848,7 +848,7 @@ fn leaf_bl_quads(voxel_min: vec3<f32>, origin: vec3<f32>, dir: vec3<f32>, t_lo: 
     let species = leaf_species_tint(mat, vh);
     let yrot = floor(vh * 4.0) * 1.5707963;
     let phase = voxel_min.x * 0.31 + voxel_min.z * 0.41 + vh * 6.28;
-    let wind = wind_offset(voxel_min, phase, 0.06);
+    let wind = wind_offset(voxel_min, phase, 0.11);
 
     var best_t: f32 = 1e30;
     for (var q: i32 = 0; q < 2; q = q + 1) {
@@ -947,7 +947,7 @@ fn leaf_cloud_hit(cell_min: vec3<f32>, origin: vec3<f32>, dir: vec3<f32>, t_lo: 
     let sprite = leaf_card_sprite(mat);
     let base_h = hash3f(cell_min + vec3<f32>(0.11, 0.53, 0.29));
     let species = leaf_species_tint(mat, base_h);
-    let wind = wind_offset(cell_min, base_h * 6.28, 0.08);
+    let wind = wind_offset(cell_min, base_h * 6.28, 0.15);
     var best_t: f32 = 1e30;
     for (var k: i32 = 0; k < 6; k = k + 1) {
         // Per-leaf channels from one base hash via a golden-ratio lattice.
@@ -955,10 +955,10 @@ fn leaf_cloud_hit(cell_min: vec3<f32>, origin: vec3<f32>, dir: vec3<f32>, t_lo: 
         let h1 = fract(hk * 13.91);
         let h2 = fract(hk * 41.23);
         let h3 = fract(hk * 97.51);
-        // Hug the inner half of the fringe cell (toward the leaf mass) so
+        // Hug the inner part of the fringe cell (toward the leaf mass) so
         // cards read as the canopy's edge, not detached floaters; vary the
         // card size per leaf.
-        let c = cell_min + vec3<f32>(h1, h2, h3) - outward * 0.22;
+        let c = cell_min + vec3<f32>(0.1) + vec3<f32>(h1, h2, h3) * 0.8 - outward * 0.28;
         let scale = 0.80 + h3 * 0.45;
         let n = normalize(outward + (vec3<f32>(h1, h2, h3) - vec3<f32>(0.5)) * 1.4);
         let denom = dot(dir, n);
@@ -985,14 +985,15 @@ fn leaf_cloud_hit(cell_min: vec3<f32>, origin: vec3<f32>, dir: vec3<f32>, t_lo: 
         var tone = 0.95;
         if (val == 2u) { tone = 0.62; }
         if (val == 3u) { tone = 1.30; }
-        // Wide per-leaf shade spread: the separation that makes leaves read
-        // as individuals.
+        // Wide per-leaf shade spread plus a subtle hue wobble: the
+        // separation that makes leaves read as individuals.
         let leaf_shade = 0.78 + hk * 0.47;
+        let hue = vec3<f32>(1.0 + (h1 - 0.5) * 0.18, 1.0, 1.0 - (h1 - 0.5) * 0.18);
         best_t = t;
         out.hit = true;
         out.t_hit = t;
         out.normal = select(n, -n, denom > 0.0);
-        out.color_tint = vec3<f32>(tone * leaf_shade) * species;
+        out.color_tint = vec3<f32>(tone * leaf_shade) * species * hue;
     }
     return out;
 }
@@ -1027,11 +1028,14 @@ fn leaf_fringe_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>) -> SubHi
         let nb_mat = voxel_material_at(nb);
         if (!is_leaf_block_mat(nb_mat)) { continue; }
         if (cloud_mat == 0u) {
-            // First adjacent leaf block: its direction is the canopy-outward
-            // axis for this fringe cell's leaf cloud, its species the art.
             cloud_mat = nb_mat;
-            outward = -vec3<f32>(f32(off.x), f32(off.y), f32(off.z));
+            outward = vec3<f32>(0.0);
         }
+        // Accumulate ALL adjacent leaf directions: for a flat canopy face
+        // the sum is the face normal, and in a step notch (leaf neighbours
+        // in two directions) it is the DIAGONAL bisector - cards anchor
+        // into the notch and bridge the blocky step.
+        outward = outward - vec3<f32>(f32(off.x), f32(off.y), f32(off.z));
         let nb_min = vec3<f32>(f32(nb.x), f32(nb.y), f32(nb.z));
         var qh = leaf_bl_quads(nb_min, origin, dir, max(t_enter - 0.05, 0.0), t_exit + 0.05, nb_mat);
         if (qh.hit && qh.t_hit < best_t) {
@@ -1059,6 +1063,8 @@ fn leaf_fringe_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>) -> SubHi
     // The volumetric leaf cloud fills this fringe cell with individual
     // leaves (all six shell directions - canopy SIDES included, which is
     // where eye-level views look).
+    // Opposing leaf pairs cancel the sum: bias up so normalize is safe.
+    outward = normalize(outward + vec3<f32>(0.0, 1e-4, 0.0));
     if (cloud_mat != 0u && t_enter < LEAF_CLOUD_T) {
         var lh = leaf_cloud_hit(voxel_min, origin, dir,
                                 max(t_enter - 0.05, 0.0), min(t_exit + 0.05, best_t), cloud_mat, outward);
@@ -1244,7 +1250,7 @@ fn sprite_cross_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u3
 
     let voxel_center = voxel_min + vec3<f32>(0.5);
     let phase = voxel_min.x * 0.40 + voxel_min.z * 0.55 + vh * 6.28;
-    let wind = wind_offset(voxel_min, phase, 0.22);
+    let wind = wind_offset(voxel_min, phase, 0.32);
     let mirror_u = fract(vh * 16.0) > 0.5;
 
     var best_t: f32 = 1e30;
@@ -2210,18 +2216,18 @@ fn shade(
         // shear (one source of truth), so brightness ripples move with the
         // front instead of pulsing in place.
         let gust = 0.5 + 0.5 * wind_gust(p_hit.xz, wind_dir_now());
-        let amp = select(0.45, 0.55, hit.mat == MAT_FLOWER || hit.mat == MAT_TALL_GRASS
+        let amp = select(0.60, 0.75, hit.mat == MAT_FLOWER || hit.mat == MAT_TALL_GRASS
                                    || hit.mat == MAT_TALL_GRASS_DRY) * gust;
         n.x += sway * amp;
         n.z += sway * amp * 0.7;
         n = normalize(n);
-        base *= 1.0 + sway * 0.16 * gust;
+        base *= 1.0 + sway * 0.20 * gust;
     } else if (hit.mat == MAT_GRASS && hit.normal.y > 0.5) {
         let t = camera.time;
         let gust = 0.5 + 0.5 * wind_gust(p_hit.xz, wind_dir_now());
         let sway = sin(p_hit.x * 0.55 + t * 2.1) * cos(p_hit.z * 0.55 + t * 1.7);
-        n.x += sway * 0.20 * gust;
-        n.z += sway * 0.18 * gust;
+        n.x += sway * 0.26 * gust;
+        n.z += sway * 0.24 * gust;
         n = normalize(n);
         base *= 1.0 + sway * 0.07 * gust;
     }
