@@ -1627,10 +1627,12 @@ fn bark_pattern(p: vec3<f32>, n: vec3<f32>, mat: u32) -> vec3<f32> {
 // shifts stay gentle - recolouring a whole material reads as a palette
 // swap, which is not the job of this function.
 // High-frequency micro-grain shared by every textured material: without it
-// the smooth value noise reads as soft low-res blobs.
-fn micro_grain(uv: vec2<f32>) -> f32 {
-    return 0.93 + vnoise3(vec3<f32>(uv * 13.0, 91.0)) * 0.10
-         + vnoise3(vec3<f32>(uv * 27.0, 92.0)) * 0.05;
+// the smooth noise reads as soft low-res blobs. Sampled in 3D WORLD space -
+// a per-face 2D projection makes the sub-voxel detail jump at face
+// orientation changes, which reads as texture misalignment at edges even
+// when the large-scale pattern (3D fracture network) continues correctly.
+fn micro_grain(p: vec3<f32>) -> f32 {
+    return 0.93 + vnoise3(p * 13.0) * 0.10 + vnoise3(p * 27.0) * 0.05;
 }
 
 fn material_texture(p: vec3<f32>, n: vec3<f32>, mat: u32) -> vec3<f32> {
@@ -1639,7 +1641,7 @@ fn material_texture(p: vec3<f32>, n: vec3<f32>, mat: u32) -> vec3<f32> {
     if (mat == 18u || (base.x == 1.0 && base.y == 1.0 && base.z == 1.0)) {
         return base;
     }
-    return base * micro_grain(tex_uv(p, n));
+    return base * micro_grain(p);
 }
 
 fn material_texture_base(p: vec3<f32>, n: vec3<f32>, mat: u32) -> vec3<f32> {
@@ -1652,7 +1654,7 @@ fn material_texture_base(p: vec3<f32>, n: vec3<f32>, mat: u32) -> vec3<f32> {
         let w = worley3(p * 1.5 + vec3<f32>(jig));
         let facet = 0.82 + fract(w.id * 9.7) * 0.24;
         let border = smoothstep(0.10, 0.02, w.f2 - w.f1);
-        let strata = 0.95 + 0.05 * sin(p.y * 1.9 + w.id * 2.0);
+        let strata = 0.95 + 0.05 * sin(p.y * 1.9 + jig * 3.0);
         return vec3<f32>(facet * strata * (1.0 - border * 0.38));
     }
     // Bark - per species.
