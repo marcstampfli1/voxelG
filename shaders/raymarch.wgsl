@@ -1319,22 +1319,9 @@ fn axis_from_face_normal(n: vec3<f32>) -> i32 {
 
 // Sun rotates east→up→west→under. Start near midday so the very first frame
 // isn't dim/orange; cycle slows to ~5 minutes for a less twitchy feel.
+// Bodies live in common.wgsl (shared with the falling-leaf pass).
 fn sun_dir() -> vec3<f32> {
-    let a = camera.time * 0.025 + 1.20;
-    return normalize(vec3<f32>(cos(a), sin(a), 0.30));
-}
-
-fn sun_intensity(s: vec3<f32>) -> f32 {
-    // Smoothstep into night below the horizon.
-    return smoothstep(-0.05, 0.10, s.y);
-}
-
-fn sun_color(s: vec3<f32>) -> vec3<f32> {
-    let h = clamp(s.y, 0.0, 1.0);
-    // Sunset/sunrise = warm orange. Midday = neutral. Lerp on solar elevation.
-    let warm = vec3<f32>(1.40, 0.60, 0.25);
-    let mid = vec3<f32>(1.10, 1.02, 0.92);
-    return mix(warm, mid, smoothstep(0.05, 0.40, h)) * sun_intensity(s);
+    return sun_dir_at(camera.time);
 }
 
 // IQ-style fract hash. The previous sin-based hash had visible periodic

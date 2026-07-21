@@ -49,3 +49,24 @@ fn safe_inv(x: f32) -> f32 {
     if (abs(x) < 1e-8) { return 1e30; }
     return 1.0 / x;
 }
+
+// ---- Sun (shared by raymarch and the falling-leaf pass) ----
+// Pure functions of time so passes that cannot see the raymarch bindings
+// still light consistently.
+fn sun_dir_at(t: f32) -> vec3<f32> {
+    let a = t * 0.025 + 1.20;
+    return normalize(vec3<f32>(cos(a), sin(a), 0.30));
+}
+
+fn sun_intensity(s: vec3<f32>) -> f32 {
+    // Smoothstep into night below the horizon.
+    return smoothstep(-0.05, 0.10, s.y);
+}
+
+fn sun_color(s: vec3<f32>) -> vec3<f32> {
+    let h = clamp(s.y, 0.0, 1.0);
+    // Sunset/sunrise = warm orange. Midday = neutral. Lerp on solar elevation.
+    let warm = vec3<f32>(1.40, 0.60, 0.25);
+    let mid = vec3<f32>(1.10, 1.02, 0.92);
+    return mix(warm, mid, smoothstep(0.05, 0.40, h)) * sun_intensity(s);
+}
