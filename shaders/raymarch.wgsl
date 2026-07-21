@@ -970,8 +970,22 @@ fn leaf_cloud_hit(cell_min: vec3<f32>, origin: vec3<f32>, dir: vec3<f32>, t_lo: 
         let lp = origin + dir * t - c;
         var up_ref = vec3<f32>(0.0, 1.0, 0.0);
         if (abs(n.y) > 0.9) { up_ref = vec3<f32>(1.0, 0.0, 0.0); }
-        let u_ax = normalize(cross(up_ref, n));
-        let v_ax = cross(n, u_ax);
+        let u_base = normalize(cross(up_ref, n));
+        let v_base = cross(n, u_base);
+        // Per-leaf in-plane orientation from a trig-free 8-angle table -
+        // without it every leaf tip points up. (cos, sin) of k*45deg.
+        let h4 = fract(hk * 57.77);
+        var oc = 1.0;
+        var os = 0.0;
+        if (h4 >= 0.125 && h4 < 0.250) { oc = 0.7071; os = 0.7071; }
+        else if (h4 >= 0.250 && h4 < 0.375) { oc = 0.0; os = 1.0; }
+        else if (h4 >= 0.375 && h4 < 0.500) { oc = -0.7071; os = 0.7071; }
+        else if (h4 >= 0.500 && h4 < 0.625) { oc = -1.0; os = 0.0; }
+        else if (h4 >= 0.625 && h4 < 0.750) { oc = -0.7071; os = -0.7071; }
+        else if (h4 >= 0.750 && h4 < 0.875) { oc = 0.0; os = -1.0; }
+        else if (h4 >= 0.875) { oc = 0.7071; os = -0.7071; }
+        let u_ax = u_base * oc + v_base * os;
+        let v_ax = v_base * oc - u_base * os;
         let hw = 0.22 * scale;
         let hh = 0.30 * scale;
         let lv = dot(lp, v_ax);
