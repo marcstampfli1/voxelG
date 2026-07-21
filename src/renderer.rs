@@ -1788,6 +1788,15 @@ mod gpu_render_tests {
     /// pipeline (half-res clouds, cs_main, a reprojection-validating second
     /// frame, deferred transparent) and read the RGBA bytes back.
     fn render_rgba(world: &World, cam: &Camera, w: u32, h: u32) -> Option<Vec<u8>> {
+        render_rgba_ext(world, cam, w, h, &[])
+    }
+
+    /// render_rgba plus injected falling-leaf instances, drawn by the real
+    /// leaf pipeline after cs_transparent. An empty slice skips the pass, so
+    /// the plain render_rgba path is byte-for-byte what it always was.
+    fn render_rgba_ext(
+        world: &World, cam: &Camera, w: u32, h: u32, leaves: &[crate::leaffall::LeafInstance],
+    ) -> Option<Vec<u8>> {
         let (device, queue) = headless_device()?;
         let wo = world.world_origin_voxel();
         let cu = CameraUniform::from_camera(cam, w, h, 0.0, wo, [0.0, 0.0], 0.0);
@@ -1941,6 +1950,26 @@ mod gpu_render_tests {
             cp.set_bind_group(0, &bg, &[]);
             cp.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
         }
+        if !leaves.is_empty() {
+            let leaves_buf = storage(&device, "leaves", bytemuck::cast_slice(leaves));
+            let leaf_bgl = create_leaf_bgl(&device);
+            let leaf_pipeline = create_leaf_pipeline(&device, &leaf_bgl);
+            let leaf_bg = make_leaf_bg(&device, &leaf_bgl, &camera_buf, &leaves_buf, &sprites_buf, &depth_view);
+            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("test leaves"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &output_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            rp.set_pipeline(&leaf_pipeline);
+            rp.set_bind_group(0, &leaf_bg, &[]);
+            rp.draw(0..6, 0..leaves.len() as u32);
+        }
         enc.copy_texture_to_buffer(
             wgpu::ImageCopyTexture {
                 texture: &output_tex,
@@ -2069,6 +2098,68 @@ mod gpu_render_tests {
             }
         }
         hits as f32 / n.max(1) as f32
+    }
+
+    /// Injected falling leaves must respect world depth: one leaf in the
+    /// open is visible, one under a stone slab and one under a water surface
+    /// are not (water pixels export their SURFACE t). Pure-red tint makes
+    /// the classification unambiguous; the count band asserts exactly one
+    /// leaf's worth of pixels regardless of screen orientation.
+    #[test]
+    fn leaf_occlusion_render() {
+        use crate::leaffall::LeafInstance;
+        use crate::voxel::{MAT_STONE, MAT_WATER};
+        let mut world = World::new();
+        for z in 216..264u32 {
+            for x in 216..264u32 {
+                world.set_voxel(x, 60, z, MAT_STONE);
+            }
+        }
+        // Station B: stone slab; station C: floating water pool. Station A
+        // (x=228) is open ground.
+        for z in 236..244u32 {
+            for x in 236..244u32 {
+                world.set_voxel(x, 66, z, MAT_STONE);
+            }
+            for x in 248..256u32 {
+                world.set_voxel(x, 66, z, MAT_WATER);
+            }
+        }
+        let leaf = |x: f32| LeafInstance {
+            pos: [x, 63.0, 240.0],
+            size: 1.2,
+            rot: 0.3,
+            tilt_phase: 0.0,
+            sprite: crate::sprites::SPR_LEAF_OAK as u32,
+            tint: 0xff00_00ff, // pure red
+        };
+        let mut cam = Camera::new();
+        cam.pos = glam::Vec3::new(242.0, 85.0, 240.0);
+        cam.yaw = 0.0;
+        cam.pitch = -1.55; // straight down
+        let (w, h) = (640usize, 400usize);
+        let Some(frame) = render_rgba_ext(
+            &world, &cam, w as u32, h as u32,
+            &[leaf(228.0), leaf(240.0), leaf(252.0)],
+        ) else {
+            eprintln!("no GPU adapter — skipping leaf occlusion test");
+            return;
+        };
+        let mut red = 0usize;
+        for px in frame.chunks_exact(4) {
+            let (r, g, b) = (px[0] as f32, px[1] as f32, px[2] as f32);
+            if r > 90.0 && r > g * 2.0 && r > b * 2.0 {
+                red += 1;
+            }
+        }
+        eprintln!("leaf occlusion: red pixels {red}");
+        // Measured: one visible leaf = 349 red px; all three (broken depth
+        // test) would be ~1050. The band discriminates both failure modes.
+        assert!(red > 100, "the open-air leaf is not visible ({red} red px)");
+        assert!(
+            red < 700,
+            "occluded leaves are showing - depth test broken ({red} red px)"
+        );
     }
 
     /// Isolated leaf-rendering bench: a flat grass plain with four hand-built
@@ -2435,6 +2526,35 @@ mod gpu_render_tests {
             let lab = build_leaf_lab_world();
             for (name, cam) in leaf_lab_cams() {
                 save_world(&lab, name, &cam);
+            }
+        }
+
+        // Falling leaves frozen mid-air: a seeded sim stepped 240 fixed
+        // frames over the demo forest, rendered through the injection path.
+        {
+            let mut sim = crate::leaffall::LeafSim::new(11);
+            let cam_pos = glam::Vec3::new(
+                clamp_anchor(leaf_c.x),
+                leaf_ground as f32 + 12.0,
+                clamp_anchor(leaf_c.y) - 18.0,
+            );
+            for _ in 0..240 {
+                sim.step(&world, cam_pos, 1.0 / 60.0);
+            }
+            let mut inst = Vec::new();
+            sim.write_instances(&mut inst);
+            eprintln!("leaffall still: {} leaves in flight", inst.len());
+            let mut cam = Camera::new();
+            cam.pos = cam_pos;
+            cam.pitch = -0.15;
+            if let Some(rgba) = render_rgba_ext(&world, &cam, w, h, &inst) {
+                let path = "target/lookdev/leaffall.png";
+                let file = std::fs::File::create(path).unwrap();
+                let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w, h);
+                enc.set_color(png::ColorType::Rgba);
+                enc.set_depth(png::BitDepth::Eight);
+                enc.write_header().unwrap().write_image_data(&rgba).unwrap();
+                eprintln!("wrote {path}");
             }
         }
 

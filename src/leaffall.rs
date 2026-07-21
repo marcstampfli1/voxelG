@@ -192,6 +192,15 @@ impl LeafSim {
                     break;
                 }
             }
+            // Real canopies are capped by the invisible fringe shell: the
+            // first non-air cell of a tree column is MAT_LEAF_FRINGE with
+            // the leaf block right below it.
+            if hit == MAT_LEAF_FRINGE {
+                let below = world.material_at_world(x, hit_y - 1, z);
+                if is_leaf_mat(below) {
+                    hit = below;
+                }
+            }
             if !is_leaf_mat(hit) {
                 continue;
             }
@@ -270,15 +279,34 @@ mod tests {
             }
         }
         // A broad canopy: spawn probes are area-proportional, and the test
-        // needs plentiful spawns, not marginal ones.
+        // needs plentiful spawns, not marginal ones. Fringe-capped like the
+        // real worldgen shells (the spawn probe must see through the cap).
         for z in 216..264u32 {
             for x in 216..264u32 {
                 for y in 70..74u32 {
                     w.set_voxel(x, y, z, MAT_LEAVES);
                 }
+                w.set_voxel(x, 74, z, crate::voxel::MAT_LEAF_FRINGE);
             }
         }
         (w, Vec3::new(240.0, 70.0, 240.0))
+    }
+
+    #[test]
+    fn spawns_in_demo_world() {
+        let mut w = World::new();
+        w.fill_demo_terrain();
+        // Same anchor logic as the lookdev still.
+        let cam = Vec3::new(16.0_f32.max(48.0), 101.0, 272.0_f32.min(464.0) - 18.0);
+        let mut sim = LeafSim::new(11);
+        for i in 0..240 {
+            sim.step(&w, cam, 1.0 / 60.0);
+            if i % 60 == 0 {
+                eprintln!("step {i}: {} leaves", sim.len());
+            }
+        }
+        eprintln!("final: {} leaves", sim.len());
+        assert!(!sim.is_empty(), "no leaves spawned over the demo forest");
     }
 
     #[test]
@@ -319,12 +347,15 @@ mod tests {
                 // Newest leaf spawned this step: its column top must be leaf.
                 let leaf = sim.leaves.last().unwrap();
                 let (x, z) = (leaf.pos.x.floor() as i32, leaf.pos.z.floor() as i32);
-                let top = (1..WORLD_VOXELS_Y as i32 - 1)
+                let top_y = (1..WORLD_VOXELS_Y as i32 - 1)
                     .rev()
-                    .map(|y| w.material_at_world(x, y, z))
-                    .find(|&m| m != crate::voxel::MAT_AIR)
+                    .find(|&y| w.material_at_world(x, y, z) != crate::voxel::MAT_AIR)
                     .unwrap_or(0);
-                assert!(is_leaf_mat(top), "spawned over material {top}");
+                let top = w.material_at_world(x, top_y, z);
+                let ok = is_leaf_mat(top)
+                    || (top == MAT_LEAF_FRINGE
+                        && is_leaf_mat(w.material_at_world(x, top_y - 1, z)));
+                assert!(ok, "spawned over material {top}");
                 seen += 1;
             }
         }
