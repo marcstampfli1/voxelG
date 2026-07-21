@@ -245,6 +245,11 @@ pub struct Renderer {
     #[allow(dead_code)] // kept alive for the view; the leaf pass reads the view
     depth_tex: wgpu::Texture,
     depth_view: wgpu::TextureView,
+    leaves_buf: wgpu::Buffer,
+    leaf_count: u32,
+    leaf_bgl: wgpu::BindGroupLayout,
+    leaf_pipeline: wgpu::RenderPipeline,
+    leaf_bg: wgpu::BindGroup,
 
     // Half-res volumetric (cloud) pass. The texture handle is dropped after
     // creation — its views keep the GPU resource alive.
@@ -477,6 +482,10 @@ impl Renderer {
         let transp_buf = create_transp_buf(&device, width, height);
         // Primary-hit depth for the falling-leaf pass.
         let (depth_tex, depth_view) = create_depth_texture(&device, width, height);
+        // Falling-leaf pass state.
+        let leaves_buf = create_leaves_buf(&device);
+        let leaf_bgl = create_leaf_bgl(&device);
+        let leaf_pipeline = create_leaf_pipeline(&device, &leaf_bgl);
 
         // -- compute pipeline --
         let compute_bgl = create_compute_bgl(&device);
@@ -507,6 +516,8 @@ impl Renderer {
             &cloud_sampled_view, &sampler, &light_hist_view, &light_out_view, &transp_buf,
             &sprites_buf, &depth_view,
         );
+
+        let leaf_bg = make_leaf_bg(&device, &leaf_bgl, &camera_buf, &leaves_buf, &sprites_buf, &depth_view);
 
         // -- deferred transparent pipeline (cs_transparent, same module + bgl) --
         let transparent_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -696,6 +707,7 @@ impl Renderer {
             beam_bgl, beam_pipeline, beam_bg,
             compute_bgl, compute_pipeline, compute_bg,
             transparent_pipeline, transp_buf, depth_tex, depth_view,
+            leaves_buf, leaf_count: 0, leaf_bgl, leaf_pipeline, leaf_bg,
             bricks_buf_b, physics_pipeline, physics_bg, gpu_physics: gpu_physics_enabled,
             cloud_bgl, cloud_pipeline, cloud_bg, cloud_sampled_view, cloud_storage_view,
             light_out_tex, light_out_view, light_hist_tex, light_hist_view,
@@ -745,6 +757,10 @@ impl Renderer {
         let (dt, dv) = create_depth_texture(&self.device, rw, rh);
         self.depth_tex = dt;
         self.depth_view = dv;
+        self.leaf_bg = make_leaf_bg(
+            &self.device, &self.leaf_bgl, &self.camera_buf, &self.leaves_buf,
+            &self.sprites_buf, &self.depth_view,
+        );
 
         self.compute_bg = make_compute_bg(
             &self.device, &self.compute_bgl, &self.camera_buf, &self.bricks_buf,
@@ -937,6 +953,17 @@ impl Renderer {
         self.queue.submit(std::iter::once(enc.finish()));
     }
 
+    /// Upload this frame's falling-leaf instances. Zero leaves skips the
+    /// pass entirely - the OFF switch that keeps headless renders and the
+    /// VOXELG_NO_LEAVES path deterministic.
+    pub fn upload_leaves(&mut self, instances: &[crate::leaffall::LeafInstance]) {
+        let n = instances.len().min(crate::leaffall::MAX_LEAVES);
+        if n > 0 {
+            self.queue.write_buffer(&self.leaves_buf, 0, bytemuck::cast_slice(&instances[..n]));
+        }
+        self.leaf_count = n as u32;
+    }
+
     pub fn render(&mut self, any_dirty: bool) -> Result<(), wgpu::SurfaceError> {
         let frame = self.surface.get_current_texture()?;
         let frame_view = frame
@@ -1044,6 +1071,29 @@ impl Renderer {
                 },
                 wgpu::Extent3d { width: self.size.0, height: self.size.1, depth_or_array_layers: 1 },
             );
+            // Falling leaves: AFTER the resolve->history copy so moving
+            // particles never enter the TAA feedback loop, BEFORE the blit.
+            // (If any_dirty were ever false here, a skipped frame would blit
+            // last frame's leaves - consistent with skipping everything.)
+            if self.leaf_count > 0 {
+                let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("leaves"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.resolve_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                rp.set_pipeline(&self.leaf_pipeline);
+                rp.set_bind_group(0, &self.leaf_bg, &[]);
+                rp.draw(0..6, 0..self.leaf_count);
+            }
         }
 
         {
@@ -1084,9 +1134,12 @@ fn create_output_texture(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Textur
         format: wgpu::TextureFormat::Rgba8Unorm,
         // COPY_SRC lets the headless render test read the frame back for
         // automated validation; harmless for the windowed path.
+        // RENDER_ATTACHMENT: the falling-leaf pass draws onto the resolve
+        // texture (and onto output_tex in the headless harness).
         usage: wgpu::TextureUsages::STORAGE_BINDING
             | wgpu::TextureUsages::TEXTURE_BINDING
-            | wgpu::TextureUsages::COPY_SRC,
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     });
     let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1160,6 +1213,18 @@ fn create_beam_texture(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture,
     (tex, view)
 }
 
+/// Falling-leaf pass source: common prelude (Camera + sun helpers) + the
+/// generated sprite atlas consts + the pass body. Same one-assembly-point
+/// contract as raymarch_source.
+pub(crate) fn leaves_source() -> String {
+    format!(
+        "{}\n{}\n{}",
+        COMMON_WGSL,
+        crate::sprites::wgsl_consts(),
+        include_str!("../shaders/leaves.wgsl")
+    )
+}
+
 /// Species colour straight from the render palette, so CPU systems (the
 /// falling-leaf sim) cannot drift from what the shader shows.
 pub fn palette_color(mat: u8) -> [f32; 4] {
@@ -1181,6 +1246,126 @@ fn create_depth_texture(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture
     });
     let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
     (tex, view)
+}
+
+/// Falling-leaf pass: bind-group layout (camera + instances + atlas +
+/// scene depth; note VERTEX/FRAGMENT visibility, unlike the compute BGLs).
+fn create_leaf_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("leaf bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+fn create_leaf_pipeline(device: &wgpu::Device, bgl: &wgpu::BindGroupLayout) -> wgpu::RenderPipeline {
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("leaves shader"),
+        source: wgpu::ShaderSource::Wgsl(leaves_source().into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("leaf pl"),
+        bind_group_layouts: &[bgl],
+        push_constant_ranges: &[],
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("leaf pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: Some("vs_leaf"),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &module,
+            entry_point: Some("fs_leaf"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                blend: None, // hard cutout, matches the 2bpp foliage aesthetic
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: None, // manual depth test against the exported ray depth
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+        cache: None,
+    })
+}
+
+fn make_leaf_bg(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    camera_buf: &wgpu::Buffer,
+    leaves_buf: &wgpu::Buffer,
+    sprites_buf: &wgpu::Buffer,
+    depth_view: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("leaf bg"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: camera_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: leaves_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: sprites_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(depth_view) },
+        ],
+    })
+}
+
+fn create_leaves_buf(device: &wgpu::Device) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("leaf instances"),
+        size: (crate::leaffall::MAX_LEAVES * std::mem::size_of::<crate::leaffall::LeafInstance>())
+            as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
 }
 
 /// Compute-pass bind-group layout. Single definition shared by the renderer and
@@ -1479,6 +1664,12 @@ mod shader_tests {
     fn raymarch_wgsl_valid() {
         let src = raymarch_source();
         validate("raymarch.wgsl", &src);
+    }
+
+    #[test]
+    fn leaves_wgsl_valid() {
+        let src = super::leaves_source();
+        validate("leaves.wgsl", &src);
     }
 
     #[test]
