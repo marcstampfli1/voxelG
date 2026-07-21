@@ -1528,6 +1528,41 @@ fn ridge_line(v: f32, w: f32) -> f32 {
     return 1.0 - smoothstep(0.0, w, abs(v - 0.5));
 }
 
+// 2D cellular (Worley) noise: distance to the nearest and second-nearest
+// feature point plus the nearest cell's hash. f2 - f1 is ~0 exactly on the
+// border between two cells, giving ANGULAR plate borders - fractured rock
+// facets and ice panes, where smooth ridge lines read as water waves.
+struct CellNoise {
+    f1: f32,
+    f2: f32,
+    id: f32,
+}
+
+fn worley2(p: vec2<f32>) -> CellNoise {
+    let ip = floor(p);
+    let fp = fract(p);
+    var out: CellNoise;
+    out.f1 = 8.0;
+    out.f2 = 8.0;
+    out.id = 0.0;
+    for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
+        for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
+            let g = vec2<f32>(f32(dx), f32(dy));
+            let h = hash3f(vec3<f32>(ip + g, 17.0));
+            let o = vec2<f32>(fract(h * 7.13), fract(h * 13.71));
+            let d = length(g + o - fp);
+            if (d < out.f1) {
+                out.f2 = out.f1;
+                out.f1 = d;
+                out.id = h;
+            } else if (d < out.f2) {
+                out.f2 = d;
+            }
+        }
+    }
+    return out;
+}
+
 // Bark per species - side faces get vertical ridge relief; birch gets its
 // signature dark horizontal lenticel scars on a pale smooth bark; pine gets
 // plated scales. End grain (top/bottom) keeps growth rings.
@@ -1585,19 +1620,16 @@ fn material_texture(p: vec3<f32>, n: vec3<f32>, mat: u32) -> vec3<f32> {
 
 fn material_texture_base(p: vec3<f32>, n: vec3<f32>, mat: u32) -> vec3<f32> {
     let uv = tex_uv(p, n);
-    // Stone - natural rock: domain-warped gradient fbm with a contrast
-    // snap (sharp facet transitions, not blobs), fine strata, and two
-    // crack systems at different scales.
+    // Stone - fractured rock: angular facet plates from cellular noise
+    // (flat-ish grey per plate, thin dark borders as cracks), a hint of
+    // strata. Smooth ridge/wave lines are exactly what stone must NOT be.
     if (mat == 4u) {
-        let w = fbm3g(vec3<f32>(uv * 0.9, p.y * 0.5)) * 1.4;
-        let body = fbm3g(vec3<f32>(uv * 2.4 + vec2<f32>(w), p.y * 0.8));
-        let mottle = 0.80 + body * 0.30;
-        let snap = 0.90 + smoothstep(0.30, 0.72, body) * 0.18;
-        let strata = 0.94 + 0.06 * sin(p.y * 2.4 + w * 2.0);
-        let c1 = ridge_line(gnoise3(vec3<f32>(uv * 1.5, 9.0)), 0.025);
-        let c2 = ridge_line(gnoise3(vec3<f32>(uv * 3.3, 21.0)), 0.020);
-        let crack = max(c1, c2 * 0.7);
-        return vec3<f32>(mottle * snap * strata * (1.0 - crack * 0.45));
+        let jig = fbm3g(vec3<f32>(uv * 0.5, 3.0)) * 0.8;
+        let w = worley2(uv * 1.6 + vec2<f32>(jig));
+        let facet = 0.82 + fract(w.id * 9.7) * 0.24;
+        let border = smoothstep(0.10, 0.02, w.f2 - w.f1);
+        let strata = 0.95 + 0.05 * sin(p.y * 1.9 + w.id * 2.0);
+        return vec3<f32>(facet * strata * (1.0 - border * 0.38));
     }
     // Bark - per species.
     if (mat == 13u || mat == 23u || mat == 24u) {
@@ -1648,12 +1680,13 @@ fn material_texture_base(p: vec3<f32>, n: vec3<f32>, mat: u32) -> vec3<f32> {
         return vec3<f32>(drift - dip * 1.3 + sparkle, drift - dip * 0.9 + sparkle, drift + sparkle);
     }
     // Leaves carry their own art; no extra noise here.
-    // Ice - clarity gradient with bright blue-white internal crack streaks.
+    // Ice - large clear panes with sparse bright fracture borders and a
+    // subtle per-pane clarity difference.
     if (mat == 17u) {
-        let base = 0.88 + fbm3g(vec3<f32>(uv * 1.4, 0.0)) * 0.14;
-        let crackn = gnoise3(vec3<f32>(uv.x * 2.6 + uv.y * 0.4, uv.y * 2.6, 71.0));
-        let streak = ridge_line(crackn, 0.05);
-        return vec3<f32>(base + streak * 0.24, base + streak * 0.30, base + streak * 0.42);
+        let w = worley2(uv * 0.85);
+        let body = 0.90 + fract(w.id * 7.3) * 0.10;
+        let border = smoothstep(0.14, 0.03, w.f2 - w.f1);
+        return vec3<f32>(body + border * 0.28, body + border * 0.32, body + border * 0.42);
     }
     // Coal - dark lumpy seams in the rock with glossy specks.
     if (mat == 19u) {
