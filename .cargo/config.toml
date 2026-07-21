@@ -1,0 +1,6 @@
+# Cap test parallelism: the GPU render tests each allocate a full World
+# (~80 MB) plus a wgpu device and world-sized buffers; at the default
+# one-thread-per-core parallelism the suite spikes to multiple GB of RAM.
+# Four workers keep the peak bounded with negligible wall-time cost.
+[env]
+RUST_TEST_THREADS = "4"

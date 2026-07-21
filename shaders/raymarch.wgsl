@@ -1473,7 +1473,51 @@ fn tex_uv(p: vec3<f32>, n: vec3<f32>) -> vec2<f32> {
     return p.xy;                                        // ±Z face
 }
 
-// 2-3 octave fbm over the value noise - the workhorse for natural mottling.
+// Gradient (Perlin-style) noise with a quintic fade: C2-continuous, so no
+// lattice creases - the value noise's smoothstep plateaus read as blobs
+// with faint grid edges INSIDE blocks, which is exactly what textures must
+// not do. Gradients are cheap unnormalized hash vectors; the output is
+// remapped to ~0..1.
+fn gvec(i: vec3<f32>) -> vec3<f32> {
+    // ONE hash fanned into three channels: a third of the inlined code of
+    // hashing per channel, which matters because the driver inlines every
+    // instance (3x cost = minutes of driver compile, measured).
+    let h = hash3f(i);
+    return vec3<f32>(fract(h * 5.37), fract(h * 7.79), fract(h * 9.13)) * 2.0 - vec3<f32>(1.0);
+}
+
+fn gnoise3(p: vec3<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    let d000 = dot(gvec(i + vec3<f32>(0.0, 0.0, 0.0)), f - vec3<f32>(0.0, 0.0, 0.0));
+    let d100 = dot(gvec(i + vec3<f32>(1.0, 0.0, 0.0)), f - vec3<f32>(1.0, 0.0, 0.0));
+    let d010 = dot(gvec(i + vec3<f32>(0.0, 1.0, 0.0)), f - vec3<f32>(0.0, 1.0, 0.0));
+    let d110 = dot(gvec(i + vec3<f32>(1.0, 1.0, 0.0)), f - vec3<f32>(1.0, 1.0, 0.0));
+    let d001 = dot(gvec(i + vec3<f32>(0.0, 0.0, 1.0)), f - vec3<f32>(0.0, 0.0, 1.0));
+    let d101 = dot(gvec(i + vec3<f32>(1.0, 0.0, 1.0)), f - vec3<f32>(1.0, 0.0, 1.0));
+    let d011 = dot(gvec(i + vec3<f32>(0.0, 1.0, 1.0)), f - vec3<f32>(0.0, 1.0, 1.0));
+    let d111 = dot(gvec(i + vec3<f32>(1.0, 1.0, 1.0)), f - vec3<f32>(1.0, 1.0, 1.0));
+    let x0 = mix(mix(d000, d100, u.x), mix(d010, d110, u.x), u.y);
+    let x1 = mix(mix(d001, d101, u.x), mix(d011, d111, u.x), u.y);
+    return mix(x0, x1, u.z) * 0.6 + 0.5;
+}
+
+// Rotated-octave gradient fbm: the domain rotates between octaves so no
+// lattice direction ever aligns with the world axes.
+fn fbm3g(p: vec3<f32>) -> f32 {
+    var q = p;
+    var acc = gnoise3(q) * 0.55;
+    q = vec3<f32>(q.x * 0.80 - q.z * 0.60, q.y * 0.94 + q.x * 0.34,
+                  q.x * 0.60 + q.z * 0.80) * 2.13 + vec3<f32>(7.7);
+    acc = acc + gnoise3(q) * 0.30;
+    q = vec3<f32>(q.x * 0.80 - q.z * 0.60, q.y * 0.94 + q.x * 0.34,
+                  q.x * 0.60 + q.z * 0.80) * 2.13 + vec3<f32>(3.1);
+    acc = acc + gnoise3(q) * 0.15;
+    return acc;
+}
+
+// Legacy 3-octave value fbm (still used outside the material system).
 fn fbm3(p: vec3<f32>) -> f32 {
     return vnoise3(p) * 0.55 + vnoise3(p * 2.7) * 0.30 + vnoise3(p * 6.1) * 0.15;
 }
@@ -1499,16 +1543,16 @@ fn bark_pattern(p: vec3<f32>, n: vec3<f32>, mat: u32) -> vec3<f32> {
     if (mat == 23u) {
         // Birch: pale, smooth, with dark lenticel bands stretched wide and
         // thin (fast noise along y, slow along the face).
-        let lent = smoothstep(0.72, 0.80, vnoise3(vec3<f32>(uv.x * 0.9, p.y * 5.5, 61.0)));
+        let lent = smoothstep(0.68, 0.76, gnoise3(vec3<f32>(uv.x * 0.9, p.y * 5.5, 61.0)));
         let base = 1.04 + vnoise3(vec3<f32>(uv * 3.0, 62.0)) * 0.08;
         return vec3<f32>(mix(base, 0.38, lent));
     }
     if (mat == 24u) {
         // Pine: scaly plates - dark borders where two stretched noise fields
         // cross their midlines.
-        let pa = ridge_line(vnoise3(vec3<f32>(uv.x * 2.4, p.y * 1.1, 67.0)), 0.06);
-        let pb = ridge_line(vnoise3(vec3<f32>(uv.x * 1.2, p.y * 2.9, 68.0)), 0.06);
-        let plate = fbm3(vec3<f32>(uv * 2.0, 69.0)) * 0.20 + 0.88;
+        let pa = ridge_line(gnoise3(vec3<f32>(uv.x * 2.4, p.y * 1.1, 67.0)), 0.06);
+        let pb = ridge_line(gnoise3(vec3<f32>(uv.x * 1.2, p.y * 2.9, 68.0)), 0.06);
+        let plate = fbm3g(vec3<f32>(uv * 2.0, 69.0)) * 0.20 + 0.88;
         return vec3<f32>(plate * (1.0 - max(pa, pb) * 0.38));
     }
     // Oak: deep coarse vertical ridges + fine fibre noise.
@@ -1541,12 +1585,19 @@ fn material_texture(p: vec3<f32>, n: vec3<f32>, mat: u32) -> vec3<f32> {
 
 fn material_texture_base(p: vec3<f32>, n: vec3<f32>, mat: u32) -> vec3<f32> {
     let uv = tex_uv(p, n);
-    // Stone - natural rock: strata banding, fbm mottling, thin crack veins.
+    // Stone - natural rock: domain-warped gradient fbm with a contrast
+    // snap (sharp facet transitions, not blobs), fine strata, and two
+    // crack systems at different scales.
     if (mat == 4u) {
-        let strata = 0.92 + 0.10 * sin(p.y * 1.7 + vnoise3(p * 0.35) * 3.0);
-        let mottle = fbm3(vec3<f32>(uv * 2.7, p.y * 0.8)) * 0.26 + 0.84;
-        let crack = ridge_line(vnoise3(vec3<f32>(uv * 1.1, 7.7)), 0.035);
-        return vec3<f32>(strata * mottle * (1.0 - crack * 0.35));
+        let w = fbm3g(vec3<f32>(uv * 0.9, p.y * 0.5)) * 1.4;
+        let body = fbm3g(vec3<f32>(uv * 2.4 + vec2<f32>(w), p.y * 0.8));
+        let mottle = 0.80 + body * 0.30;
+        let snap = 0.90 + smoothstep(0.30, 0.72, body) * 0.18;
+        let strata = 0.94 + 0.06 * sin(p.y * 2.4 + w * 2.0);
+        let c1 = ridge_line(gnoise3(vec3<f32>(uv * 1.5, 9.0)), 0.025);
+        let c2 = ridge_line(gnoise3(vec3<f32>(uv * 3.3, 21.0)), 0.020);
+        let crack = max(c1, c2 * 0.7);
+        return vec3<f32>(mottle * snap * strata * (1.0 - crack * 0.45));
     }
     // Bark - per species.
     if (mat == 13u || mat == 23u || mat == 24u) {
@@ -1556,11 +1607,11 @@ fn material_texture_base(p: vec3<f32>, n: vec3<f32>, mat: u32) -> vec3<f32> {
     // sides with a ragged green fringe, dirt bottom.
     if (mat == 2u) {
         if (n.y > 0.5) {
-            let clump = vnoise3(vec3<f32>(uv * 2.1, 11.0));
+            let clump = fbm3g(vec3<f32>(uv * 2.1, 11.0));
             let blades = vnoise3(vec3<f32>(uv * 14.0, 5.0));
             let lum = 0.78 + clump * 0.26 + blades * 0.12;
             // Dry patches: warm the reds slightly, never a full recolour.
-            let dry = smoothstep(0.62, 0.80, vnoise3(vec3<f32>(uv * 0.5, 23.0)));
+            let dry = smoothstep(0.58, 0.76, gnoise3(vec3<f32>(uv * 0.5, 23.0)));
             return vec3<f32>(lum * (1.0 + dry * 0.20), lum, lum * (1.0 - dry * 0.10));
         }
         let dirt = vec3<f32>(1.3333, 0.4154, 0.75); // (0.40,0.27,0.15)/(0.30,0.65,0.20)
@@ -1577,9 +1628,9 @@ fn material_texture_base(p: vec3<f32>, n: vec3<f32>, mat: u32) -> vec3<f32> {
     }
     // Dirt - clumpy soil with lighter pebbles and dark pores.
     if (mat == 3u) {
-        let clump = fbm3(vec3<f32>(uv * 3.2, 3.0)) * 0.30 + 0.74;
-        let pebble = smoothstep(0.72, 0.80, vnoise3(vec3<f32>(uv * 6.5, 9.5))) * 0.35;
-        let pore = smoothstep(0.72, 0.80, vnoise3(vec3<f32>(uv * 5.1, 17.0))) * 0.25;
+        let clump = fbm3g(vec3<f32>(uv * 3.2, 3.0)) * 0.30 + 0.74;
+        let pebble = smoothstep(0.68, 0.76, gnoise3(vec3<f32>(uv * 6.5, 9.5))) * 0.35;
+        let pore = smoothstep(0.68, 0.76, gnoise3(vec3<f32>(uv * 5.1, 17.0))) * 0.25;
         return vec3<f32>(clump + pebble - pore);
     }
     // Sand - wind ripples over fine grain, sparse glints.
@@ -1591,51 +1642,51 @@ fn material_texture_base(p: vec3<f32>, n: vec3<f32>, mat: u32) -> vec3<f32> {
     }
     // Snow - soft drifts, cool shadowed dips, hard sparkles.
     if (mat == 15u) {
-        let drift = 0.92 + 0.10 * vnoise3(vec3<f32>(uv * 0.8, 51.0));
-        let dip = smoothstep(0.30, 0.0, vnoise3(vec3<f32>(uv * 2.3, 53.0))) * 0.10;
+        let drift = 0.92 + 0.10 * gnoise3(vec3<f32>(uv * 0.8, 51.0));
+        let dip = smoothstep(0.30, 0.0, gnoise3(vec3<f32>(uv * 2.3, 53.0))) * 0.10;
         let sparkle = max(0.0, (vnoise3(vec3<f32>(uv * 16.0, 0.0)) - 0.85) * 6.0);
         return vec3<f32>(drift - dip * 1.3 + sparkle, drift - dip * 0.9 + sparkle, drift + sparkle);
     }
     // Leaves carry their own art; no extra noise here.
     // Ice - clarity gradient with bright blue-white internal crack streaks.
     if (mat == 17u) {
-        let base = 0.88 + vnoise3(vec3<f32>(uv * 1.2, 0.0)) * 0.14;
-        let crackn = vnoise3(vec3<f32>(uv.x * 2.6 + uv.y * 0.4, uv.y * 2.6, 71.0));
+        let base = 0.88 + fbm3g(vec3<f32>(uv * 1.4, 0.0)) * 0.14;
+        let crackn = gnoise3(vec3<f32>(uv.x * 2.6 + uv.y * 0.4, uv.y * 2.6, 71.0));
         let streak = ridge_line(crackn, 0.05);
         return vec3<f32>(base + streak * 0.24, base + streak * 0.30, base + streak * 0.42);
     }
     // Coal - dark lumpy seams in the rock with glossy specks.
     if (mat == 19u) {
-        let base = fbm3(vec3<f32>(uv * 2.0, 73.0)) * 0.22 + 0.86;
-        let seam = smoothstep(0.52, 0.62, fbm3(vec3<f32>(uv * 2.6, 74.0)));
+        let base = fbm3g(vec3<f32>(uv * 2.2, 73.0)) * 0.22 + 0.86;
+        let seam = smoothstep(0.50, 0.60, fbm3g(vec3<f32>(uv * 2.6, 74.0)));
         let gloss = max(0.0, (vnoise3(vec3<f32>(uv * 13.0, 75.0)) - 0.88) * 5.0) * seam;
         return vec3<f32>(mix(base, 0.34, seam) + gloss);
     }
     // Iron - rusty warm veins through grey rock.
     if (mat == 20u) {
-        let base = fbm3(vec3<f32>(uv * 2.0, 77.0)) * 0.22 + 0.86;
-        let vein = smoothstep(0.55, 0.63, fbm3(vec3<f32>(uv * 2.9, 78.0)));
+        let base = fbm3g(vec3<f32>(uv * 2.2, 77.0)) * 0.22 + 0.86;
+        let vein = smoothstep(0.53, 0.61, fbm3g(vec3<f32>(uv * 2.9, 78.0)));
         return mix(vec3<f32>(base), vec3<f32>(1.30, 0.78, 0.52) * (base * 0.9 + 0.2), vein);
     }
     // Gold - bright glinting veins.
     if (mat == 21u) {
-        let base = fbm3(vec3<f32>(uv * 2.0, 79.0)) * 0.22 + 0.86;
-        let vein = smoothstep(0.56, 0.63, fbm3(vec3<f32>(uv * 3.1, 80.0)));
+        let base = fbm3g(vec3<f32>(uv * 2.2, 79.0)) * 0.22 + 0.86;
+        let vein = smoothstep(0.54, 0.61, fbm3g(vec3<f32>(uv * 3.1, 80.0)));
         let glint = max(0.0, (vnoise3(vec3<f32>(uv * 15.0, 81.0)) - 0.86) * 6.0) * vein;
         return mix(vec3<f32>(base), vec3<f32>(1.55, 1.22, 0.45), vein) + vec3<f32>(glint);
     }
     // Diamond - sparse cyan crystals with hard sparkle.
     if (mat == 22u) {
-        let base = fbm3(vec3<f32>(uv * 2.0, 83.0)) * 0.22 + 0.86;
-        let crystal = smoothstep(0.74, 0.80, vnoise3(vec3<f32>(uv * 4.2, 84.0)));
+        let base = fbm3g(vec3<f32>(uv * 2.2, 83.0)) * 0.22 + 0.86;
+        let crystal = smoothstep(0.70, 0.76, gnoise3(vec3<f32>(uv * 4.2, 84.0)));
         let sparkle = max(0.0, (vnoise3(vec3<f32>(uv * 18.0, 85.0)) - 0.84) * 7.0) * crystal;
         return mix(vec3<f32>(base), vec3<f32>(0.85, 1.45, 1.55), crystal) + vec3<f32>(sparkle);
     }
     // Lava - dark cooling crust plates over slowly pulsing glow cracks.
     if (mat == 16u) {
-        let flow = vnoise3(vec3<f32>(uv * 1.1, camera.time * 0.06));
+        let flow = gnoise3(vec3<f32>(uv * 1.1, camera.time * 0.06));
         let crack = ridge_line(flow, 0.09);
-        let crust = fbm3(vec3<f32>(uv * 2.3, 5.0)) * 0.25 + 0.45;
+        let crust = fbm3g(vec3<f32>(uv * 2.3, 5.0)) * 0.25 + 0.45;
         let pulse = 0.85 + 0.15 * sin(camera.time * 0.8 + flow * 6.0);
         return mix(vec3<f32>(crust * 0.55), vec3<f32>(2.2, 1.35, 0.60) * pulse, crack);
     }
@@ -2253,16 +2304,73 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
 // secondary rays, which aren't cached).
 // `reuse_light`: when true, the shadow + AO terms are taken from *light (the
 // reprojected cache) instead of being traced. When false they are computed and
-// written back into *light so the caller can store them for next frame.
+// Terrain materials whose TOP faces cross-fade into each other at shared
+// edges (sand beaches into grass, snow lines into stone, ...).
+fn is_blend_mat(m: u32) -> bool {
+    return m == 1u || m == 2u || m == 3u || m == 4u || m == 15u;
+}
+
+const BLEND_T: f32 = 64.0;   // beyond this an edge fade is sub-pixel
+const BLEND_W: f32 = 0.42;   // fade starts this far from the shared edge
+
+// Connected-texture cross-fade for terrain top faces: bilinear-blend the
+// PALETTE colours of the two nearest in-plane neighbours (and their
+// diagonal) when they hold a different blend-class material at the same
+// height, then apply the OWN material's texture pattern once. Both sides
+// of a shared edge compute the same 50/50 colour split exactly at the
+// edge, so the fade is seamless. Deliberately colour-only: any
+// per-neighbour texture evaluation gets loop-unrolled by the driver into
+// N inline copies of material_texture, and N copies of the noise stack
+// put libnvidia-gpucomp into minutes of pipeline compilation (measured
+// via live backtrace).
+fn blended_palette(p_hit: vec3<f32>, voxel: vec3<i32>, m: u32) -> vec3<f32> {
+    let own = palette[m].rgb;
+    let local = fract(p_hit.xz); // (x, z) in-face position
+    let sx = select(-1, 1, local.x > 0.5);
+    let sz = select(-1, 1, local.y > 0.5);
+    let dx = select(local.x, 1.0 - local.x, local.x > 0.5);
+    let dz = select(local.y, 1.0 - local.y, local.y > 0.5);
+    let ax = smoothstep(BLEND_W, 0.0, dx) * 0.5;
+    let az = smoothstep(BLEND_W, 0.0, dz) * 0.5;
+    if (ax <= 0.0 && az <= 0.0) { return own; }
+    var cx = own;
+    var cz = own;
+    var cd = own;
+    if (ax > 0.0) {
+        let nm = voxel_material_at(voxel + vec3<i32>(sx, 0, 0));
+        if (is_blend_mat(nm)) { cx = palette[nm].rgb; }
+    }
+    if (az > 0.0) {
+        let nm = voxel_material_at(voxel + vec3<i32>(0, 0, sz));
+        if (is_blend_mat(nm)) { cz = palette[nm].rgb; }
+    }
+    if (ax > 0.0 && az > 0.0) {
+        let nm = voxel_material_at(voxel + vec3<i32>(sx, 0, sz));
+        if (is_blend_mat(nm)) { cd = palette[nm].rgb; }
+    }
+    return own * (1.0 - ax) * (1.0 - az)
+         + cx * ax * (1.0 - az)
+         + cz * (1.0 - ax) * az
+         + cd * ax * az;
+}
+
+// written back into *light so the caller can store them for next frame.// written back into *light so the caller can store them for next frame.
 fn shade(
     hit: Hit, origin: vec3<f32>, dir: vec3<f32>, pix_jit: f32,
     reuse_light: bool, light: ptr<function, vec2<f32>>,
 ) -> vec3<f32> {
     let p_hit = origin + dir * hit.t_hit;
+    // Terrain top faces near the camera cross-fade their palette colour into
+    // differing blend-class neighbours (connected textures); the texture
+    // pattern is evaluated exactly once either way.
+    var pal = palette[hit.mat].rgb;
+    if (hit.normal.y > 0.5 && is_blend_mat(hit.mat) && hit.t_hit < BLEND_T) {
+        pal = blended_palette(p_hit, hit.voxel, hit.mat);
+    }
     let tex = material_texture(p_hit, hit.normal, hit.mat);
     // hit.tint carries the sub-voxel colour (leaf shade, blade gradient,
     // petal/stem); (1,1,1) for plain cube hits.
-    var base = palette[hit.mat].rgb * tex * hit.tint;
+    var base = pal * tex * hit.tint;
     // Skip the cube-face AO for sub-voxel sphere hits (foliage). The curved
     // sphere normal already gives rim/falloff that reads as 3D.
     // AO (12 hierarchical neighbour lookups) only near the camera — its
