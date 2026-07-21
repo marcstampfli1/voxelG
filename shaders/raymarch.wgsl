@@ -813,6 +813,41 @@ fn leaf_bl_quads(voxel_min: vec3<f32>, origin: vec3<f32>, dir: vec3<f32>, t_lo: 
     return out;
 }
 
+// Horizontal canopy cap for the fringe cell directly above a leaf block:
+// the block's full tuft laid flat at cap_y, rotated by its 90-degree hash
+// variant. Deliberately lean - kept OUT of leaf_bl_quads because inlining
+// it there bloats the hottest leaf function's registers (measured +0.14 ms
+// on the foliage scenario even with the branch disabled). Trig-free (the
+// four rotations are exact selects) and without geometric wind shear (the
+// 0.06-block amplitude is sub-texel on a flat cap, and shade()'s sway still
+// animates the normal), so a canopy-top traversal pays a hash, one plane
+// test and one texel fetch.
+fn leaf_cap_hit(nb_min: vec3<f32>, origin: vec3<f32>, dir: vec3<f32>, cap_y: f32, t_lo: f32, t_hi: f32, mat: u32) -> SubHit {
+    var out: SubHit;
+    out.hit = false;
+    out.color_tint = vec3<f32>(1.0);
+    if (abs(dir.y) < 1e-4) { return out; }
+    let t = (cap_y - origin.y) / dir.y;
+    if (t <= t_lo || t >= t_hi) { return out; }
+    let vh = hash3f(nb_min);
+    let k = i32(floor(vh * 4.0));
+    let ca = select(select(1.0, -1.0, k == 2), 0.0, (k & 1) == 1);
+    let sa = select(select(0.0, 1.0, k == 1), -1.0, k == 3);
+    let lp = origin + dir * t - (nb_min + vec3<f32>(0.5, 0.0, 0.5));
+    let u = lp.x * ca - lp.z * sa;
+    let v = lp.x * sa + lp.z * ca;
+    if (abs(u) > 1.15 || abs(v) > 1.15) { return out; }
+    let val = tuft_texel(leaf_tuft_index(mat),
+                         u32(clamp((u / 1.15 * 0.5 + 0.5) * 32.0, 0.0, 31.0)),
+                         u32(clamp((v / 1.15 * 0.5 + 0.5) * 32.0, 0.0, 31.0)));
+    if (val == 0u) { return out; }
+    out.hit = true;
+    out.t_hit = t;
+    out.normal = vec3<f32>(0.0, select(1.0, -1.0, dir.y > 0.0), 0.0);
+    out.color_tint = tuft_tone(val, 0.90 + fract(vh * 32.0) * 0.20) * leaf_species_tint(mat, vh);
+    return out;
+}
+
 // A fringe cell renders the parts of its neighbouring leaf blocks tuft
 // quads that protrude into it — this is what makes tufts visible from the
 // SIDE (rays grazing past a canopy never enter the leaf cells themselves,
@@ -849,6 +884,21 @@ fn leaf_fringe_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>) -> SubHi
             qh.color_tint = qh.color_tint * palette[nb_mat].rgb
                 / max(palette[MAT_LEAF_FRINGE].rgb, vec3<f32>(1e-3));
             out = qh;
+        }
+        if (i == 3) {
+            // Below-neighbour case: this fringe cell sits on a canopy top -
+            // lay the neighbour's horizontal cap tuft 0.30 into this cell so
+            // tops read fluffy from above instead of flat tiled cube faces.
+            // (A distance gate at t=96 was measured and bought nothing - the
+            // cost is the per-traversal test itself, so it stays simple.)
+            var ch = leaf_cap_hit(nb_min, origin, dir, voxel_min.y + 0.30,
+                                  max(t_enter - 0.05, 0.0), min(t_exit + 0.05, best_t), nb_mat);
+            if (ch.hit) {
+                best_t = ch.t_hit;
+                ch.color_tint = ch.color_tint * palette[nb_mat].rgb
+                    / max(palette[MAT_LEAF_FRINGE].rgb, vec3<f32>(1e-3));
+                out = ch;
+            }
         }
     }
     return out;
@@ -1785,7 +1835,10 @@ fn shade(
     // tracer instead: generic cube AO counts the invisible fringe shell as
     // solid and darkens exposed canopy faces (and would double-occlude on
     // top of the canopy AO).
-    let skip_ao = hit.last_axis < 0 || hit.t_hit > AO_DIST || is_leaf_block_mat(hit.mat);
+    // (fringe included: its cap tufts return axis-aligned normals, and cube
+    // AO on a fringe cell would re-introduce the invisible-shell darkening.)
+    let skip_ao = hit.last_axis < 0 || hit.t_hit > AO_DIST
+        || is_leaf_block_mat(hit.mat) || hit.mat == MAT_LEAF_FRINGE;
     var ao: f32;
     if (reuse_light) { ao = (*light).y; }
     else { ao = select(compute_ao(hit, origin, dir), 1.0, skip_ao); }

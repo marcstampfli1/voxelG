@@ -1926,6 +1926,17 @@ mod gpu_render_tests {
         water_view.pitch = -0.35;
         save("water_view", &water_view);
 
+        // Straight down at the densest canopy: judges the horizontal cap
+        // tufts (fringe cells above canopy tops).
+        let mut canopy_top = Camera::new();
+        canopy_top.pos = glam::Vec3::new(
+            clamp_anchor(leaf_c.x),
+            leaf_ground as f32 + 26.0,
+            clamp_anchor(leaf_c.y),
+        );
+        canopy_top.pitch = -1.45;
+        save("canopy_top", &canopy_top);
+
         // Per-species canopy close-ups (skipped when the demo seed grew none).
         for (name, mat) in [
             ("birch_close", crate::voxel::MAT_LEAVES_BIRCH),
