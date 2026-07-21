@@ -2163,6 +2163,51 @@ mod gpu_render_tests {
         );
     }
 
+    /// Isolated material bench: a stone plain with a 4x4x4 cube of every
+    /// textured material in two sunlit rows, for tuning the procedural
+    /// block textures against one view.
+    fn build_material_lab_world() -> World {
+        use crate::voxel::*;
+        let mut world = World::new();
+        for z in 80..136u32 {
+            for x in 88..168u32 {
+                for y in 58..62u32 {
+                    world.set_voxel(x, y, z, MAT_STONE);
+                }
+                world.set_voxel(x, 62, z, MAT_GRASS);
+            }
+        }
+        let mats: [u8; 16] = [
+            MAT_STONE, MAT_DIRT, MAT_GRASS, MAT_SAND, MAT_SNOW, MAT_WOOD, MAT_WOOD_BIRCH,
+            MAT_WOOD_PINE, MAT_ICE, MAT_COAL, MAT_IRON, MAT_GOLD, MAT_DIAMOND, MAT_LAVA,
+            MAT_CACTUS, MAT_GLASS,
+        ];
+        for (i, m) in mats.iter().enumerate() {
+            let bx = 92 + (i % 8) as u32 * 9;
+            let bz = 104 + (i / 8) as u32 * 12;
+            for y in 63..67u32 {
+                for dz in 0..4u32 {
+                    for dx in 0..4u32 {
+                        world.set_voxel(bx + dx, y, bz + dz, *m);
+                    }
+                }
+            }
+        }
+        world
+    }
+
+    fn material_lab_cams() -> [(&'static str, Camera); 2] {
+        let mut front = Camera::new();
+        front.pos = glam::Vec3::new(124.0, 68.5, 76.0);
+        front.yaw = 0.0;
+        front.pitch = -0.08;
+        let mut close = Camera::new();
+        close.pos = glam::Vec3::new(101.0, 65.5, 98.5);
+        close.yaw = 0.35;
+        close.pitch = -0.02;
+        [("material_lab", front), ("material_lab_close", close)]
+    }
+
     /// Isolated leaf-rendering bench: a flat grass plain with four hand-built
     /// canopies (oak, birch, pine, autumn) at known positions, fringe shells
     /// painted with the same sphere semantics as worldgen paint_canopy
@@ -2527,6 +2572,10 @@ mod gpu_render_tests {
             let lab = build_leaf_lab_world();
             for (name, cam) in leaf_lab_cams() {
                 save_world(&lab, name, &cam);
+            }
+            let mlab = build_material_lab_world();
+            for (name, cam) in material_lab_cams() {
+                save_world(&mlab, name, &cam);
             }
         }
 
