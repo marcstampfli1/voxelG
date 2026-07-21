@@ -911,75 +911,80 @@ fn leaf_cap_hit(nb_min: vec3<f32>, origin: vec3<f32>, dir: vec3<f32>, cap_y: f32
     return out;
 }
 
-// How near individual canopy-sprig leaves render: they are ~0.7-block
-// features, sub-pixel past this, and skipping the whole call is the point
-// of the gate (unlike the cap, the sprig test is real per-cell work).
-const LEAF_SPRIG_T: f32 = 40.0;
+// Corner of the leaf-cloud tier: within this distance every fringe cell
+// scatters individual leaf-silhouette cards through its VOLUME; beyond it
+// the cheap horizontal cap tuft covers canopy tops instead (two-tier LOD,
+// same pattern as the water corner/centre tiers).
+const LEAF_CLOUD_T: f32 = 32.0;
 
-// Which leaf silhouette a species' sprigs carry.
-fn leaf_sprig_sprite(mat: u32) -> u32 {
+// Which leaf silhouette a species' cards carry.
+fn leaf_card_sprite(mat: u32) -> u32 {
     if (mat == MAT_LEAVES_BIRCH) { return SPR_LEAF_BIRCH; }
     if (mat == MAT_LEAVES_PINE)  { return SPR_LEAF_NEEDLE; }
     return SPR_LEAF_OAK;
 }
 
-// Individual leaf-silhouette sprigs on a canopy top: two hash-placed leaf
-// quads (0.6 x 0.84 blocks) standing on the shared face, leaning outward
-// ~33 degrees from vertical so they read from above AND from the side,
-// shearing sideways in the wind. This is what puts leaves SHAPED like
-// leaves on top of the Better Leaves tufts.
-fn leaf_sprig_hit(nb_min: vec3<f32>, origin: vec3<f32>, dir: vec3<f32>, t_lo: f32, t_hi: f32, mat: u32) -> SubHit {
+// The volumetric leaf cloud: K leaf-silhouette cards (0.44 x 0.60 blocks)
+// hash-scattered through the fringe cell's volume, normals biased outward
+// from the canopy with wide per-leaf scatter. Varied depth gives parallax,
+// per-leaf tone spread gives separation, sky shows through the gaps at the
+// crown edge - individual leaves instead of a flat textured shell. Zero
+// trig in the loop: orientation variety comes entirely from the 3D normal
+// scatter (in-plane rotation would cost 2 trig per card per ray and adds
+// little once normals are scattered).
+fn leaf_cloud_hit(cell_min: vec3<f32>, origin: vec3<f32>, dir: vec3<f32>, t_lo: f32, t_hi: f32, mat: u32, outward: vec3<f32>) -> SubHit {
     var out: SubHit;
     out.hit = false;
     out.color_tint = vec3<f32>(1.0);
-    // Decorrelated from the tuft hash so sprig placement does not follow
-    // the tuft rotation variant.
-    let vh = hash3f(nb_min + vec3<f32>(0.0, 0.37, 0.0));
-    let vox_shade = 0.90 + fract(vh * 32.0) * 0.20;
-    let species = leaf_species_tint(mat, vh);
-    let sprite = leaf_sprig_sprite(mat);
-    let ang = vh * 6.2831853;
-    let ca = cos(ang);
-    let sa = sin(ang);
-    let wind = wind_offset(nb_min, vh * 6.28, 0.10);
+    let sprite = leaf_card_sprite(mat);
+    let base_h = hash3f(cell_min + vec3<f32>(0.11, 0.53, 0.29));
+    let species = leaf_species_tint(mat, base_h);
+    let wind = wind_offset(cell_min, base_h * 6.28, 0.08);
     var best_t: f32 = 1e30;
-    for (var q: i32 = 0; q < 2; q = q + 1) {
-        // Second leaf: rotated 90 degrees (free component swap), placed by
-        // an independent hash channel.
-        var qa = ca;
-        var qb = sa;
-        if (q == 1) { qa = -sa; qb = ca; }
-        let bx = 0.15 + 0.70 * fract(vh * select(16.0, 64.0, q == 1));
-        let bz = 0.15 + 0.70 * fract(vh * select(23.0, 87.0, q == 1));
-        let base = nb_min + vec3<f32>(bx, 1.0, bz);
-        // Leaf plane basis: u horizontal, v up-and-outward.
-        let u_ax = vec3<f32>(qa, 0.0, -qb);
-        let v_ax = normalize(vec3<f32>(qb * 0.84, 0.55, qa * 0.84));
-        let n = cross(u_ax, v_ax);
+    for (var k: i32 = 0; k < 6; k = k + 1) {
+        // Per-leaf channels from one base hash via a golden-ratio lattice.
+        let hk = fract(base_h * 71.7 + f32(k) * 0.6180339);
+        let h1 = fract(hk * 13.91);
+        let h2 = fract(hk * 41.23);
+        let h3 = fract(hk * 97.51);
+        // Hug the inner half of the fringe cell (toward the leaf mass) so
+        // cards read as the canopy's edge, not detached floaters; vary the
+        // card size per leaf.
+        let c = cell_min + vec3<f32>(h1, h2, h3) - outward * 0.22;
+        let scale = 0.80 + h3 * 0.45;
+        let n = normalize(outward + (vec3<f32>(h1, h2, h3) - vec3<f32>(0.5)) * 1.4);
         let denom = dot(dir, n);
         if (abs(denom) < 1e-4) { continue; }
-        let c = base + v_ax * 0.42;
         let t = dot(c - origin, n) / denom;
         if (t <= t_lo || t >= min(t_hi, best_t)) { continue; }
         let lp = origin + dir * t - c;
-        var lu = dot(lp, u_ax);
+        var up_ref = vec3<f32>(0.0, 1.0, 0.0);
+        if (abs(n.y) > 0.9) { up_ref = vec3<f32>(1.0, 0.0, 0.0); }
+        let u_ax = normalize(cross(up_ref, n));
+        let v_ax = cross(n, u_ax);
+        let hw = 0.22 * scale;
+        let hh = 0.30 * scale;
         let lv = dot(lp, v_ax);
-        if (abs(lv) > 0.42) { continue; }
-        // Wind shear, stronger toward the leaf tip.
-        lu = lu - (wind.x * qa - wind.y * qb) * (lv / 0.84 + 0.5);
-        if (abs(lu) > 0.30) { continue; }
-        let tx = u32(clamp((lu / 0.30 * 0.5 + 0.5) * 16.0, 0.0, 15.0));
-        let ty = u32(clamp((lv / 0.42 * 0.5 + 0.5) * 16.0, 0.0, 15.0));
+        if (abs(lv) > hh) { continue; }
+        var lu = dot(lp, u_ax);
+        // Gust shear, stronger toward the leaf tip.
+        lu = lu - (wind.x * u_ax.x + wind.y * u_ax.z) * (lv + 0.5);
+        if (abs(lu) > hw) { continue; }
+        let tx = u32(clamp((lu / hw * 0.5 + 0.5) * 16.0, 0.0, 15.0));
+        let ty = u32(clamp((lv / hh * 0.5 + 0.5) * 16.0, 0.0, 15.0));
         let val = sprite_texel(sprite, tx, ty);
         if (val == 0u) { continue; }
         var tone = 0.95;
         if (val == 2u) { tone = 0.62; }
         if (val == 3u) { tone = 1.30; }
+        // Wide per-leaf shade spread: the separation that makes leaves read
+        // as individuals.
+        let leaf_shade = 0.78 + hk * 0.47;
         best_t = t;
         out.hit = true;
         out.t_hit = t;
         out.normal = select(n, -n, denom > 0.0);
-        out.color_tint = vec3<f32>(tone * vox_shade) * species;
+        out.color_tint = vec3<f32>(tone * leaf_shade) * species;
     }
     return out;
 }
@@ -1003,6 +1008,8 @@ fn leaf_fringe_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>) -> SubHi
     if (t_enter >= t_exit) { return out; }
 
     var best_t: f32 = 1e30;
+    var cloud_mat: u32 = 0u;
+    var outward = vec3<f32>(0.0, 1.0, 0.0);
     for (var i: i32 = 0; i < 6; i = i + 1) {
         var off = vec3<i32>(0);
         if (i == 0) { off.x = 1; } else if (i == 1) { off.x = -1; }
@@ -1011,6 +1018,12 @@ fn leaf_fringe_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>) -> SubHi
         let nb = voxel + off;
         let nb_mat = voxel_material_at(nb);
         if (!is_leaf_block_mat(nb_mat)) { continue; }
+        if (cloud_mat == 0u) {
+            // First adjacent leaf block: its direction is the canopy-outward
+            // axis for this fringe cell's leaf cloud, its species the art.
+            cloud_mat = nb_mat;
+            outward = -vec3<f32>(f32(off.x), f32(off.y), f32(off.z));
+        }
         let nb_min = vec3<f32>(f32(nb.x), f32(nb.y), f32(nb.z));
         var qh = leaf_bl_quads(nb_min, origin, dir, max(t_enter - 0.05, 0.0), t_exit + 0.05, nb_mat);
         if (qh.hit && qh.t_hit < best_t) {
@@ -1021,12 +1034,10 @@ fn leaf_fringe_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>) -> SubHi
                 / max(palette[MAT_LEAF_FRINGE].rgb, vec3<f32>(1e-3));
             out = qh;
         }
-        if (i == 3) {
-            // Below-neighbour case: this fringe cell sits on a canopy top -
-            // lay the neighbour's horizontal cap tuft 0.30 into this cell so
-            // tops read fluffy from above instead of flat tiled cube faces.
-            // (A distance gate at t=96 was measured and bought nothing - the
-            // cost is the per-traversal test itself, so it stays simple.)
+        if (i == 3 && t_enter >= LEAF_CLOUD_T) {
+            // Far tier only: beyond the leaf cloud, canopy tops fall back to
+            // the neighbour's horizontal cap tuft at 0.30 into this cell so
+            // distant tops stay fluffy instead of flat tiled cube faces.
             var ch = leaf_cap_hit(nb_min, origin, dir, voxel_min.y + 0.30,
                                   max(t_enter - 0.05, 0.0), min(t_exit + 0.05, best_t), nb_mat);
             if (ch.hit) {
@@ -1035,17 +1046,18 @@ fn leaf_fringe_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>) -> SubHi
                     / max(palette[MAT_LEAF_FRINGE].rgb, vec3<f32>(1e-3));
                 out = ch;
             }
-            if (t_enter < LEAF_SPRIG_T) {
-                // Individual leaf silhouettes standing on the canopy top.
-                var sh = leaf_sprig_hit(nb_min, origin, dir,
-                                        max(t_enter - 0.05, 0.0), min(t_exit + 0.05, best_t), nb_mat);
-                if (sh.hit) {
-                    best_t = sh.t_hit;
-                    sh.color_tint = sh.color_tint * palette[nb_mat].rgb
-                        / max(palette[MAT_LEAF_FRINGE].rgb, vec3<f32>(1e-3));
-                    out = sh;
-                }
-            }
+        }
+    }
+    // The volumetric leaf cloud fills this fringe cell with individual
+    // leaves (all six shell directions - canopy SIDES included, which is
+    // where eye-level views look).
+    if (cloud_mat != 0u && t_enter < LEAF_CLOUD_T) {
+        var lh = leaf_cloud_hit(voxel_min, origin, dir,
+                                max(t_enter - 0.05, 0.0), min(t_exit + 0.05, best_t), cloud_mat, outward);
+        if (lh.hit) {
+            lh.color_tint = lh.color_tint * palette[cloud_mat].rgb
+                / max(palette[MAT_LEAF_FRINGE].rgb, vec3<f32>(1e-3));
+            out = lh;
         }
     }
     return out;

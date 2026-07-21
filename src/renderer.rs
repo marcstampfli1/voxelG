@@ -1959,8 +1959,14 @@ mod gpu_render_tests {
         let sky_f = sky as f32 / n;
         let green_f = green as f32 / n;
         eprintln!("leaf lab edge crop: luma std {:.4} sky {sky_f:.3} green {green_f:.3}", var.sqrt());
-        // Sanity only until the cloud lands: the crop must contain canopy.
+        // Regression guard only: canopy present and neither hollow nor
+        // solid-blocked. "Reads as individual leaves" is judged by the
+        // leaf_lab_side/top/all lookdev A/B - every aggregate scalar tried
+        // (pixel std, 8x8 block-mean std, connected-component census,
+        // outside-silhouette annulus) failed to separate speckle texture
+        // from leaf-shaped structure, so no threshold pretends to.
         assert!(green_f > 0.15, "crown edge crop missed the canopy (green {green_f:.3})");
+        assert!(sky_f > 0.02 && sky_f < 0.60, "crown edge lost its sky gaps ({sky_f:.3})");
     }
 
     /// Two water bodies meeting only at a diagonal corner, one level apart:
