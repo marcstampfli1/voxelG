@@ -20,6 +20,7 @@ use crate::physics;
 use crate::raycast;
 use crate::renderer::Renderer;
 use crate::temporal;
+use crate::leaffall;
 use crate::voxel::{
     self, World, MAT_STONE, MAT_SAND, MAT_WATER, MAT_WOOD, MAT_LEAVES, MAT_GLASS,
     MAT_LAVA, MAT_ICE, MAT_SNOW, MAT_SMOKE,
@@ -112,6 +113,9 @@ pub struct App {
     /// animating on a still camera — spread evenly instead of one hard full
     /// re-trace every 15 frames (which stuttered).
     refresh_phase: u32,
+    /// Falling-leaf simulation (None when VOXELG_NO_LEAVES is set).
+    leaf_sim: Option<leaffall::LeafSim>,
+    leaf_instances: Vec<leaffall::LeafInstance>,
     tile_dirty_mask: Vec<u32>,
     first_frame: bool,
     current_material: u8,
@@ -183,6 +187,10 @@ impl App {
             last_camera_pose: None,
             frame_counter: 0,
             refresh_phase: 0,
+            leaf_sim: std::env::var("VOXELG_NO_LEAVES")
+                .is_err()
+                .then(|| leaffall::LeafSim::new(0x1eaf_5eed)),
+            leaf_instances: Vec::new(),
             tile_dirty_mask: Vec::with_capacity(2048),
             first_frame: true,
             current_material: MAT_STONE,
@@ -523,6 +531,15 @@ impl App {
                 renderer.run_gpu_physics();
             }
             renderer.update_camera(&self.camera, t, world_origin, jitter, taa_blend);
+            // Falling leaves: stepped under the already-held lock (a few
+            // hundred leaves = tens of microseconds), uploaded after it.
+            if let Some(sim) = &mut self.leaf_sim {
+                sim.step(&world, self.camera.pos, dt);
+            }
+        }
+        if let Some(sim) = &self.leaf_sim {
+            sim.write_instances(&mut self.leaf_instances);
+            self.renderer.as_mut().unwrap().upload_leaves(&self.leaf_instances);
         }
         // We always re-trace at least the rotating animation subset.
         let any_dirty = true;
