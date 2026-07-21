@@ -1790,6 +1790,35 @@ mod gpu_render_tests {
         v.max(48).min(464) as f32
     }
 
+    /// Densest 32x32 column-cell in one specific material, for per-species
+    /// views. None when the demo seed grew no such trees in the slot window
+    /// (callers skip loudly instead of asserting on an absent species).
+    fn find_species_anchor(world: &World, mat: u8) -> Option<(glam::IVec2, i32)> {
+        let cells = 512 / 32;
+        let mut best = (0usize, glam::IVec2::ZERO);
+        for cz in 0..cells {
+            for cx in 0..cells {
+                let mut n = 0usize;
+                for dz in (0..32).step_by(4) {
+                    for dx in (0..32).step_by(4) {
+                        let (x, z) = (cx * 32 + dx, cz * 32 + dz);
+                        for y in 60..140 {
+                            if world.material_at_world(x, y, z) == mat { n += 1; }
+                        }
+                    }
+                }
+                let c = glam::IVec2::new(cx * 32 + 16, cz * 32 + 16);
+                if n > best.0 { best = (n, c); }
+            }
+        }
+        if best.0 == 0 { return None; }
+        let ground = (1..200)
+            .rev()
+            .find(|&y| world.material_at_world(best.1.x, y, best.1.y) != MAT_AIR)
+            .unwrap_or(80);
+        Some((best.1, ground))
+    }
+
     /// Fraction of pixels in the bottom 60% of the frame matching a colour
     /// class. The top rows are excluded so sky can't satisfy a "blue water"
     /// check.
@@ -1896,6 +1925,62 @@ mod gpu_render_tests {
         );
         water_view.pitch = -0.35;
         save("water_view", &water_view);
+
+        // Per-species canopy close-ups (skipped when the demo seed grew none).
+        for (name, mat) in [
+            ("birch_close", crate::voxel::MAT_LEAVES_BIRCH),
+            ("pine_close", crate::voxel::MAT_LEAVES_PINE),
+        ] {
+            if let Some((c, ground)) = find_species_anchor(&world, mat) {
+                let mut cam = Camera::new();
+                // Back off and look slightly down: the anchor cell is the
+                // canopy itself, and a camera inside it sees only cube faces.
+                cam.pos = glam::Vec3::new(
+                    clamp_anchor(c.x) + 1.0,
+                    ground as f32 + 14.0,
+                    clamp_anchor(c.y) - 26.0,
+                );
+                cam.pitch = -0.18;
+                save(name, &cam);
+            } else {
+                eprintln!("no {name} anchor in demo world - skipped");
+            }
+        }
+    }
+
+    /// Each ported leaf species must render as green-ish foliage from its own
+    /// close-up anchor - catches a species tuft that decodes to garbage or
+    /// vanishes. Skips (loudly) any species the demo seed didn't grow.
+    #[test]
+    fn renders_leaf_species() {
+        let mut world = World::new();
+        world.fill_demo_terrain();
+        for (label, mat) in [
+            ("birch", crate::voxel::MAT_LEAVES_BIRCH),
+            ("pine", crate::voxel::MAT_LEAVES_PINE),
+        ] {
+            let Some((c, ground)) = find_species_anchor(&world, mat) else {
+                eprintln!("skip: demo world grew no {label}");
+                continue;
+            };
+            let mut cam = Camera::new();
+            cam.pos = glam::Vec3::new(
+                clamp_anchor(c.x),
+                ground as f32 + 12.0,
+                clamp_anchor(c.y) - 24.0,
+            );
+            cam.pitch = -0.25;
+            let Some(frame) = render_rgba(&world, &cam, 320, 200) else {
+                eprintln!("no GPU adapter — skipping species content test");
+                return;
+            };
+            // Pine is dark, snow backgrounds are bright: a loose green-dominant
+            // class with a small margin catches "black/pink/vanished" while
+            // tolerating species-specific brightness.
+            let green = ground_fraction(&frame, 320, 200, |r, g, b| g > r + 0.02 && g > b + 0.02);
+            eprintln!("{label} view green fraction: {green:.3}");
+            assert!(green > 0.08, "{label} view has too few green pixels ({green:.3})");
+        }
     }
 
     /// Time the raymarch + deferred-transparent dispatches at 1920x1080 for

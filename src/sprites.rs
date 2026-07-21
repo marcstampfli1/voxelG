@@ -297,10 +297,86 @@ const BL_TUFT_OAK: [&str; BL_TUFT_DIM] = [
         ".............*..o..#............",
 ];
 
-// Tuft art table, indexed by TUFT_*. Birch and pine currently alias the oak
-// art as a structural placeholder: the atlas layout (offsets, count) is
-// final, and the ported birch/spruce conversions land in the next change.
-const TUFT_ART: [&[&str; BL_TUFT_DIM]; N_TUFTS] = [&BL_TUFT_OAK, &BL_TUFT_OAK, &BL_TUFT_OAK];
+// Converted from birch_leaves.png by examples/convert_tuft.rs (bucket-ratio
+// tone rule, see that file). Birch's art has NO darker-than-body shading:
+// the leaf body maps to mid with bright speckles on top - the pack's actual
+// structure, airier and lighter than oak.
+#[rustfmt::skip]
+const BL_TUFT_BIRCH: [&str; BL_TUFT_DIM] = [
+        "................#...............",
+        "...............*##.**...........",
+        "........*..##..**..*#.#*........",
+        "......#...#.**...**...#.........",
+        ".....##*.*##...#.*##.##*..#.....",
+        "......**.**.#.##*.#...**.**.....",
+        ".........#.**#.**..**....#.**...",
+        "...*#..**..***...#.*##.**..*....",
+        "....#.##*..#*...##*.#.##*...*...",
+        "..*...*#.#**##.#.**...*#.#**##..",
+        "...##..#..*##.*#...##..#..*##.*.",
+        "..#**#..**..*.**..#**#..**..*...",
+        "..**..#.*#***#..#.**..#.*#***...",
+        ".**..##*.#.*#..##**..##*.#.*#...",
+        "...#..**..#..**.**.#..**..#..*..",
+        "...*#....##*.***..**#....##*.***",
+        "..**...#..**..#.#.**...#..**....",
+        ".#.**.*#*#..#..*##.**.*#*#..#...",
+        "...*###**..##*.**..*###**..##*.*",
+        "....#.#...#.**...**.#.#...#.**..",
+        ".*##.##*.*##...#.*##.##*.*##....",
+        "..#...**.**.#.##*.#...**.**.#.#.",
+        "....*....#.**#.**..**....#.**...",
+        "...*##.**..***...#.*##.**..***..",
+        "....#.##*..#*...##*.#.##*...*...",
+        "......*#.#**##.#.**...*#.#*.....",
+        "....#..#..*##.*#...##..#..*#....",
+        "....*....*..*.**..#**#..*.......",
+        "......#.*#***#..#.**....*#......",
+        ".........#..#..##**..#.*........",
+        ".............*..*..#............",
+        ".............*.*...*............",
+];
+
+// Converted from spruce_leaves.png by examples/convert_tuft.rs. A proper
+// three-tone conifer: deep needle shadow, mid body, bright tips.
+#[rustfmt::skip]
+const BL_TUFT_PINE: [&str; BL_TUFT_DIM] = [
+        "................................",
+        "...............*..#.............",
+        "..............o....#............",
+        ".......*o.o*..o##.o#..#*........",
+        ".......o.*..#.#.#.#*#...........",
+        ".....*#o#..#.o#o.*o*o*#.#.......",
+        ".....#.#.#...#*#.o.*.#.#........",
+        "......o#o.#o*o*o#o#.#.o#o.#o....",
+        "...#..#*#.#o#.*#.#.#..#*#.......",
+        ".....*o*o#.#.##.o#o.#*o*o#.#....",
+        "...#.#.*#.o#o.#.#*##o#.*#.o#....",
+        "...*#.#...#*#..*o*o*#.#...#*#...",
+        "...o#o.#.*o*o*#o#*.o#o.#.*o*o*..",
+        "...#*#.....*.#.#.#.#*#.....*....",
+        "....*o*..o..#.o#o.*o*o*..o....o.",
+        "....*...#o#...#*#...*...#o#.....",
+        "...o...#.#.#.*o*o*.o...#.#.#.*o.",
+        "...o#.#.o#o.#..*..#o#.#.o#o.....",
+        ".....#..#*#...o..#.#.#..#*#.....",
+        "..o#o.#*o*o*.#o##.o#o.#*o*o*.#..",
+        "..#*#..o.*..#.#.#.#*#..o.*......",
+        "..o.o*#o#..#.o#o.*o*o*#o#..#....",
+        "...*.#.#.#...#*#.o.*.#.#.#......",
+        "....#.o#o.#o*o*o#o#.#.o#o.#.....",
+        "...#..#*#.#o#.*#.#.#..#*#.#o....",
+        "....#*o*o#.#.##.o#o.#*o*o..#....",
+        ".......*#.o#o.#.#*##o#.*#.......",
+        "......#...#*#..*o*o*#.#.........",
+        "...........*o*#o#*.o#o.#........",
+        "...........*.#...#.#.#..........",
+        "...............#o.*o*...........",
+        "................................",
+];
+
+// Tuft art table, indexed by TUFT_*.
+const TUFT_ART: [&[&str; BL_TUFT_DIM]; N_TUFTS] = [&BL_TUFT_OAK, &BL_TUFT_BIRCH, &BL_TUFT_PINE];
 
 /// Encode all sprites into the flat u32 word array the shader indexes.
 /// Texel (x, y) of 16x16 sprite s lives at bit `(y*16 + x) * 2` of word block
@@ -384,26 +460,44 @@ mod tests {
     }
 
     /// The ported Better Leaves tufts: right size, round (transparent
-    /// corners), and roughly the original's ~46% coverage (oak).
+    /// corners), and coverage bands measured from the source textures by
+    /// examples/convert_tuft.rs (oak 0.464, birch 0.396, spruce 0.388;
+    /// centre-16x16 0.672 / 0.562 / 0.625 - birch's airier centre is the
+    /// pack's real structure, so its floor sits below the others).
     #[test]
-    fn better_leaves_tuft_intact() {
+    fn better_leaves_tufts_intact() {
         let w = encoded();
-        let tex = |x: usize, y: usize| tuft_texel(&w, TUFT_OAK, x, y);
-        for (x, y) in [(0, 0), (31, 0), (0, 31), (31, 31)] {
-            assert_eq!(tex(x, y), 0, "tuft corner ({x},{y}) must be clear");
+        for (tuft, cov_band, centre_floor) in [
+            (TUFT_OAK, 0.40..=0.55, 0.60),
+            (TUFT_BIRCH, 0.35..=0.45, 0.52),
+            (TUFT_PINE, 0.34..=0.44, 0.58),
+        ] {
+            let tex = |x: usize, y: usize| tuft_texel(&w, tuft, x, y);
+            for (x, y) in [(0, 0), (31, 0), (0, 31), (31, 31)] {
+                assert_eq!(tex(x, y), 0, "tuft {tuft} corner ({x},{y}) must be clear");
+            }
+            let n: usize = (0..32)
+                .flat_map(|y| (0..32).map(move |x| (x, y)))
+                .filter(|&(x, y)| tex(x, y) != 0)
+                .count();
+            let cov = n as f32 / 1024.0;
+            assert!(cov_band.contains(&cov), "tuft {tuft} coverage {cov}");
+            // Centre 16x16 (used by the cube faces) must be mostly opaque.
+            let nc: usize = (8..24)
+                .flat_map(|y| (8..24).map(move |x| (x, y)))
+                .filter(|&(x, y)| tex(x, y) != 0)
+                .count();
+            let cc = nc as f32 / 256.0;
+            assert!(cc > centre_floor, "tuft {tuft} centre too sparse: {cc}");
         }
-        let n: usize = (0..32)
-            .flat_map(|y| (0..32).map(move |x| (x, y)))
-            .filter(|&(x, y)| tex(x, y) != 0)
-            .count();
-        let cov = n as f32 / 1024.0;
-        assert!((0.40..=0.55).contains(&cov), "tuft coverage {cov}");
-        // Centre 16x16 (used by the cube faces) must be mostly opaque.
-        let nc: usize = (8..24)
-            .flat_map(|y| (8..24).map(move |x| (x, y)))
-            .filter(|&(x, y)| tex(x, y) != 0)
-            .count();
-        assert!(nc as f32 / 256.0 > 0.60, "tuft centre too sparse: {nc}");
+        // The three species must actually differ (guards against the
+        // placeholder aliasing ever sneaking back).
+        let differs = |a: usize, b: usize| {
+            (0..32).flat_map(|y| (0..32).map(move |x| (x, y)))
+                .any(|(x, y)| tuft_texel(&w, a, x, y) != tuft_texel(&w, b, x, y))
+        };
+        assert!(differs(TUFT_OAK, TUFT_BIRCH), "birch aliases oak");
+        assert!(differs(TUFT_OAK, TUFT_PINE), "pine aliases oak");
     }
 
     #[test]

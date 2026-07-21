@@ -666,14 +666,16 @@ fn wind_offset(voxel_min: vec3<f32>, phase: f32, base_amp: f32) -> vec2<f32> {
 }
 
 // ---------- LEAVES: Motschen's Better Leaves, ported exactly ----------------
-// Geometry and texture from "Motschen's Better Leaves Lite"
-// (github.com/TeamMidnightDust/BetterLeavesLite, MIT): every leaf block is a
-// cutout CUBE whose faces sample the CENTRE 16x16 of the pack's pre-rounded
-// 32x32 tuft texture, PLUS two big double-sided diagonal quads (2.0 x 1.75
-// blocks, rotated 22.5 and -45 degrees about Y, one slightly off-centre)
-// carrying the FULL round ragged tuft. Four variants (the pack's blockstate
-// y-rotations 0/90/180/270) are picked per block by hash. The huge
-// overhanging tufts from every block interleave into dense bushy canopies.
+// Geometry and textures from "Motschen's Better Leaves Lite"
+// (github.com/TeamMidnightDust/BetterLeavesLite, MIT; oak_leaves.png,
+// birch_leaves.png and spruce_leaves.png converted by
+// examples/convert_tuft.rs): every leaf block is a cutout CUBE whose faces
+// sample the CENTRE 16x16 of the species' pre-rounded 32x32 tuft texture,
+// PLUS two big double-sided diagonal quads (species-scaled, rotated 22.5 and
+// -45 degrees about Y, one slightly off-centre) carrying the FULL round
+// ragged tuft. Four variants (the pack's blockstate y-rotations 0/90/180/270)
+// are picked per block by hash. The huge overhanging tufts from every block
+// interleave into dense bushy canopies.
 fn tuft_texel(tuft: u32, x: u32, y: u32) -> u32 {
     let bit = (y * 32u + x) * 2u;
     let w = sprites[TUFT_BASE_WORDS + tuft * 64u + (bit >> 5u)];
@@ -688,17 +690,47 @@ fn tuft_tone(val: u32, scale: f32) -> vec3<f32> {
     return vec3<f32>(b * scale);
 }
 
+// Which tuft texture a leaf material carries. Oak and autumn share the oak
+// art (autumn differs by palette + mottle); birch and pine have their own
+// ports from the same pack.
+fn leaf_tuft_index(mat: u32) -> u32 {
+    if (mat == MAT_LEAVES_BIRCH) { return TUFT_BIRCH; }
+    if (mat == MAT_LEAVES_PINE)  { return TUFT_PINE; }
+    return TUFT_OAK;
+}
+
+// Per-species quad half-extents (u, v): pine tufts narrower and taller
+// (conifer), birch a touch wider and shorter, oak/autumn the original
+// 2.3 x 2.0 blocks.
+fn leaf_quad_ext(tuft: u32) -> vec2<f32> {
+    if (tuft == TUFT_PINE)  { return vec2<f32>(0.95, 1.05); }
+    if (tuft == TUFT_BIRCH) { return vec2<f32>(1.05, 0.95); }
+    return vec2<f32>(1.15, 1.0);
+}
+
+// Autumn per-voxel mottle: a warm red-orange to gold-green patchwork so an
+// autumn canopy reads as turning leaves, not one flat orange.
+fn leaf_species_tint(mat: u32, vh: f32) -> vec3<f32> {
+    if (mat == MAT_LEAVES_AUTUMN) {
+        return mix(vec3<f32>(1.20, 0.72, 0.45), vec3<f32>(0.95, 1.25, 0.75), fract(vh * 8.0));
+    }
+    return vec3<f32>(1.0);
+}
+
 // The two big diagonal tuft quads of one leaf block (Better Leaves model:
 // 2.3 x 2.0 blocks — the pack geometry scaled up ~15% per user taste — at
 // 22.5 / -45 degrees plus the block hash 90-degree rotation, quad 1 slightly
 // off-centre). Tested over [t_lo, t_hi] so both the owning cell and the
 // surrounding fringe cells can render their part of the quads.
-fn leaf_bl_quads(voxel_min: vec3<f32>, origin: vec3<f32>, dir: vec3<f32>, t_lo: f32, t_hi: f32) -> SubHit {
+fn leaf_bl_quads(voxel_min: vec3<f32>, origin: vec3<f32>, dir: vec3<f32>, t_lo: f32, t_hi: f32, mat: u32) -> SubHit {
     var out: SubHit;
     out.hit = false;
     out.color_tint = vec3<f32>(1.0);
+    let tuft = leaf_tuft_index(mat);
+    let ext = leaf_quad_ext(tuft);
     let vh = hash3f(voxel_min);
     let vox_shade = 0.90 + fract(vh * 32.0) * 0.20;
+    let species = leaf_species_tint(mat, vh);
     let yrot = floor(vh * 4.0) * 1.5707963;
     let phase = voxel_min.x * 0.31 + voxel_min.z * 0.41 + vh * 6.28;
     let wind = wind_offset(voxel_min, phase, 0.06);
@@ -719,20 +751,20 @@ fn leaf_bl_quads(voxel_min: vec3<f32>, origin: vec3<f32>, dir: vec3<f32>, t_lo: 
         if (t <= t_lo || t >= min(t_hi, best_t)) { continue; }
         let lp = origin + dir * t - c;
         let lv = lp.y;
-        if (abs(lv) > 1.0) { continue; }
+        if (abs(lv) > ext.y) { continue; }
         var lu = lp.x * ca - lp.z * sa;
-        if (abs(lu) > 1.15) { continue; }
+        if (abs(lu) > ext.x) { continue; }
         // Gentle waving-mod shear, stronger toward the tuft top.
-        lu = lu - (wind.x * ca - wind.y * sa) * (lv / 2.0 + 0.5);
-        let tx = u32(clamp((lu / 1.15 * 0.5 + 0.5) * 32.0, 0.0, 31.0));
-        let ty = u32(clamp(2.0 + (lv / 2.0 + 0.5) * 28.0, 0.0, 31.0));
-        let val = tuft_texel(TUFT_OAK, tx, ty);
+        lu = lu - (wind.x * ca - wind.y * sa) * (lv / (2.0 * ext.y) + 0.5);
+        let tx = u32(clamp((lu / ext.x * 0.5 + 0.5) * 32.0, 0.0, 31.0));
+        let ty = u32(clamp(2.0 + (lv / (2.0 * ext.y) + 0.5) * 28.0, 0.0, 31.0));
+        let val = tuft_texel(tuft, tx, ty);
         if (val == 0u) { continue; }
         best_t = t;
         out.hit = true;
         out.t_hit = t;
         out.normal = select(n, -n, denom > 0.0);
-        out.color_tint = tuft_tone(val, vox_shade);
+        out.color_tint = tuft_tone(val, vox_shade) * species;
     }
     return out;
 }
@@ -765,7 +797,7 @@ fn leaf_fringe_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>) -> SubHi
         let nb_mat = voxel_material_at(nb);
         if (!is_leaf_block_mat(nb_mat)) { continue; }
         let nb_min = vec3<f32>(f32(nb.x), f32(nb.y), f32(nb.z));
-        var qh = leaf_bl_quads(nb_min, origin, dir, max(t_enter - 0.05, 0.0), t_exit + 0.05);
+        var qh = leaf_bl_quads(nb_min, origin, dir, max(t_enter - 0.05, 0.0), t_exit + 0.05, nb_mat);
         if (qh.hit && qh.t_hit < best_t) {
             best_t = qh.t_hit;
             // shade() tints by palette[MAT_LEAF_FRINGE]; fold in the ratio to
@@ -794,6 +826,8 @@ fn leaf_bl_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32) ->
 
     let vh = hash3f(voxel_min);
     let vox_shade = 0.90 + fract(vh * 32.0) * 0.20;
+    let tuft = leaf_tuft_index(mat);
+    let species = leaf_species_tint(mat, vh);
 
     var best_t: f32 = 1e30;
     var best_n = vec3<f32>(0.0, 1.0, 0.0);
@@ -802,7 +836,7 @@ fn leaf_bl_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32) ->
     // ---- the two big diagonal tuft quads (shared tester) ----
     // Overhang beyond this cell is rendered by the surrounding fringe cells,
     // so the own-cell test stays tight.
-    let qh = leaf_bl_quads(voxel_min, origin, dir, max(t_enter - 0.05, 0.0), t_exit + 0.05);
+    let qh = leaf_bl_quads(voxel_min, origin, dir, max(t_enter - 0.05, 0.0), t_exit + 0.05, mat);
     if (qh.hit) {
         best_t = qh.t_hit;
         best_n = qh.normal;
@@ -820,7 +854,7 @@ fn leaf_bl_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32) ->
         if (entry_axis == 0) { uv_e = vec2<f32>(lp_e.z, lp_e.y); }
         else if (entry_axis == 1) { uv_e = vec2<f32>(lp_e.x, lp_e.z); }
         else { uv_e = vec2<f32>(lp_e.x, lp_e.y); }
-        let val = tuft_texel(TUFT_OAK, 8u + u32(clamp(uv_e.x * 16.0, 0.0, 15.0)),
+        let val = tuft_texel(tuft, 8u + u32(clamp(uv_e.x * 16.0, 0.0, 15.0)),
                              8u + u32(clamp(uv_e.y * 16.0, 0.0, 15.0)));
         if (val != 0u) {
             var n = vec3<f32>(0.0);
@@ -829,7 +863,7 @@ fn leaf_bl_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32) ->
             else { n.z = select(1.0, -1.0, dir.z > 0.0); }
             best_t = t_enter;
             best_n = n;
-            tint = tuft_tone(val, vox_shade);
+            tint = tuft_tone(val, vox_shade) * species;
         }
     }
     if (best_t >= 1e29) {
@@ -844,7 +878,7 @@ fn leaf_bl_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32) ->
         if (exit_axis == 0) { uv_x = vec2<f32>(lp_x.z, lp_x.y); }
         else if (exit_axis == 1) { uv_x = vec2<f32>(lp_x.x, lp_x.z); }
         else { uv_x = vec2<f32>(lp_x.x, lp_x.y); }
-        let val = tuft_texel(TUFT_OAK, 8u + u32(clamp(uv_x.x * 16.0, 0.0, 15.0)),
+        let val = tuft_texel(tuft, 8u + u32(clamp(uv_x.x * 16.0, 0.0, 15.0)),
                              8u + u32(clamp(uv_x.y * 16.0, 0.0, 15.0)));
         if (val != 0u) {
             var n = vec3<f32>(0.0);
@@ -853,7 +887,7 @@ fn leaf_bl_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32) ->
             else { n.z = select(-1.0, 1.0, dir.z > 0.0); }
             best_t = t_exit;
             best_n = n;
-            tint = tuft_tone(val, vox_shade * 0.78);
+            tint = tuft_tone(val, vox_shade * 0.78) * species;
         }
     }
 
