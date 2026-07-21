@@ -59,6 +59,17 @@ Validation tooling added so changes are checkable without a display:
   profiler to justify; near-only foliage removes the worst divergence.)*
 - **LOD** → far terrain terminates at brick (`LOD_BRICK_T`) then tile granularity
   (`TILE_LOD_T`, via a tile-representative material).
+- **foliage overhaul** → per-species Better Leaves tufts (birch/spruce ported by
+  `examples/convert_tuft.rs`, oak self-validation 100%), autumn mottle, canopy
+  occupancy AO (fixes generic cube AO counting the invisible fringe shell as
+  solid; probes use the brick-local `neighbor_material` fast path), horizontal
+  cap tufts on canopy tops, three grass blade variants + per-clump height +
+  dry straw tufts on sand/snow, five flower species with an absolute colour
+  table, and a traveling gust field shared by geometric shear and shading
+  sway (wind direction lifted into the camera uniform). Validated by the
+  sprite property tests, `renders_leaf_species`, the lookdev views
+  (tree_close / canopy_top / birch_close / pine_close / meadow) and the
+  timing scenarios below.
 
 ## Correctness / numerical
 - **rebase to window-relative coords** → all float DDA math is done relative to the
@@ -111,6 +122,14 @@ temporal-differential system re-traces only ~1/8 of tiles per frame.
 | + shadow PCF 2→1 (Win B) | 11.0 ms (91 fps) | 8.6 ms (117 fps) |
 | **+ AO distance-LOD** | **9.8 ms (102 fps)** | **6.9 ms (144 fps)** |
 | pure traversal (no shading) | 5.6 ms | 3.1 ms |
+
+Scenario timings after the foliage overhaul (same harness, per-scenario cameras
+from `find_scene_anchors`, 1920×1080): terrain 5.4 ms, water 12.1 ms, foliage
+8.28 → 9.0 ms, meadow 6.1 ms. The foliage delta breaks down as canopy AO +1.9%
+(brick-local probes; naive probes cost +4.3% and were rejected), cap tufts ~+5%
+(kept for the canopy-top read; revert that commit to reclaim ~0.45 ms), gusts
++1%. Grass/flower density is capacity-tuned: denser ground flora measurably
+slows every view containing grass tops (see `Biome::flora_probs`).
 
 So the worst case now clears **100+ fps even at 1080p**, and shading (the
 dominant ~60–70%) was cut ~40% with no visible quality loss (TAA accumulates the

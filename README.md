@@ -42,16 +42,22 @@ Shading and effects:
 - **Glass**: Fresnel reflection plus per-channel refraction for chromatic dispersion (n = 1.48/1.50/1.52),
   total-internal-reflection fallback to the reflected ray, distance-compounding tint; the 3-trace
   dispersion path is gated to grazing angles.
-- **Foliage**, resolved sub-voxel inside the DDA. Leaves port the model and texture of Motschen's
+- **Foliage**, resolved sub-voxel inside the DDA. Leaves port the model and textures of Motschen's
   [Better Leaves](https://github.com/TeamMidnightDust/BetterLeavesLite) resource pack (MIT): each leaf
-  block is a cutout cube (faces sample the centre of the pack's pre-rounded 32×32 tuft texture, carried
-  as ASCII art in `src/sprites.rs`) plus two big double-sided diagonal tuft quads (2.3×2.0 blocks at
-  22.5°/−45°, four hash-picked rotations per block) that shear gently in the wind. Worldgen paints an
+  block is a cutout cube (faces sample the centre of its species' pre-rounded 32×32 tuft — oak, birch
+  and spruce ported via `examples/convert_tuft.rs`, carried as ASCII art in `src/sprites.rs`) plus two
+  big double-sided diagonal tuft quads (species-scaled, 22.5°/−45°, four hash-picked rotations per
+  block) that shear gently in the wind; autumn canopies add a per-voxel red-to-gold mottle. A
+  sky-weighted occupancy AO darkens canopy interiors so crowns read volumetric. Worldgen paints an
   invisible one-voxel fringe shell around every canopy whose cells render the neighbouring blocks'
-  protruding tuft parts, so the bushy overhang is visible from every angle — fringe never draws as a
-  cube, casts no shadows and is skipped by picking. Tall grass and flowers (poppy, daisy) are crossed
-  quads carrying authored sprites, sheared by the wind in shared world space so the X always intersects;
-  grass blocks render dirt sides with a ragged grass fringe.
+  protruding tuft parts — and lay a horizontal cap tuft over canopy tops — so the bushy overhang reads
+  from every angle; fringe never draws as a cube, casts no shadows and is skipped by picking. Tall
+  grass (three blade shapes with per-clump height, hue-coupled to the ground palette) and five flower
+  species (poppy, daisy, tulip, cornflower, dandelion, clustered into wildflower meadows) are crossed
+  quads carrying authored sprites, sheared by the wind in shared world space so the X always
+  intersects; dry straw tufts dot desert sand and tundra snow. Wind strength rides a traveling gust
+  field, so gusts visibly move across fields instead of the whole map swaying in lockstep; grass blocks
+  render dirt sides with a ragged grass fringe.
 - **Lighting**: day/night sun cycle with sunset scattering, sun disc, halo and stars; single-sample
   golden-angle PCF soft shadows jittered with interleaved gradient noise (TAA accumulates the penumbra);
   bit-test ambient occlusion bilinearly interpolated across the hit face.
