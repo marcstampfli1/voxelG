@@ -76,7 +76,22 @@ struct PlayersBuf {
 // reflection/refraction so the opaque-majority warps in cs_main stay coherent
 // (less 8x8 divergence). A read_write storage buffer (not a texture) lets both
 // passes share this binding without a read/write aliasing hazard.
-@group(0) @binding(17) var<storage, read_write> transp_buf: array<vec4<f32>>;
+// Deferred transparent records, one per pixel. Explicit u32 schema (bit
+// patterns must survive exactly; f32 lanes are not bit-stable for packed
+// payloads on all hardware):
+//   x = bitcast<u32>(t_hit)
+//   y = kind: TR_NONE / TR_WATER_TOP / TR_WATER_FACE / TR_GLASS
+//   z = TR_WATER_TOP: pack2x16float(rest-gradient of the surface, i.e. the
+//       level/step part without the wave field - cs_transparent adds the
+//       per-pixel field gradient on top); TR_WATER_FACE/TR_GLASS: axis face
+//       code (encode_face_normal)
+//   w = spare (0)
+@group(0) @binding(17) var<storage, read_write> transp_buf: array<vec4<u32>>;
+
+const TR_NONE:       u32 = 0u;
+const TR_WATER_TOP:  u32 = 1u;
+const TR_WATER_FACE: u32 = 2u;
+const TR_GLASS:      u32 = 3u;
 
 // Authored 16x16 foliage sprites, 2 bits per texel (0 transparent, 1 primary,
 // 2 secondary/dark, 3 accent). Drawn as ASCII art in src/sprites.rs and
@@ -314,6 +329,9 @@ struct Hit {
     // (1,1,1) for plain cube hits. Carried in the Hit so secondary rays can't
     // read a stale value, which a module-global tint could leak.
     tint: vec3<f32>,
+    // Water-top rest gradient (terrace/level slope without the wave field),
+    // transported to the deferred record. (0,0) for everything else.
+    aux: vec2<f32>,
 };
 
 // IGN (interleaved gradient noise) — high-quality low-discrepancy per-pixel
@@ -377,18 +395,17 @@ fn cs_clouds(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // Axis-aligned face normal <-> small code, for the deferred transparent buffer.
-fn encode_face_normal(n: vec3<f32>) -> f32 {
-    if (n.x > 0.5) { return 0.0; } else if (n.x < -0.5) { return 1.0; }
-    else if (n.y > 0.5) { return 2.0; } else if (n.y < -0.5) { return 3.0; }
-    else if (n.z > 0.5) { return 4.0; } else { return 5.0; }
+fn encode_face_normal(n: vec3<f32>) -> u32 {
+    if (n.x > 0.5) { return 0u; } else if (n.x < -0.5) { return 1u; }
+    else if (n.y > 0.5) { return 2u; } else if (n.y < -0.5) { return 3u; }
+    else if (n.z > 0.5) { return 4u; } else { return 5u; }
 }
-fn decode_face_normal(c: f32) -> vec3<f32> {
-    let i = i32(c + 0.5);
-    if (i == 0) { return vec3<f32>(1.0, 0.0, 0.0); }
-    if (i == 1) { return vec3<f32>(-1.0, 0.0, 0.0); }
-    if (i == 2) { return vec3<f32>(0.0, 1.0, 0.0); }
-    if (i == 3) { return vec3<f32>(0.0, -1.0, 0.0); }
-    if (i == 4) { return vec3<f32>(0.0, 0.0, 1.0); }
+fn decode_face_normal(c: u32) -> vec3<f32> {
+    if (c == 0u) { return vec3<f32>(1.0, 0.0, 0.0); }
+    if (c == 1u) { return vec3<f32>(-1.0, 0.0, 0.0); }
+    if (c == 2u) { return vec3<f32>(0.0, 1.0, 0.0); }
+    if (c == 3u) { return vec3<f32>(0.0, -1.0, 0.0); }
+    if (c == 4u) { return vec3<f32>(0.0, 0.0, 1.0); }
     return vec3<f32>(0.0, 0.0, -1.0);
 }
 
@@ -401,29 +418,32 @@ fn cs_transparent(@builtin(global_invocation_id) gid: vec3<u32>) {
     let res = vec2<i32>(camera.resolution);
     if (i32(gid.x) >= res.x || i32(gid.y) >= res.y) { return; }
     let rec = transp_buf[gid.y * u32(res.x) + gid.x];
-    if (rec.w < 0.5) { return; } // not a transparent pixel
+    if (rec.y == TR_NONE) { return; } // not a transparent pixel
 
     let uv = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5) + camera.jitter) / camera.resolution;
     let dir = ray_dir_uv(uv);
 
     var hit: Hit;
     hit.hit = true;
-    hit.t_hit = rec.x;
+    hit.t_hit = bitcast<f32>(rec.x);
     hit.last_axis = 0;
     hit.voxel = vec3<i32>(0);
     hit.tint = vec3<f32>(1.0);
+    hit.aux = vec2<f32>(0.0);
     var col: vec3<f32>;
-    if (rec.y < 1.5) {
+    if (rec.y == TR_WATER_TOP) {
         hit.mat = MAT_WATER_L8;
-        if (i32(rec.z + 0.5) == 2) {
-            // Top surface: exact smooth field normal at the hit point (the
-            // per-pixel derivative of the same field the facets displace by).
-            let p_hit = camera.origin + dir * rec.x;
-            let f = water_field(p_hit.xz, camera.time);
-            hit.normal = normalize(vec3<f32>(-f.y, 1.0, -f.z));
-        } else {
-            hit.normal = decode_face_normal(rec.z);
-        }
+        // Top surface: the carried rest-gradient (terrace/level slope, zero
+        // on flat lakes) plus the exact per-pixel field gradient (the same
+        // field the facets displace by).
+        let p_hit = camera.origin + dir * hit.t_hit;
+        let g = unpack2x16float(rec.z);
+        let f = water_field(p_hit.xz, camera.time);
+        hit.normal = normalize(vec3<f32>(-(g.x + f.y), 1.0, -(g.y + f.z)));
+        col = shade_water_top(hit, camera.origin, dir);
+    } else if (rec.y == TR_WATER_FACE) {
+        hit.mat = MAT_WATER_L8;
+        hit.normal = decode_face_normal(rec.z);
         col = shade_water_top(hit, camera.origin, dir);
     } else {
         hit.mat = MAT_GLASS;
@@ -505,16 +525,24 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     // G-buffer for the shadow/AO reprojection cache; sentinel pos = never reused.
     var gbuf = vec4<f32>(1e9, 1e9, 1e9, 0.0);
-    // Deferred transparent record (mat_code 0 = opaque/none).
-    var transp = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    // Deferred transparent record (kind TR_NONE = opaque/none).
+    var transp = vec4<u32>(0u);
     if (hit.hit) {
         if (is_water_mat(hit.mat)) {
-            // Defer ALL water (plates, walls, undersides) to cs_transparent.
-            // The quantised plate/face normal travels in the record code.
-            transp = vec4<f32>(hit.t_hit, 1.0, encode_water_normal(hit.normal), 1.0);
+            // Defer ALL water (patches, walls, undersides) to cs_transparent.
+            // Up-facing surface hits carry the rest-gradient; walls and
+            // undersides carry their axis face code.
+            if (hit.normal.y > 0.9) {
+                transp = vec4<u32>(bitcast<u32>(hit.t_hit), TR_WATER_TOP,
+                                   pack2x16float(hit.aux), 0u);
+            } else {
+                transp = vec4<u32>(bitcast<u32>(hit.t_hit), TR_WATER_FACE,
+                                   encode_face_normal(hit.normal), 0u);
+            }
             col = sky(dir); // cheap placeholder (overwritten by cs_transparent)
         } else if (hit.mat == MAT_GLASS) {
-            transp = vec4<f32>(hit.t_hit, 2.0, encode_face_normal(hit.normal), 1.0);
+            transp = vec4<u32>(bitcast<u32>(hit.t_hit), TR_GLASS,
+                               encode_face_normal(hit.normal), 0u);
             col = sky(dir);
         } else {
             // Solid terrain faces have stable (view-independent) shadow + AO, so
@@ -1561,14 +1589,6 @@ fn water_subvoxel(
     return out;
 }
 
-// Water normal record code: any up-facing surface hit (facet or cube top)
-// gets code 2; cs_transparent recomputes the exact smooth field normal at
-// the hit point. Walls and undersides keep their axis face codes.
-fn encode_water_normal(n: vec3<f32>) -> f32 {
-    if (n.y > 0.9) { return 2.0; }
-    return encode_face_normal(n);
-}
-
 // Face normal + entry distance for the cell a ray just stepped into. `last_axis`
 // is the axis whose plane we crossed (0/1/2); -1 means we began inside the cell,
 // so fall back to the dominant entry plane from `tmin3`. Extracted so every LOD
@@ -1712,6 +1732,7 @@ fn trace_no_water(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
     out.voxel = vec3<i32>(0);
     out.last_axis = -1;
     out.t_hit = 0.0;
+    out.aux = vec2<f32>(0.0);
     out.tint = vec3<f32>(1.0);
 
     let init = dda_init(origin, dir);
@@ -2372,6 +2393,7 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
     out.voxel = vec3<i32>(0);
     out.last_axis = -1;
     out.t_hit = 0.0;
+    out.aux = vec2<f32>(0.0);
     out.tint = vec3<f32>(1.0);
 
     let init = dda_init(origin, dir);
