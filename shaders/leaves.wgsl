@@ -77,12 +77,14 @@ fn vs_leaf(@builtin(vertex_index) vid: u32,
     o.uv = c * 0.5 + vec2<f32>(0.5);
     o.sprite = leaf.sprite;
     o.view_t = length(d);
-    // Cheap time-of-day light + tumble glint (no shadow trace at this
-    // budget - a falling leaf is lit as if exposed).
+    // Time-of-day light: ambient follows the sky brightness, direct sun is
+    // scaled by the CPU-probed visibility factor in the alpha byte (leaves
+    // under canopy or indoors go properly dark) plus a tumble glint.
     let s = sun_dir_at(camera.sun_time);
     let glint = 0.55 + 0.45 * abs(cos(leaf.tilt_phase));
-    let tint = unpack4x8unorm(leaf.tint).rgb;
-    o.lit = tint * (vec3<f32>(0.30, 0.34, 0.40) + sun_color(s) * glint);
+    let t4 = unpack4x8unorm(leaf.tint);
+    let sky_f = 0.25 + 0.75 * sun_intensity(s);
+    o.lit = t4.rgb * (vec3<f32>(0.30, 0.34, 0.40) * sky_f + sun_color(s) * glint * t4.a);
     return o;
 }
 

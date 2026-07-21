@@ -62,6 +62,9 @@ struct Leaf {
     sprite: u32,
     tint: u32,
     age: f32,
+    /// Smoothed sun-visibility factor (0.22 shadowed .. 1.0 lit), updated
+    /// round-robin by cheap coarse probes toward the sun.
+    shadow: f32,
     state: LeafState,
 }
 
@@ -86,6 +89,7 @@ pub struct LeafSim {
     rng: Rng,
     spawn_accum: f32,
     time: f32,
+    shadow_cursor: usize,
 }
 
 /// Materials a falling leaf passes through instead of landing on: air, the
@@ -101,7 +105,13 @@ fn passthrough(m: u8) -> bool {
 
 impl LeafSim {
     pub fn new(seed: u64) -> Self {
-        Self { leaves: Vec::with_capacity(MAX_LEAVES), rng: Rng(seed), spawn_accum: 0.0, time: 0.0 }
+        Self {
+            leaves: Vec::with_capacity(MAX_LEAVES),
+            rng: Rng(seed),
+            spawn_accum: 0.0,
+            time: 0.0,
+            shadow_cursor: 0,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -113,8 +123,10 @@ impl LeafSim {
     }
 
     /// Advance the simulation. `dt` should be the (clamped) frame dt; the
-    /// determinism tests drive this with a fixed step.
-    pub fn step(&mut self, world: &World, cam_pos: Vec3, dt: f32) {
+    /// determinism tests drive this with a fixed step. `sun` is the current
+    /// sun direction (camera::sun_dir_at of the sun clock) for the shadow
+    /// probes.
+    pub fn step(&mut self, world: &World, cam_pos: Vec3, dt: f32, sun: Vec3) {
         self.time += dt;
         let wind = wind_dir(self.time);
         self.leaves.retain_mut(|leaf| {
@@ -161,6 +173,38 @@ impl LeafSim {
                 }
             }
         });
+
+        // Amortized lighting: coarse-march up to 16 leaves per frame toward
+        // the sun (1-voxel steps, 48 max) and smooth the visibility factor.
+        // Leaves/solids occlude, the invisible fringe and decoration do not.
+        if !self.leaves.is_empty() {
+            for _ in 0..16.min(self.leaves.len()) {
+                self.shadow_cursor = (self.shadow_cursor + 1) % self.leaves.len();
+                let leaf = &mut self.leaves[self.shadow_cursor];
+                let mut lit = 1.0f32;
+                if sun.y > 0.0 {
+                    let mut p = leaf.pos + sun * 0.75;
+                    for _ in 0..48 {
+                        let m = world.material_at_world(
+                            p.x.floor() as i32, p.y.floor() as i32, p.z.floor() as i32,
+                        );
+                        if m != MAT_AIR
+                            && m != MAT_LEAF_FRINGE
+                            && m != MAT_FLOWER
+                            && m != MAT_TALL_GRASS
+                            && m != MAT_TALL_GRASS_DRY
+                        {
+                            lit = 0.22;
+                            break;
+                        }
+                        p += sun;
+                    }
+                } else {
+                    lit = 0.4; // night: no direct sun to occlude
+                }
+                leaf.shadow += (lit - leaf.shadow) * 0.25;
+            }
+        }
 
         self.spawn_accum += SPAWN_RATE_PER_S * dt;
         while self.spawn_accum >= 1.0 {
@@ -230,8 +274,9 @@ impl LeafSim {
                 spin: self.rng.next_f32() * std::f32::consts::TAU,
                 spin_rate: -2.5 + 5.0 * self.rng.next_f32(),
                 sprite,
-                tint: tint[0] | (tint[1] << 8) | (tint[2] << 16) | 0xff00_0000,
+                tint: tint[0] | (tint[1] << 8) | (tint[2] << 16),
                 age: 0.0,
+                shadow: 0.65,
                 state: LeafState::Falling,
             });
             return;
@@ -251,13 +296,15 @@ impl LeafSim {
                 LeafState::Falling => leaf.phase,
                 _ => 0.0,
             };
+            // The alpha byte carries the smoothed sun-visibility factor.
+            let shadow_bits = ((leaf.shadow.clamp(0.0, 1.0) * 255.0) as u32) << 24;
             out.push(LeafInstance {
                 pos: leaf.pos.to_array(),
                 size,
                 rot: leaf.spin,
                 tilt_phase: tilt,
                 sprite: leaf.sprite,
-                tint: leaf.tint,
+                tint: (leaf.tint & 0x00ff_ffff) | shadow_bits,
             });
         }
     }
@@ -269,6 +316,7 @@ mod tests {
     use crate::voxel::{MAT_LEAVES, MAT_STONE, MAT_WATER};
 
     const DT: f32 = 1.0 / 60.0;
+    const SUN: Vec3 = Vec3::new(0.357, 0.874, 0.331);
 
     /// One oak canopy over stone ground; camera parked beside it.
     fn tree_world() -> (World, Vec3) {
@@ -300,7 +348,7 @@ mod tests {
         let cam = Vec3::new(16.0_f32.max(48.0), 101.0, 272.0_f32.min(464.0) - 18.0);
         let mut sim = LeafSim::new(11);
         for i in 0..240 {
-            sim.step(&w, cam, 1.0 / 60.0);
+            sim.step(&w, cam, 1.0 / 60.0, SUN);
             if i % 60 == 0 {
                 eprintln!("step {i}: {} leaves", sim.len());
             }
@@ -321,9 +369,9 @@ mod tests {
         let mut b = LeafSim::new(7);
         let mut c = LeafSim::new(8);
         for _ in 0..600 {
-            a.step(&w, cam, DT);
-            b.step(&w, cam, DT);
-            c.step(&w, cam, DT);
+            a.step(&w, cam, DT, SUN);
+            b.step(&w, cam, DT, SUN);
+            c.step(&w, cam, DT, SUN);
         }
         let dump = |s: &LeafSim| {
             let mut v = Vec::new();
@@ -342,7 +390,7 @@ mod tests {
         let mut seen = 0;
         for _ in 0..1200 {
             let before = sim.len();
-            sim.step(&w, cam, DT);
+            sim.step(&w, cam, DT, SUN);
             if sim.len() > before {
                 // Newest leaf spawned this step: its column top must be leaf.
                 let leaf = sim.leaves.last().unwrap();
@@ -369,7 +417,7 @@ mod tests {
         // Run long enough for early leaves to complete fall + rest + shrink.
         let mut max_alive_age: f32 = 0.0;
         for _ in 0..3600 {
-            sim.step(&w, cam, DT);
+            sim.step(&w, cam, DT, SUN);
             for leaf in &sim.leaves {
                 max_alive_age = max_alive_age.max(leaf.age);
                 if let LeafState::Resting(_) = leaf.state {
@@ -397,7 +445,7 @@ mod tests {
         }
         let mut sim = LeafSim::new(5);
         for _ in 0..3600 {
-            sim.step(&w, cam, DT);
+            sim.step(&w, cam, DT, SUN);
             for leaf in &sim.leaves {
                 if let LeafState::Resting(_) = leaf.state {
                     let cell = leaf.pos.floor();
@@ -413,7 +461,7 @@ mod tests {
         let (w, cam) = tree_world();
         let mut sim = LeafSim::new(1);
         for _ in 0..10_000 {
-            sim.step(&w, cam, DT);
+            sim.step(&w, cam, DT, SUN);
             assert!(sim.len() <= MAX_LEAVES);
         }
     }
@@ -431,7 +479,7 @@ mod tests {
         let cam = Vec3::new(240.0, 120.0, 240.0);
         let mut sim = LeafSim::new(2);
         for _ in 0..3600 {
-            sim.step(&w, cam, DT);
+            sim.step(&w, cam, DT, SUN);
             for leaf in &sim.leaves {
                 assert!(leaf.age <= LEAF_TTL + DT);
             }

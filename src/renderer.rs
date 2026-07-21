@@ -2540,7 +2540,7 @@ mod gpu_render_tests {
                 clamp_anchor(leaf_c.y) - 18.0,
             );
             for _ in 0..240 {
-                sim.step(&world, cam_pos, 1.0 / 60.0);
+                sim.step(&world, cam_pos, 1.0 / 60.0, crate::camera::sun_dir_at(0.0));
             }
             let mut inst = Vec::new();
             sim.write_instances(&mut inst);

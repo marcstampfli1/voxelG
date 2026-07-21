@@ -113,6 +113,12 @@ pub fn wind_dir(time: f32) -> glam::Vec2 {
     glam::Vec2::new(a.cos(), a.sin())
 }
 
+/// CPU mirror of the WGSL sun_dir_at in shaders/common.wgsl - keep in sync.
+pub fn sun_dir_at(t: f32) -> glam::Vec3 {
+    let a = t * 0.025 + 1.20;
+    glam::Vec3::new(a.cos(), a.sin(), 0.30).normalize()
+}
+
 impl CameraUniform {
     pub fn from_camera(
         c: &Camera,

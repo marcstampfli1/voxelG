@@ -540,7 +540,7 @@ impl App {
             // Falling leaves: stepped under the already-held lock (a few
             // hundred leaves = tens of microseconds), uploaded after it.
             if let Some(sim) = &mut self.leaf_sim {
-                sim.step(&world, self.camera.pos, dt);
+                sim.step(&world, self.camera.pos, dt, crate::camera::sun_dir_at(sun_t));
             }
         }
         if let Some(sim) = &self.leaf_sim {
