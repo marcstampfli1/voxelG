@@ -30,15 +30,19 @@ Traversal and performance:
 
 Shading and effects:
 
-- **Water**: real sub-voxel displaced geometry — each surface water voxel renders a planar facet sampled
-  from a continuous four-wave Gerstner spectrum at the cell's own centre (swell λ26, sea λ13, chop λ7 and
-  λ3.5 voxels), so neighbouring facets line up sub-pixel and the surface reads as traveling wavefronts
-  with real parallax and silhouettes. Shading uses the exact per-pixel field normal; vertical water walls
-  appear only at shores, waterfalls and physics level differences. Schlick Fresnel mixes a traced
-  reflection with a Snell-refracted trace beneath the surface (η = 1/1.33); Beer-Lambert per-channel
-  absorption, shoreline foam from underwater hit distance gated by wave crests, a caustic approximation,
-  specular sun glints, and a separate absorption post-effect when the camera is submerged. Facets respect
-  the physics fill level (L1-L8) of each voxel.
+- **Water**: real sub-voxel displaced geometry — each surface water voxel renders a bilinear patch over
+  four per-corner heights. A corner takes the mean fill level of the up-to-4 water columns sharing it
+  (so mixed physics levels L1-L8 ramp smoothly), displaced by a continuous four-wave Gerstner spectrum
+  sampled at the corner's world position (swell λ26, sea λ13, chop λ7 and λ3.5 voxels); any
+  corner-sharing column with water one cell up pins the corner to the cell top, so water bodies that
+  touch diagonally or at different heights knit into one connected surface instead of isolated plates.
+  Shared corners are computed identically from every sharing cell, so continuity is exact and vertical
+  water walls appear only at shores, waterfalls and level steps. Shading uses the carried terrace
+  gradient plus the exact per-pixel field normal; the far LOD tier falls back to a centre-sampled
+  facet. Schlick Fresnel mixes a traced reflection with a Snell-refracted trace beneath the surface
+  (η = 1/1.33); Beer-Lambert per-channel absorption, shoreline foam from underwater hit distance gated
+  by wave crests, a caustic approximation, specular sun glints, and a separate absorption post-effect
+  when the camera is submerged.
 - **Glass**: Fresnel reflection plus per-channel refraction for chromatic dispersion (n = 1.48/1.50/1.52),
   total-internal-reflection fallback to the reflected ray, distance-compounding tint; the 3-trace
   dispersion path is gated to grazing angles.

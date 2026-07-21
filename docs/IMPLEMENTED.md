@@ -59,6 +59,19 @@ Validation tooling added so changes are checkable without a display:
   profiler to justify; near-only foliage removes the worst divergence.)*
 - **LOD** → far terrain terminates at brick (`LOD_BRICK_T`) then tile granularity
   (`TILE_LOD_T`, via a tile-representative material).
+- **connected water surface** → per-corner heights (mean fill level of the
+  corner-sharing columns + Gerstner field at the corner; water one cell up in
+  any sharing column pins the corner to the cell top) with closed-form
+  bilinear-patch intersection, so diagonally-touching / different-height
+  water knits into one surface. Corner tier within `WATER_NEAR_T`, previous
+  centre-plane facet beyond; rest-gradient carried to the deferred pass in
+  the u32 transparent record. Validated by `water_diagonal_connects`
+  (measured thresholds, fails on the pre-fix shader), `water_terrace_ramp`,
+  the `water_terrace` lookdev view and a terrace timing scenario. Cost on
+  the worst-case ocean bench: 12.15 -> 13.5 ms/frame at 1080p (74 fps
+  GPU-bound; breakdown in the feat commit). *(Known scalable follow-up: a
+  per-frame surface-cell corner precompute would take the probes off the
+  per-ray path entirely.)*
 - **foliage overhaul** → per-species Better Leaves tufts (birch/spruce ported by
   `examples/convert_tuft.rs`, oak self-validation 100%), autumn mottle, canopy
   occupancy AO (fixes generic cube AO counting the invisible fringe shell as
