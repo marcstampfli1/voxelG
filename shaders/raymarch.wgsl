@@ -97,6 +97,12 @@ const TR_GLASS:      u32 = 3u;
 // 2 secondary/dark, 3 accent). Drawn as ASCII art in src/sprites.rs and
 // encoded at startup — hand-made cutout art, not hash noise.
 @group(0) @binding(18) var<storage, read> sprites: array<u32>;
+// Primary-hit depth (t along the primary ray; 1e9 = sky). Water and glass
+// pixels carry the SURFACE t (cs_transparent re-shades at the same t) and
+// player boxes are included, so the falling-leaf pass can depth-test
+// against the world without any rasterized geometry. Persists across
+// temporal-differential clean tiles exactly like output_tex.
+@group(0) @binding(19) var depth_out: texture_storage_2d<r32float, write>;
 
 // The SPR_* / TUFT_* atlas constants are GENERATED from src/sprites.rs and
 // prepended to this source (see renderer::raymarch_source) - single source
@@ -616,6 +622,8 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             col = player_color_for(pid);
         }
     }
+    textureStore(depth_out, vec2<i32>(i32(gid.x), i32(gid.y)),
+                 vec4<f32>(min(closest_t, 1e9), 0.0, 0.0, 0.0));
 
     // Volumetric clouds — sampled from the half-res cs_clouds pass (bilinear
     // upsample) instead of marched here. Terrain occlusion is reapplied cheaply:

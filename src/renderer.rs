@@ -242,6 +242,9 @@ pub struct Renderer {
     // Deferred transparent pass (#16): shares compute_bgl/compute_bg.
     transparent_pipeline: wgpu::ComputePipeline,
     transp_buf: wgpu::Buffer,
+    #[allow(dead_code)] // kept alive for the view; the leaf pass reads the view
+    depth_tex: wgpu::Texture,
+    depth_view: wgpu::TextureView,
 
     // Half-res volumetric (cloud) pass. The texture handle is dropped after
     // creation — its views keep the GPU resource alive.
@@ -472,6 +475,8 @@ impl Renderer {
         let (light_hist_tex, light_hist_view) = create_lighting_texture(&device, width, height);
         // Deferred transparent records (#16).
         let transp_buf = create_transp_buf(&device, width, height);
+        // Primary-hit depth for the falling-leaf pass.
+        let (depth_tex, depth_view) = create_depth_texture(&device, width, height);
 
         // -- compute pipeline --
         let compute_bgl = create_compute_bgl(&device);
@@ -500,7 +505,7 @@ impl Renderer {
             &tile_mask_buf, &chunk_mask_buf, &palette_buf, &output_view, &beam_view,
             &tile_dirty_buf, &players_buf, &brick_uniform_buf, &tile_uniform_buf, &l4_mask_buf,
             &cloud_sampled_view, &sampler, &light_hist_view, &light_out_view, &transp_buf,
-            &sprites_buf,
+            &sprites_buf, &depth_view,
         );
 
         // -- deferred transparent pipeline (cs_transparent, same module + bgl) --
@@ -690,7 +695,7 @@ impl Renderer {
             history_tex, history_view, resolve_tex, resolve_view, sampler,
             beam_bgl, beam_pipeline, beam_bg,
             compute_bgl, compute_pipeline, compute_bg,
-            transparent_pipeline, transp_buf,
+            transparent_pipeline, transp_buf, depth_tex, depth_view,
             bricks_buf_b, physics_pipeline, physics_bg, gpu_physics: gpu_physics_enabled,
             cloud_bgl, cloud_pipeline, cloud_bg, cloud_sampled_view, cloud_storage_view,
             light_out_tex, light_out_view, light_hist_tex, light_hist_view,
@@ -737,6 +742,9 @@ impl Renderer {
         self.light_hist_tex = lh_tex;
         self.light_hist_view = lh_view;
         self.transp_buf = create_transp_buf(&self.device, rw, rh);
+        let (dt, dv) = create_depth_texture(&self.device, rw, rh);
+        self.depth_tex = dt;
+        self.depth_view = dv;
 
         self.compute_bg = make_compute_bg(
             &self.device, &self.compute_bgl, &self.camera_buf, &self.bricks_buf,
@@ -744,7 +752,7 @@ impl Renderer {
             &self.tile_dirty_buf, &self.players_buf, &self.brick_uniform_buf, &self.tile_uniform_buf,
             &self.l4_mask_buf, &self.cloud_sampled_view, &self.sampler,
             &self.light_hist_view, &self.light_out_view, &self.transp_buf,
-            &self.sprites_buf,
+            &self.sprites_buf, &self.depth_view,
         );
         self.cloud_bg = make_cloud_bg(
             &self.device, &self.cloud_bgl, &self.camera_buf, &self.cloud_storage_view,
@@ -1152,6 +1160,23 @@ fn create_beam_texture(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture,
     (tex, view)
 }
 
+/// Full-resolution primary-hit depth (r32float): written by cs_main, read by
+/// the falling-leaf pass for manual depth testing.
+fn create_depth_texture(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture, wgpu::TextureView) {
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("scene depth"),
+        size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R32Float,
+        usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+    (tex, view)
+}
+
 /// Compute-pass bind-group layout. Single definition shared by the renderer and
 /// the headless render test so the two can never drift. Binding order matches
 /// `make_compute_bg` and the `@group(0) @binding(N)` declarations in
@@ -1242,6 +1267,7 @@ fn create_compute_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
             bgl_storage_tex(16, wgpu::TextureFormat::Rgba32Float), // light_out
             bgl_storage(17, false), // transp_buf: deferred transparent records (rw)
             bgl_storage(18, true),  // foliage sprites (2bpp authored cutout art)
+            bgl_storage_tex(19, wgpu::TextureFormat::R32Float), // primary-hit depth out
         ],
     })
 }
@@ -1344,6 +1370,7 @@ fn make_compute_bg(
     light_out_view: &wgpu::TextureView,
     transp_buf: &wgpu::Buffer,
     sprites_buf: &wgpu::Buffer,
+    depth_view: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("compute bg"),
@@ -1367,6 +1394,7 @@ fn make_compute_bg(
             wgpu::BindGroupEntry { binding: 16, resource: wgpu::BindingResource::TextureView(light_out_view) },
             wgpu::BindGroupEntry { binding: 17, resource: transp_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 18, resource: sprites_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 19, resource: wgpu::BindingResource::TextureView(depth_view) },
         ],
     })
 }
@@ -1607,12 +1635,13 @@ mod gpu_render_tests {
         let (_ltex2, light_out_view) = create_lighting_texture(&device, w, h);
         let transp_buf = create_transp_buf(&device, w, h);
         let sprites_buf = storage(&device, "sprites", bytemuck::cast_slice(&crate::sprites::encoded()));
+        let (_dtex, depth_view) = create_depth_texture(&device, w, h);
         let bg = make_compute_bg(
             &device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
             &palette_buf, &output_view, &beam_view, &tile_dirty_buf, &players_buf,
             &brick_uniform_buf, &tile_uniform_buf, &l4_mask_buf,
             &cloud_sampled_view, &cloud_sampler, &light_in_view, &light_out_view, &transp_buf,
-            &sprites_buf,
+            &sprites_buf, &depth_view,
         );
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("test pl"),
@@ -2380,7 +2409,8 @@ mod gpu_render_tests {
         let tpb = create_transp_buf(&device, w, h);
         let spr = storage(&device, "sprites", bytemuck::cast_slice(&crate::sprites::encoded()));
         let bgl = create_compute_bgl(&device);
-        let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &ov, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr);
+        let (_dtex, dv) = create_depth_texture(&device, w, h);
+        let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &ov, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &dv);
         let pll = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[&bgl], push_constant_ranges: &[] });
         let src = raymarch_source();
         let m = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(src.into()) });
