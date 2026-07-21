@@ -147,6 +147,13 @@ temporal-differential system re-traces only ~1/8 of tiles per frame.
 | **+ AO distance-LOD** | **9.8 ms (102 fps)** | **6.9 ms (144 fps)** |
 | pure traversal (no shading) | 5.6 ms | 3.1 ms |
 
+Clean batch after the material rework + K=12 leaf cloud (GPU free,
+2026-07-21 evening): terrain 6.1, water 14.2, foliage 10.5, meadow 6.8,
+terrace 11.6, leaf_lab 7.0 ms/frame at 1080p; falling-leaf pass still free
+(7.00 vs 7.01 with 256 leaves). The texture noise layers cost ~+0.7 ms on
+terrain-class views; the quality passes (denser leaf cloud, textures,
+grain) total ~+1 ms per scene against the morning references.
+
 Scenario timings after the foliage overhaul (same harness, per-scenario cameras
 from `find_scene_anchors`, 1920×1080): terrain 5.4 ms, water 12.1 ms, foliage
 8.28 → 9.0 ms, meadow 6.1 ms. The foliage delta breaks down as canopy AO +1.9%
