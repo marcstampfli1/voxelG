@@ -245,6 +245,14 @@ pub struct Renderer {
     #[allow(dead_code)] // kept alive for the view; the leaf pass reads the view
     depth_tex: wgpu::Texture,
     depth_view: wgpu::TextureView,
+    #[allow(dead_code)] // kept alive for the views bound in the bind groups
+    geom_tex: wgpu::Texture,
+    geom_view: wgpu::TextureView,
+    #[allow(dead_code)]
+    dummy_depth_tex: wgpu::Texture,
+    dummy_depth_view: wgpu::TextureView,
+    compose_pipeline: wgpu::ComputePipeline,
+    compose_bg: wgpu::BindGroup,
     leaves_buf: wgpu::Buffer,
     leaf_count: u32,
     leaf_bgl: wgpu::BindGroupLayout,
@@ -480,8 +488,16 @@ impl Renderer {
         let (light_hist_tex, light_hist_view) = create_lighting_texture(&device, width, height);
         // Deferred transparent records (#16).
         let transp_buf = create_transp_buf(&device, width, height);
-        // Primary-hit depth for the falling-leaf pass.
+        // Primary-hit depth for the falling-leaf pass and cs_compose.
         let (depth_tex, depth_view) = create_depth_texture(&device, width, height);
+        // Geometry colour target for cs_main/cs_transparent; cs_compose
+        // reads it and writes the final pre-TAA image into output_tex.
+        let (geom_tex, geom_view) = create_output_texture(&device, width, height);
+        // 1x1 dummy r32float storage: fills the depth-out slot in the
+        // compose bind group, where the REAL depth is bound as a sampled
+        // input and binding the same texture for write would be a usage
+        // conflict. cs_compose never stores depth.
+        let (dummy_depth_tex, dummy_depth_view) = create_depth_texture(&device, 1, 1);
         // Falling-leaf pass state.
         let leaves_buf = create_leaves_buf(&device);
         let leaf_bgl = create_leaf_bgl(&device);
@@ -509,15 +525,35 @@ impl Renderer {
             cache: None,
         });
 
+        // Main bind group: colour -> geom_tex, depth -> depth_tex; slots
+        // 20/21 point at unrelated textures (history/beam) for usage-scope
+        // cleanliness. Compose bind group: colour -> output_tex, reads
+        // geom + depth, dummy in the depth-out slot.
         let compute_bg = make_compute_bg(
+            &device, &compute_bgl, &camera_buf, &bricks_buf,
+            &tile_mask_buf, &chunk_mask_buf, &palette_buf, &geom_view, &beam_view,
+            &tile_dirty_buf, &players_buf, &brick_uniform_buf, &tile_uniform_buf, &l4_mask_buf,
+            &cloud_sampled_view, &sampler, &light_hist_view, &light_out_view, &transp_buf,
+            &sprites_buf, &depth_view, &history_view, &beam_view,
+        );
+        let compose_bg = make_compute_bg(
             &device, &compute_bgl, &camera_buf, &bricks_buf,
             &tile_mask_buf, &chunk_mask_buf, &palette_buf, &output_view, &beam_view,
             &tile_dirty_buf, &players_buf, &brick_uniform_buf, &tile_uniform_buf, &l4_mask_buf,
             &cloud_sampled_view, &sampler, &light_hist_view, &light_out_view, &transp_buf,
-            &sprites_buf, &depth_view,
+            &sprites_buf, &dummy_depth_view, &geom_view, &depth_view,
         );
 
         let leaf_bg = make_leaf_bg(&device, &leaf_bgl, &camera_buf, &leaves_buf, &sprites_buf, &depth_view);
+
+        let compose_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("compose pipeline"),
+            layout: Some(&compute_pl),
+            module: &compute_shader,
+            entry_point: Some("cs_compose"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
 
         // -- deferred transparent pipeline (cs_transparent, same module + bgl) --
         let transparent_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -707,6 +743,8 @@ impl Renderer {
             beam_bgl, beam_pipeline, beam_bg,
             compute_bgl, compute_pipeline, compute_bg,
             transparent_pipeline, transp_buf, depth_tex, depth_view,
+            geom_tex, geom_view, dummy_depth_tex, dummy_depth_view,
+            compose_pipeline, compose_bg,
             leaves_buf, leaf_count: 0, leaf_bgl, leaf_pipeline, leaf_bg,
             bricks_buf_b, physics_pipeline, physics_bg, gpu_physics: gpu_physics_enabled,
             cloud_bgl, cloud_pipeline, cloud_bg, cloud_sampled_view, cloud_storage_view,
@@ -757,6 +795,9 @@ impl Renderer {
         let (dt, dv) = create_depth_texture(&self.device, rw, rh);
         self.depth_tex = dt;
         self.depth_view = dv;
+        let (gt, gv) = create_output_texture(&self.device, rw, rh);
+        self.geom_tex = gt;
+        self.geom_view = gv;
         self.leaf_bg = make_leaf_bg(
             &self.device, &self.leaf_bgl, &self.camera_buf, &self.leaves_buf,
             &self.sprites_buf, &self.depth_view,
@@ -764,11 +805,19 @@ impl Renderer {
 
         self.compute_bg = make_compute_bg(
             &self.device, &self.compute_bgl, &self.camera_buf, &self.bricks_buf,
+            &self.tile_mask_buf, &self.chunk_mask_buf, &self.palette_buf, &self.geom_view, &self.beam_view,
+            &self.tile_dirty_buf, &self.players_buf, &self.brick_uniform_buf, &self.tile_uniform_buf,
+            &self.l4_mask_buf, &self.cloud_sampled_view, &self.sampler,
+            &self.light_hist_view, &self.light_out_view, &self.transp_buf,
+            &self.sprites_buf, &self.depth_view, &self.history_view, &self.beam_view,
+        );
+        self.compose_bg = make_compute_bg(
+            &self.device, &self.compute_bgl, &self.camera_buf, &self.bricks_buf,
             &self.tile_mask_buf, &self.chunk_mask_buf, &self.palette_buf, &self.output_view, &self.beam_view,
             &self.tile_dirty_buf, &self.players_buf, &self.brick_uniform_buf, &self.tile_uniform_buf,
             &self.l4_mask_buf, &self.cloud_sampled_view, &self.sampler,
             &self.light_hist_view, &self.light_out_view, &self.transp_buf,
-            &self.sprites_buf, &self.depth_view,
+            &self.sprites_buf, &self.dummy_depth_view, &self.geom_view, &self.depth_view,
         );
         self.cloud_bg = make_cloud_bg(
             &self.device, &self.cloud_bgl, &self.camera_buf, &self.cloud_storage_view,
@@ -1023,6 +1072,20 @@ impl Renderer {
                 });
                 cp.set_pipeline(&self.transparent_pipeline);
                 cp.set_bind_group(0, &self.compute_bg, &[]);
+                let gx = (self.size.0 + 7) / 8;
+                let gy = (self.size.1 + 7) / 8;
+                cp.dispatch_workgroups(gx, gy, 1);
+            }
+            // ---- full-screen compose: geometry + clouds + god rays ----
+            // EVERY pixel EVERY frame: per-frame-varying terms must never
+            // bake into the tile-gated passes (the checkerboard mechanism).
+            {
+                let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("compose"),
+                    timestamp_writes: None,
+                });
+                cp.set_pipeline(&self.compose_pipeline);
+                cp.set_bind_group(0, &self.compose_bg, &[]);
                 let gx = (self.size.0 + 7) / 8;
                 let gy = (self.size.1 + 7) / 8;
                 cp.dispatch_workgroups(gx, gy, 1);
@@ -1460,6 +1523,8 @@ fn create_compute_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
             bgl_storage(17, false), // transp_buf: deferred transparent records (rw)
             bgl_storage(18, true),  // foliage sprites (2bpp authored cutout art)
             bgl_storage_tex(19, wgpu::TextureFormat::R32Float), // primary-hit depth out
+            bgl_tex(20, false), // cs_compose: geometry colour in (main bg: history, unused)
+            bgl_tex(21, false), // cs_compose: depth in (main bg: beam, unused)
         ],
     })
 }
@@ -1563,6 +1628,8 @@ fn make_compute_bg(
     transp_buf: &wgpu::Buffer,
     sprites_buf: &wgpu::Buffer,
     depth_view: &wgpu::TextureView,
+    geom_in_view: &wgpu::TextureView,
+    depth_in_view: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("compute bg"),
@@ -1587,6 +1654,8 @@ fn make_compute_bg(
             wgpu::BindGroupEntry { binding: 17, resource: transp_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 18, resource: sprites_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 19, resource: wgpu::BindingResource::TextureView(depth_view) },
+            wgpu::BindGroupEntry { binding: 20, resource: wgpu::BindingResource::TextureView(geom_in_view) },
+            wgpu::BindGroupEntry { binding: 21, resource: wgpu::BindingResource::TextureView(depth_in_view) },
         ],
     })
 }
@@ -1843,12 +1912,21 @@ mod gpu_render_tests {
         let transp_buf = create_transp_buf(&device, w, h);
         let sprites_buf = storage(&device, "sprites", bytemuck::cast_slice(&crate::sprites::encoded()));
         let (_dtex, depth_view) = create_depth_texture(&device, w, h);
+        let (_gtex, geom_view) = create_output_texture(&device, w, h);
+        let (_ddtex, dummy_depth_view) = create_depth_texture(&device, 1, 1);
         let bg = make_compute_bg(
+            &device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
+            &palette_buf, &geom_view, &beam_view, &tile_dirty_buf, &players_buf,
+            &brick_uniform_buf, &tile_uniform_buf, &l4_mask_buf,
+            &cloud_sampled_view, &cloud_sampler, &light_in_view, &light_out_view, &transp_buf,
+            &sprites_buf, &depth_view, &output_view, &beam_view,
+        );
+        let bg_compose = make_compute_bg(
             &device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
             &palette_buf, &output_view, &beam_view, &tile_dirty_buf, &players_buf,
             &brick_uniform_buf, &tile_uniform_buf, &l4_mask_buf,
             &cloud_sampled_view, &cloud_sampler, &light_in_view, &light_out_view, &transp_buf,
-            &sprites_buf, &depth_view,
+            &sprites_buf, &dummy_depth_view, &geom_view, &depth_view,
         );
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("test pl"),
@@ -1874,6 +1952,14 @@ mod gpu_render_tests {
             layout: Some(&pl),
             module: &module,
             entry_point: Some("cs_transparent"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let compose_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("test compose pipeline"),
+            layout: Some(&pl),
+            module: &module,
+            entry_point: Some("cs_compose"),
             compilation_options: Default::default(),
             cache: None,
         });
@@ -1949,6 +2035,12 @@ mod gpu_render_tests {
             let mut cp = enc.begin_compute_pass(&Default::default());
             cp.set_pipeline(&transparent_pipeline);
             cp.set_bind_group(0, &bg, &[]);
+            cp.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
+        }
+        {
+            let mut cp = enc.begin_compute_pass(&Default::default());
+            cp.set_pipeline(&compose_pipeline);
+            cp.set_bind_group(0, &bg_compose, &[]);
             cp.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
         }
         if !leaves.is_empty() {
@@ -2160,6 +2252,240 @@ mod gpu_render_tests {
         assert!(
             red < 700,
             "occluded leaves are showing - depth test broken ({red} red px)"
+        );
+    }
+
+    /// Two-phase render reproducing the temporal-differential staleness the
+    /// windowed app has: frame A at t0 with ALL tiles dirty, frame B at t1
+    /// with only a checkerboard of 8x8 screen tiles dirty - the clean tiles
+    /// keep frame A's pixels, exactly like the rotating anim-refresh leaves
+    /// most tiles stale each frame. Returns frame B. Any per-frame-varying
+    /// term baked inside the tile-gated pass shows up as tile-aligned seams.
+    fn render_checkerboard_probe(
+        world: &World, cam: &Camera, w: u32, h: u32, t0: f32, t1: f32,
+    ) -> Option<Vec<u8>> {
+        let (device, queue) = headless_device()?;
+        let wo = world.world_origin_voxel();
+        let cu0 = CameraUniform::from_camera(cam, w, h, t0, t0, wo, [0.0, 0.0], 0.0);
+        let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("camera"),
+            contents: bytemuck::bytes_of(&cu0),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let bricks_buf = storage(&device, "bricks", bytemuck::cast_slice(&world.bricks));
+        let tile_mask_buf = storage(&device, "tile_mask", bytemuck::cast_slice(&world.tile_mask));
+        let chunk_mask_buf = storage(&device, "chunk_mask", bytemuck::cast_slice(&world.chunk_mask));
+        let l4_mask_buf = storage(&device, "l4_mask", bytemuck::cast_slice(&world.l4_mask));
+        let brick_uniform_buf = storage(&device, "bu", bytemuck::cast_slice(&pack_u8_to_u32(&world.brick_uniform)));
+        let tile_uniform_buf = storage(&device, "tu", bytemuck::cast_slice(&pack_u8_to_u32(&world.tile_uniform)));
+        let palette = default_palette();
+        let palette_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("palette"),
+            contents: bytemuck::cast_slice(&palette),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let tiles_w = (w + 7) / 8;
+        let tiles_h = (h + 7) / 8;
+        let words = ((tiles_w * tiles_h) as usize + 31) / 32;
+        let td = storage(&device, "td", bytemuck::cast_slice(&vec![u32::MAX; words]));
+        let players = storage(&device, "pl", &vec![0u8; 16 + MAX_REMOTE_PLAYERS * 16]);
+        let (_o, ov) = create_output_texture(&device, w, h);
+        let (_b, bv) = create_beam_texture(&device, w, h);
+        let (_c, csv, _csw) = create_cloud_texture(&device, w, h);
+        let csamp = device.create_sampler(&wgpu::SamplerDescriptor {
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let (_li, liv) = create_lighting_texture(&device, w, h);
+        let (_lo, lov) = create_lighting_texture(&device, w, h);
+        let tpb = create_transp_buf(&device, w, h);
+        let spr = storage(&device, "sprites", bytemuck::cast_slice(&crate::sprites::encoded()));
+        let (_dt, dv) = create_depth_texture(&device, w, h);
+        let (_gt, gv) = create_output_texture(&device, w, h);
+        let (_dd, ddv) = create_depth_texture(&device, 1, 1);
+        let bgl = create_compute_bgl(&device);
+        let bg = make_compute_bg(
+            &device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
+            &palette_buf, &gv, &bv, &td, &players, &brick_uniform_buf, &tile_uniform_buf,
+            &l4_mask_buf, &csv, &csamp, &liv, &lov, &tpb, &spr, &dv, &ov, &bv,
+        );
+        let bg_compose = make_compute_bg(
+            &device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
+            &palette_buf, &ov, &bv, &td, &players, &brick_uniform_buf, &tile_uniform_buf,
+            &l4_mask_buf, &csv, &csamp, &liv, &lov, &tpb, &spr, &ddv, &gv, &dv,
+        );
+        let pll = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None, bind_group_layouts: &[&bgl], push_constant_ranges: &[],
+        });
+        let m = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None, source: wgpu::ShaderSource::Wgsl(raymarch_source().into()),
+        });
+        let mk = |entry: &str| device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None, layout: Some(&pll), module: &m, entry_point: Some(entry),
+            compilation_options: Default::default(), cache: None,
+        });
+        let p_main = mk("cs_main");
+        let p_transp = mk("cs_transparent");
+        let p_compose = mk("cs_compose");
+        let cloud_bgl = create_cloud_bgl(&device);
+        let cloud_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None, bind_group_layouts: &[&cloud_bgl], push_constant_ranges: &[],
+        });
+        let p_clouds_full = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None, layout: Some(&cloud_pl), module: &m, entry_point: Some("cs_clouds"),
+            compilation_options: Default::default(), cache: None,
+        });
+        let cloud_bg = make_cloud_bg(&device, &cloud_bgl, &camera_buf, &_csw);
+        let frame = |dev: &wgpu::Device, q: &wgpu::Queue| {
+            let mut e = dev.create_command_encoder(&Default::default());
+            {
+                let mut cp = e.begin_compute_pass(&Default::default());
+                cp.set_pipeline(&p_clouds_full);
+                cp.set_bind_group(0, &cloud_bg, &[]);
+                cp.dispatch_workgroups(((w + 1) / 2 + 7) / 8, ((h + 1) / 2 + 7) / 8, 1);
+            }
+            {
+                let mut cp = e.begin_compute_pass(&Default::default());
+                cp.set_pipeline(&p_main);
+                cp.set_bind_group(0, &bg, &[]);
+                cp.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
+            }
+            {
+                let mut cp = e.begin_compute_pass(&Default::default());
+                cp.set_pipeline(&p_transp);
+                cp.set_bind_group(0, &bg, &[]);
+                cp.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
+            }
+            {
+                let mut cp = e.begin_compute_pass(&Default::default());
+                cp.set_pipeline(&p_compose);
+                cp.set_bind_group(0, &bg_compose, &[]);
+                cp.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
+            }
+            q.submit(std::iter::once(e.finish()));
+        };
+        // Frame A: everything dirty at t0.
+        frame(&device, &queue);
+        // Frame B: t1, checkerboard tile mask (alternate 8x8 tiles stale).
+        let mut mask = vec![0u32; words];
+        for ty in 0..tiles_h {
+            for tx in 0..tiles_w {
+                if (tx + ty) % 2 == 0 {
+                    let idx = (ty * tiles_w + tx) as usize;
+                    mask[idx >> 5] |= 1u32 << (idx & 31);
+                }
+            }
+        }
+        queue.write_buffer(&td, 0, bytemuck::cast_slice(&mask));
+        let cu1 = CameraUniform::from_camera(cam, w, h, t1, t1, wo, [0.0, 0.0], 0.0);
+        queue.write_buffer(&camera_buf, 0, bytemuck::bytes_of(&cu1));
+        frame(&device, &queue);
+        // Read back frame B.
+        let bpr = w * 4;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: (bpr * h) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut e = device.create_command_encoder(&Default::default());
+        e.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: &_o, mip_level: 0, origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &readback,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        queue.submit(std::iter::once(e.finish()));
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::Maintain::Wait);
+        let data = slice.get_mapped_range();
+        Some(data.to_vec())
+    }
+
+    /// The cloud-shadow checkerboard, measured: with half the tiles one
+    /// frame stale (as in real play), the luma difference across 8x8 tile
+    /// BOUNDARIES must not exceed the difference at tile interiors by more
+    /// than sensor noise. Any per-frame-varying term (god-ray jitter, cloud
+    /// composite) baked inside the tile-gated pass fails this.
+    #[test]
+    fn no_tile_checkerboard_in_god_rays() {
+        use crate::voxel::MAT_STONE;
+        // Stone floor on purpose: grass tops have time-animated sway that
+        // the rotating anim-refresh legitimately lags by a few frames -
+        // this test isolates the per-frame-RANDOM terms (god-ray jitter,
+        // cloud composite) whose tile staleness is the standing
+        // checkerboard.
+        let mut world = World::new();
+        for z in 60..200u32 {
+            for x in 60..200u32 {
+                for y in 58..63u32 {
+                    world.set_voxel(x, y, z, MAT_STONE);
+                }
+            }
+        }
+        let mut cam = Camera::new();
+        cam.pos = glam::Vec3::new(150.0, 66.0, 130.0);
+        cam.yaw = -std::f32::consts::FRAC_PI_2; // toward -x, into the low sun
+        cam.pitch = -0.06;
+        let (w, h) = (640usize, 400usize);
+        // t ~ 77.6: sun_dir_at angle ~ pi -> sun low on the -x horizon; god
+        // rays active over the whole ground view.
+        let Some(frame) = render_checkerboard_probe(&world, &cam, w as u32, h as u32, 77.4, 77.4 + 1.0 / 60.0)
+        else {
+            eprintln!("no GPU adapter — skipping checkerboard probe");
+            return;
+        };
+        let luma = |x: usize, y: usize| -> f32 {
+            let i = (y * w + x) * 4;
+            (frame[i] as f32 + frame[i + 1] as f32 + frame[i + 2] as f32) / (3.0 * 255.0)
+        };
+        // Ground region only (lower third - the horizon band would leak
+        // tile-gated sky/sun-disc gradients into the metric).
+        let (y0, y1) = (h * 2 / 3, h - 8);
+        let mut b_sum = 0.0f64;
+        let mut b_n = 0u32;
+        let mut i_sum = 0.0f64;
+        let mut i_n = 0u32;
+        for y in y0..y1 {
+            for x in 8..w - 9 {
+                let d = (luma(x, y) - luma(x + 1, y)).abs() as f64;
+                if x % 8 == 7 {
+                    b_sum += d;
+                    b_n += 1;
+                } else if x % 8 == 3 {
+                    i_sum += d;
+                    i_n += 1;
+                }
+            }
+        }
+        for y in (y0..y1 - 1).step_by(1) {
+            for x in 8..w - 8 {
+                let d = (luma(x, y) - luma(x, y + 1)).abs() as f64;
+                if y % 8 == 7 {
+                    b_sum += d;
+                    b_n += 1;
+                } else if y % 8 == 3 {
+                    i_sum += d;
+                    i_n += 1;
+                }
+            }
+        }
+        let boundary = b_sum / b_n.max(1) as f64;
+        let interior = i_sum / i_n.max(1) as f64;
+        let excess = boundary - interior;
+        eprintln!("checkerboard probe: boundary {boundary:.5} interior {interior:.5} excess {excess:.5}");
+        assert!(
+            excess < 0.0025,
+            "tile-aligned seams: boundary luma delta exceeds interior by {excess:.5}"
         );
     }
 
@@ -2812,12 +3138,16 @@ mod gpu_render_tests {
         let spr = storage(&device, "sprites", bytemuck::cast_slice(&crate::sprites::encoded()));
         let bgl = create_compute_bgl(&device);
         let (_dtex, dv) = create_depth_texture(&device, w, h);
-        let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &ov, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &dv);
+        let (_gt2, gv2) = create_output_texture(&device, w, h);
+        let (_dd2, ddv2) = create_depth_texture(&device, 1, 1);
+        let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &gv2, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &dv, &ov, &bv);
+        let bg_compose = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &ov, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &ddv2, &gv2, &dv);
         let pll = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[&bgl], push_constant_ranges: &[] });
         let src = raymarch_source();
         let m = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(src.into()) });
         let pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: Some(&pll), module: &m, entry_point: Some("cs_main"), compilation_options: Default::default(), cache: None });
         let pipe_transp = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: Some(&pll), module: &m, entry_point: Some("cs_transparent"), compilation_options: Default::default(), cache: None });
+        let pipe_compose = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: Some(&pll), module: &m, entry_point: Some("cs_compose"), compilation_options: Default::default(), cache: None });
         let leaf_pass = (!leaves.is_empty()).then(|| {
             let buf = storage(&device, "leaves", bytemuck::cast_slice(leaves));
             let bgl = create_leaf_bgl(device);
@@ -2841,6 +3171,12 @@ mod gpu_render_tests {
                     let mut cp = e.begin_compute_pass(&Default::default());
                     cp.set_pipeline(&pipe_transp);
                     cp.set_bind_group(0, &bg, &[]);
+                    cp.dispatch_workgroups(tw, th, 1);
+                }
+                {
+                    let mut cp = e.begin_compute_pass(&Default::default());
+                    cp.set_pipeline(&pipe_compose);
+                    cp.set_bind_group(0, &bg_compose, &[]);
                     cp.dispatch_workgroups(tw, th, 1);
                 }
                 if let Some((lp, lbg, n)) = &leaf_pass {

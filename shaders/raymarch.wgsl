@@ -103,6 +103,12 @@ const TR_GLASS:      u32 = 3u;
 // against the world without any rasterized geometry. Persists across
 // temporal-differential clean tiles exactly like output_tex.
 @group(0) @binding(19) var depth_out: texture_storage_2d<r32float, write>;
+// cs_compose inputs: the geometry colour written by cs_main/cs_transparent
+// and the exported depth, re-read as sampled textures. In the main bind
+// group these two slots point at unrelated textures (history, beam) to
+// keep per-pass usage scopes conflict-free.
+@group(0) @binding(20) var geom_in: texture_2d<f32>;
+@group(0) @binding(21) var depth_in: texture_2d<f32>;
 
 // The SPR_* / TUFT_* atlas constants are GENERATED from src/sprites.rs and
 // prepended to this source (see renderer::raymarch_source) - single source
@@ -420,6 +426,27 @@ fn decode_face_normal(c: u32) -> vec3<f32> {
     return vec3<f32>(0.0, 0.0, -1.0);
 }
 
+// Is the eye below the water surface? Shared by cs_main (trace-path choice)
+// and cs_compose (underwater post-effect). Deliberate approximation:
+// own-level height + the field at the eye's XZ, NOT the full corner patch -
+// this runs per pixel, and the 16 corner probes would be full-screen cost
+// while swimming. It only diverges from the drawn patch at terrace lips,
+// where a few cm of eye-height mismatch in the underwater tint is
+// imperceptible.
+fn camera_in_water() -> bool {
+    let cam_voxel_chk = vec3<i32>(floor(camera.origin));
+    let cam_mat_chk = voxel_material_at(cam_voxel_chk);
+    var in_water = is_water_mat(cam_mat_chk);
+    if (in_water && !is_water_mat(voxel_material_at(cam_voxel_chk + vec3<i32>(0, 1, 0)))) {
+        let lf = f32(cam_mat_chk - MAT_WATER_L1 + 1u) * 0.125;
+        let f = water_field(camera.origin.xz, camera.time);
+        let s = clamp((WATER_BASE + f.x) * lf, WATER_MIN_H, 1.0);
+        let lp_y = camera.origin.y - f32(cam_voxel_chk.y);
+        in_water = lp_y <= s;
+    }
+    return in_water;
+}
+
 // Deferred transparent shading pass (#16): runs after cs_main, shades only the
 // pixels cs_main flagged as water-top/glass (the expensive reflection/refraction
 // + dispersion), then re-applies clouds + god-rays to match cs_main's compositing.
@@ -464,14 +491,8 @@ fn cs_transparent(@builtin(global_invocation_id) gid: vec3<u32>) {
         col = shade_glass(hit, camera.origin, dir);
     }
 
-    // Match cs_main's post-hit compositing for these pixels.
-    let uv_cloud = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5)) / camera.resolution;
-    let clouds = textureSampleLevel(cloud_in, cloud_samp, uv_cloud, 0.0);
-    if (hit.t_hit >= cloud_slab_near(dir)) {
-        col = col * (1.0 - clouds.a) + clouds.rgb;
-    }
-    col += god_rays(camera.origin, dir, hit.t_hit, vec2<f32>(f32(gid.x), f32(gid.y)));
-
+    // Clouds/god rays/underwater are applied by cs_compose (per-frame terms
+    // must not bake into cached pixels) - store the plain shaded colour.
     textureStore(output_tex, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(col, 1.0));
 }
 
@@ -508,23 +529,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // skip water (we're inside it) and find the first NON-water surface.
     // Otherwise the ray would hit the water voxel it's already inside and
     // render an opaque wall in our face.
-    let cam_voxel_chk = vec3<i32>(floor(camera.origin));
-    let cam_mat_chk = voxel_material_at(cam_voxel_chk);
-    var cam_in_water = is_water_mat(cam_mat_chk);
-    if (cam_in_water && !is_water_mat(voxel_material_at(cam_voxel_chk + vec3<i32>(0, 1, 0)))) {
-        // Surface cell: the eye is only underwater if it's below the surface.
-        // Deliberate approximation: own-level height + the field at the eye's
-        // XZ, NOT the full corner patch - the check runs per pixel, and the
-        // 16 corner probes would be full-screen cost while swimming. It only
-        // diverges from the drawn patch at terrace lips (pinned/mixed-level
-        // corners), where a few cm of eye-height mismatch in the underwater
-        // tint is imperceptible.
-        let lf = f32(cam_mat_chk - MAT_WATER_L1 + 1u) * 0.125;
-        let f = water_field(camera.origin.xz, camera.time);
-        let s = clamp((WATER_BASE + f.x) * lf, WATER_MIN_H, 1.0);
-        let lp_y = camera.origin.y - f32(cam_voxel_chk.y);
-        cam_in_water = lp_y <= s;
-    }
+    let cam_in_water = camera_in_water();
     var hit: Hit;
     if (cam_in_water) {
         // Skip beam-skip when underwater — beam pre-pass doesn't know about
@@ -625,31 +630,47 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     textureStore(depth_out, vec2<i32>(i32(gid.x), i32(gid.y)),
                  vec4<f32>(min(closest_t, 1e9), 0.0, 0.0, 0.0));
 
-    // Volumetric clouds — sampled from the half-res cs_clouds pass (bilinear
-    // upsample) instead of marched here. Terrain occlusion is reapplied cheaply:
-    // if the terrain hit is in front of the cloud-slab entry, skip compositing.
+    // Clouds, god rays and the underwater post-effect are NOT applied here:
+    // they are per-frame-varying, and anything time-varying baked into this
+    // TILE-GATED pass freezes at a different phase per 8x8 tile (the
+    // rotating anim-refresh re-traces ~1/8 of tiles per frame), which is
+    // the diffused checkerboard this engine fought repeatedly. cs_compose
+    // applies them for EVERY pixel EVERY frame from the exported depth.
+    textureStore(output_tex, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(col, 1.0));
+}
+
+// Full-screen per-frame compose: geometry colour + volumetric clouds by
+// depth + god rays + underwater post-effect. Runs after cs_transparent and
+// before TAA, unconditionally for every pixel - per-frame-varying terms
+// live HERE and nowhere upstream, so the temporal-differential tile cache
+// can never freeze them out of phase.
+@compute @workgroup_size(8, 8, 1)
+fn cs_compose(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let res = vec2<i32>(camera.resolution);
+    if (i32(gid.x) >= res.x || i32(gid.y) >= res.y) { return; }
+    let pix = vec2<i32>(i32(gid.x), i32(gid.y));
+    var col = textureLoad(geom_in, pix, 0).rgb;
+    let t_hit = textureLoad(depth_in, pix, 0).r;
+    let uv = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5) + camera.jitter) / camera.resolution;
+    let dir = ray_dir_uv(uv);
+
     let uv_cloud = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5)) / camera.resolution;
     let clouds = textureSampleLevel(cloud_in, cloud_samp, uv_cloud, 0.0);
-    let cloud_near = cloud_slab_near(dir);
-    let cloud_occluded = hit.hit && hit.t_hit < cloud_near;
-    if (!cloud_occluded) {
+    if (t_hit >= cloud_slab_near(dir)) {
         col = col * (1.0 - clouds.a) + clouds.rgb;
     }
 
-    // Volumetric god rays — accumulate sun visibility along the primary ray.
-    let t_far = select(200.0, hit.t_hit, hit.hit);
-    col += god_rays(camera.origin, dir, t_far, vec2<f32>(f32(gid.x), f32(gid.y)));
+    col += god_rays(camera.origin, dir, min(t_hit, 200.0), vec2<f32>(f32(gid.x), f32(gid.y)));
 
-    // ---- underwater see-through post-effect ----
-    if (cam_in_water) {
-        let t_eye = select(80.0, hit.t_hit, hit.hit);
+    if (camera_in_water()) {
+        let t_eye = min(t_hit, 80.0);
         let absorb = vec3<f32>(0.32, 0.16, 0.06);
         let trans = exp(-absorb * (t_eye * 0.18));
         let water_col = vec3<f32>(0.04, 0.18, 0.28);
         col = col * trans + water_col * (vec3<f32>(1.0) - trans);
     }
 
-    textureStore(output_tex, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(col, 1.0));
+    textureStore(output_tex, pix, vec4<f32>(col, 1.0));
 }
 
 const MAT_GRASS:           u32 = 2u;
