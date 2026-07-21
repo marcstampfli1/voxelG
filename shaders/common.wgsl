@@ -15,14 +15,17 @@ struct Camera {
     tan_half_fov: f32,
     resolution: vec2<f32>,
     time: f32,
-    _pad3: f32,
+    // Frame-constant wind direction (unit XZ), computed once on the CPU so
+    // shaders never re-derive trig of time per pixel. Lives in what used to
+    // be two alignment pads - zero layout growth.
+    wind_x: f32,
     world_origin: vec3<i32>,
     _pad4: i32,
     jitter: vec2<f32>,
     taa_blend: f32,
     reproject_lighting: f32,
     prev_origin: vec3<f32>,
-    _pad6: f32,
+    wind_z: f32,
     prev_forward: vec3<f32>,
     _pad7: f32,
     prev_right: vec3<f32>,

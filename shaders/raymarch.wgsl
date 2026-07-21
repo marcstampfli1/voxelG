@@ -659,12 +659,32 @@ struct SubHit {
 // scene leans the same way at the same time.
 // Slower, smoother wind — direction rotates very gradually, strength
 // oscillates calmly. Was way too fast before, made foliage look glitchy.
+// Formula (CPU side, camera.rs): angle = time*0.04 + 0.4*sin(time*0.12),
+// dir = (cos, sin). Uploaded per frame; reading it here is free.
+fn wind_dir_now() -> vec2<f32> {
+    return vec2<f32>(camera.wind_x, camera.wind_z);
+}
+
+// Traveling gust field: plane waves moving ALONG the wind direction in
+// world XZ (a broad front every ~314 voxels plus a ~57-voxel ripple), range
+// [0.25, 1.0]. This is what stops the whole map swaying in lockstep - a
+// gust visibly travels across a field. Long wavelengths keep neighbouring
+// blocks coherent (one tree never tears apart).
+fn wind_gust(p_xz: vec2<f32>, wdir: vec2<f32>) -> f32 {
+    let s = dot(p_xz, wdir);
+    let front  = 0.5 + 0.5 * sin(s * 0.020 - camera.time * 0.9);
+    let ripple = 0.5 + 0.5 * sin(s * 0.11  - camera.time * 2.1);
+    return 0.25 + 0.75 * front * (0.6 + 0.4 * ripple);
+}
+
 fn wind_offset(voxel_min: vec3<f32>, phase: f32, base_amp: f32) -> vec2<f32> {
-    let dir_angle = camera.time * 0.04 + 0.4 * sin(camera.time * 0.12);
-    let wind_x = cos(dir_angle);
-    let wind_z = sin(dir_angle);
-    let strength = base_amp * (0.55 + 0.45 * sin(camera.time * 0.55 + phase));
-    return vec2<f32>(wind_x * strength, wind_z * strength);
+    let wdir = wind_dir_now();
+    // Gust is a function of voxel_min only, so both cross planes and both
+    // tuft quads of one block share a single shear (the anti-X-split
+    // contract in sprite_cross_hit).
+    let strength = base_amp * wind_gust(voxel_min.xz, wdir)
+        * (0.70 + 0.30 * sin(camera.time * 0.55 + phase));
+    return wdir * strength;
 }
 
 // ---------- LEAVES: Motschen's Better Leaves, ported exactly ----------------
@@ -1904,19 +1924,24 @@ fn shade(
         // Flowers + tall grass sway harder (thin & light) than tree leaves.
         // Leaf amplitude raised 0.30 -> 0.45 (and brightness ripple 0.12 ->
         // 0.16) so canopies visibly move even past the leaf-card radius.
+        // Amplitude rides the SAME traveling gust field as the geometric
+        // shear (one source of truth), so brightness ripples move with the
+        // front instead of pulsing in place.
+        let gust = 0.5 + 0.5 * wind_gust(p_hit.xz, wind_dir_now());
         let amp = select(0.45, 0.55, hit.mat == MAT_FLOWER || hit.mat == MAT_TALL_GRASS
-                                   || hit.mat == MAT_TALL_GRASS_DRY);
+                                   || hit.mat == MAT_TALL_GRASS_DRY) * gust;
         n.x += sway * amp;
         n.z += sway * amp * 0.7;
         n = normalize(n);
-        base *= 1.0 + sway * 0.16;
+        base *= 1.0 + sway * 0.16 * gust;
     } else if (hit.mat == MAT_GRASS && hit.normal.y > 0.5) {
         let t = camera.time;
+        let gust = 0.5 + 0.5 * wind_gust(p_hit.xz, wind_dir_now());
         let sway = sin(p_hit.x * 0.55 + t * 2.1) * cos(p_hit.z * 0.55 + t * 1.7);
-        n.x += sway * 0.20;
-        n.z += sway * 0.18;
+        n.x += sway * 0.20 * gust;
+        n.z += sway * 0.18 * gust;
         n = normalize(n);
-        base *= 1.0 + sway * 0.07;
+        base *= 1.0 + sway * 0.07 * gust;
     }
 
     let s = sun_dir();

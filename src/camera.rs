@@ -71,7 +71,11 @@ pub struct CameraUniform {
     pub tan_half_fov: f32,
     pub resolution: [f32; 2],
     pub time: f32,
-    pub _pad3: f32,
+    /// Frame-constant wind direction x (unit XZ vector; z lives in the
+    /// former _pad6 slot). Computed here once per frame so shaders never
+    /// re-derive trig of time per pixel; formula documented at the WGSL
+    /// wind_dir_now().
+    pub wind_x: f32,
     /// World-voxel offset of the loaded region's lower corner. The shader
     /// uses this to bounds-check rays + mod-fold world voxel coords into the
     /// toroidal slot storage.
@@ -90,7 +94,7 @@ pub struct CameraUniform {
     // Previous-frame camera basis, for reprojecting a hit world-point into last
     // frame's screen to look up its cached shadow/AO.
     pub prev_origin: [f32; 3],
-    pub _pad6: f32,
+    pub wind_z: f32,
     pub prev_forward: [f32; 3],
     pub _pad7: f32,
     pub prev_right: [f32; 3],
@@ -120,14 +124,14 @@ impl CameraUniform {
             tan_half_fov: (c.fov_y * 0.5).tan(),
             resolution: [width as f32, height as f32],
             time,
-            _pad3: 0.0,
+            wind_x: (time * 0.04 + 0.4 * (time * 0.12).sin()).cos(),
             world_origin: [world_origin_voxel.x, world_origin_voxel.y, world_origin_voxel.z],
             _pad4: 0,
             jitter,
             taa_blend,
             reproject_lighting: 0.0,
             prev_origin: c.pos.to_array(),
-            _pad6: 0.0,
+            wind_z: (time * 0.04 + 0.4 * (time * 0.12).sin()).sin(),
             prev_forward: c.forward().to_array(),
             _pad7: 0.0,
             prev_right: c.right().to_array(),
