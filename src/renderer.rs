@@ -1845,6 +1845,129 @@ mod gpu_render_tests {
         hits as f32 / n.max(1) as f32
     }
 
+    /// Two water bodies meeting only at a diagonal corner, one level apart:
+    /// the crafted scene for the connected-surface tests and lookdev. Basin
+    /// A (y=64, full L8) over a sand floor; basin B (y=65) floats with open
+    /// air beneath its bulk, so any gap at the corner shows the warm floor
+    /// behind it. The camera looks diagonally straight at the shared corner
+    /// (world point 110, 65, 110).
+    fn build_water_terrace_world() -> (World, Camera) {
+        use crate::voxel::{MAT_SAND, MAT_STONE, MAT_WATER};
+        let mut world = World::new();
+        for z in 88..136u32 {
+            for x in 88..136u32 {
+                for y in 60..63u32 {
+                    world.set_voxel(x, y, z, MAT_STONE);
+                }
+                world.set_voxel(x, 63, z, MAT_SAND);
+            }
+        }
+        for z in 96..110u32 {
+            for x in 96..110u32 {
+                world.set_voxel(x, 64, z, MAT_WATER);
+            }
+        }
+        for z in 110..124u32 {
+            for x in 110..124u32 {
+                world.set_voxel(x, 64, z, MAT_STONE); // the terrace shelf
+                world.set_voxel(x, 65, z, MAT_WATER);
+            }
+        }
+        // Close-up on the corner: the pin's effect is a quarter-voxel wedge,
+        // so the discriminating view must be near enough for it to span
+        // tens of pixels.
+        let mut cam = Camera::new();
+        cam.pos = glam::Vec3::new(106.8, 66.8, 106.8);
+        cam.yaw = std::f32::consts::FRAC_PI_4;
+        cam.pitch = -0.38;
+        (world, cam)
+    }
+
+    /// Fraction of pixels matching a colour class inside a crop window.
+    fn crop_fraction(
+        rgba: &[u8], w: usize, x0: usize, y0: usize, cw: usize, ch: usize,
+        class: fn(f32, f32, f32) -> bool,
+    ) -> f32 {
+        let mut hits = 0usize;
+        for y in y0..y0 + ch {
+            for x in x0..x0 + cw {
+                let i = (y * w + x) * 4;
+                let r = rgba[i] as f32 / 255.0;
+                let g = rgba[i + 1] as f32 / 255.0;
+                let b = rgba[i + 2] as f32 / 255.0;
+                if class(r, g, b) { hits += 1; }
+            }
+        }
+        hits as f32 / (cw * ch) as f32
+    }
+
+    /// Water touching only DIAGONALLY, one level up, must read as one
+    /// connected surface. Guards the per-corner pin rule: the lower basin's
+    /// pinned corner rises to meet the upper basin, covering the dark notch
+    /// that used to separate the two surfaces. The crop is the measured
+    /// corner-wedge region; without the pin its dark fraction was 0.572 /
+    /// mean luma 0.393, with it 0.259 / 0.615 - thresholds sit mid-margin,
+    /// and this test FAILS on the pre-corner-surface shader.
+    #[test]
+    fn water_diagonal_connects() {
+        let (world, cam) = build_water_terrace_world();
+        let (w, h) = (960usize, 540usize);
+        let Some(frame) = render_rgba(&world, &cam, w as u32, h as u32) else {
+            eprintln!("no GPU adapter — skipping water_diagonal_connects");
+            return;
+        };
+        let (x0, y0, cw, ch) = (456, 264, 48, 48);
+        let dark = crop_fraction(&frame, w, x0, y0, cw, ch, |r, g, b| (r + g + b) / 3.0 < 0.35);
+        let mut luma_sum = 0.0f32;
+        for y in y0..y0 + ch {
+            for x in x0..x0 + cw {
+                let i = (y * w + x) * 4;
+                luma_sum += (frame[i] as f32 + frame[i + 1] as f32 + frame[i + 2] as f32) / (3.0 * 255.0);
+            }
+        }
+        let mean = luma_sum / (cw * ch) as f32;
+        eprintln!("diagonal corner wedge: dark {dark:.3} mean luma {mean:.3}");
+        assert!(dark < 0.40, "dark notch at the diagonal corner - surfaces not connected (dark {dark:.3})");
+        assert!(mean > 0.50, "corner wedge too dark - surfaces not connected (mean {mean:.3})");
+    }
+
+    /// Mixed physics levels must ramp without holes: L8 columns beside L2
+    /// columns in one basin. The crop across the level boundary has to be
+    /// water everywhere - a regression net for corner averaging plus the
+    /// wall branch (no gap may open at the step).
+    #[test]
+    fn water_terrace_ramp() {
+        use crate::voxel::{water_mat_for_level, MAT_SAND, MAT_STONE, MAT_WATER};
+        let mut world = World::new();
+        for z in 88..128u32 {
+            for x in 88..128u32 {
+                for y in 60..63u32 {
+                    world.set_voxel(x, y, z, MAT_STONE);
+                }
+                world.set_voxel(x, 63, z, MAT_SAND);
+            }
+        }
+        for z in 100..116u32 {
+            for x in 100..116u32 {
+                let m = if x < 108 { MAT_WATER } else { water_mat_for_level(2) };
+                world.set_voxel(x, 64, z, m);
+            }
+        }
+        let mut cam = Camera::new();
+        cam.pos = glam::Vec3::new(108.0, 68.0, 96.0);
+        cam.yaw = 0.0; // looking along +z, the boundary runs away from the camera
+        cam.pitch = -0.45;
+        let (w, h) = (640usize, 400usize);
+        let Some(frame) = render_rgba(&world, &cam, w as u32, h as u32) else {
+            eprintln!("no GPU adapter — skipping water_terrace_ramp");
+            return;
+        };
+        let (x0, y0, cw, ch) = (w / 2 - 100, h / 2 - 40, 200, 120);
+        let blue = crop_fraction(&frame, w, x0, y0, cw, ch, |r, _g, b| b > r + 0.05);
+        eprintln!("terrace ramp crop: blue {blue:.3}");
+        assert!(blue > 0.90, "level-step region shows non-water pixels (blue {blue:.3})");
+    }
+
     /// The water view must contain water-blue pixels and the foliage view
     /// green foliage pixels — catches "water/foliage renders black, pink, or
     /// vanishes" regressions that the pure luma-stats tests can't see.
@@ -1942,6 +2065,21 @@ mod gpu_render_tests {
         );
         canopy_top.pitch = -1.45;
         save("canopy_top", &canopy_top);
+
+        // Crafted diagonal-terrace water scene (same builder as the
+        // connected-surface tests).
+        {
+            let (tw_world, tcam) = build_water_terrace_world();
+            if let Some(rgba) = render_rgba(&tw_world, &tcam, w, h) {
+                let path = "target/lookdev/water_terrace.png";
+                let file = std::fs::File::create(path).unwrap();
+                let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w, h);
+                enc.set_color(png::ColorType::Rgba);
+                enc.set_depth(png::BitDepth::Eight);
+                enc.write_header().unwrap().write_image_data(&rgba).unwrap();
+                eprintln!("wrote {path}");
+            }
+        }
 
         // Per-species canopy close-ups and a ground-flora meadow view
         // (skipped when the demo seed grew none). Canopy views back off and
@@ -2058,6 +2196,24 @@ mod gpu_render_tests {
             ));
         }
 
+        time_scenarios(&device, &queue, &world, &scenarios, w, h);
+
+        // The crafted diagonal-terrace scene exercises the corner-connected
+        // surface path (pins, mixed levels) that open sea never fires.
+        let (terrace_world, terrace_cam) = build_water_terrace_world();
+        time_scenarios(&device, &queue, &terrace_world, &[("terrace", terrace_cam)], w, h);
+    }
+
+    /// Upload one world and time cs_main + cs_transparent for each scenario
+    /// camera (5 warmup + 60 timed frames each).
+    fn time_scenarios(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        world: &World,
+        scenarios: &[(&str, Camera)],
+        w: u32,
+        h: u32,
+    ) {
         // World buffers are shared across scenarios; only the camera changes.
         let cu0 = CameraUniform::from_camera(&scenarios[0].1, w, h, 0.0, glam::IVec3::ZERO, [0.0, 0.0], 0.0);
         let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -2095,7 +2251,7 @@ mod gpu_render_tests {
         let pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: Some(&pll), module: &m, entry_point: Some("cs_main"), compilation_options: Default::default(), cache: None });
         let pipe_transp = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: Some(&pll), module: &m, entry_point: Some("cs_transparent"), compilation_options: Default::default(), cache: None });
 
-        for (name, cam) in &scenarios {
+        for (name, cam) in scenarios {
             let cu = CameraUniform::from_camera(cam, w, h, 0.0, glam::IVec3::ZERO, [0.0, 0.0], 0.0);
             queue.write_buffer(&camera_buf, 0, bytemuck::bytes_of(&cu));
             let encode_frame = || {
