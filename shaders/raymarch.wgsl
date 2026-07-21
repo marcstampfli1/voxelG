@@ -83,14 +83,9 @@ struct PlayersBuf {
 // encoded at startup — hand-made cutout art, not hash noise.
 @group(0) @binding(18) var<storage, read> sprites: array<u32>;
 
-const SPR_LEAF_A:     u32 = 0u; // upright X-quad leaf cluster, variant A
-const SPR_LEAF_B:     u32 = 1u; // upright X-quad leaf cluster, variant B
-const SPR_LEAF_PINE:  u32 = 2u; // drooping needle fan for pine X-quads
-const SPR_TALL_GRASS: u32 = 3u;
-const SPR_POPPY:      u32 = 4u;
-const SPR_DAISY:      u32 = 5u;
-const SPR_LEAF_TOP:   u32 = 6u; // horizontal canopy cap, seen from above
-const SPR_LEAF_FACE:  u32 = 7u; // solid block-face weave (0 = shadow crevice)
+// The SPR_* / TUFT_* atlas constants are GENERATED from src/sprites.rs and
+// prepended to this source (see renderer::raymarch_source) - single source
+// of truth for indices and word offsets.
 
 // Texel (x, y) of a sprite; y = 0 is the sprite's bottom row. 16 u32s per
 // sprite, bit (y*16 + x)*2.
@@ -670,16 +665,6 @@ fn wind_offset(voxel_min: vec3<f32>, phase: f32, base_amp: f32) -> vec2<f32> {
     return vec2<f32>(wind_x * strength, wind_z * strength);
 }
 
-// Leaf tone -> brightness tint. The sprites carry three tones (dark
-// background leaves, lit leaves, bright highlight tips); strong contrast is
-// what makes individual leaves readable at 16x16.
-fn leaf_tone_tint(val: u32, scale: f32) -> vec3<f32> {
-    var b = 1.0;
-    if (val == 2u) { b = 0.52; }
-    if (val == 3u) { b = 1.38; }
-    return vec3<f32>(b * scale);
-}
-
 // ---------- LEAVES: Motschen's Better Leaves, ported exactly ----------------
 // Geometry and texture from "Motschen's Better Leaves Lite"
 // (github.com/TeamMidnightDust/BetterLeavesLite, MIT): every leaf block is a
@@ -689,9 +674,9 @@ fn leaf_tone_tint(val: u32, scale: f32) -> vec3<f32> {
 // carrying the FULL round ragged tuft. Four variants (the pack's blockstate
 // y-rotations 0/90/180/270) are picked per block by hash. The huge
 // overhanging tufts from every block interleave into dense bushy canopies.
-fn tuft_texel(x: u32, y: u32) -> u32 {
+fn tuft_texel(tuft: u32, x: u32, y: u32) -> u32 {
     let bit = (y * 32u + x) * 2u;
-    let w = sprites[128u + (bit >> 5u)]; // BL_TUFT_WORD_OFFSET = 128
+    let w = sprites[TUFT_BASE_WORDS + tuft * 64u + (bit >> 5u)];
     return (w >> (bit & 31u)) & 3u;
 }
 // Tuft tones: 1 = dark, 2 = mid, 3 = bright (greyscale in the pack, tinted
@@ -741,7 +726,7 @@ fn leaf_bl_quads(voxel_min: vec3<f32>, origin: vec3<f32>, dir: vec3<f32>, t_lo: 
         lu = lu - (wind.x * ca - wind.y * sa) * (lv / 2.0 + 0.5);
         let tx = u32(clamp((lu / 1.15 * 0.5 + 0.5) * 32.0, 0.0, 31.0));
         let ty = u32(clamp(2.0 + (lv / 2.0 + 0.5) * 28.0, 0.0, 31.0));
-        let val = tuft_texel(tx, ty);
+        let val = tuft_texel(TUFT_OAK, tx, ty);
         if (val == 0u) { continue; }
         best_t = t;
         out.hit = true;
@@ -835,7 +820,7 @@ fn leaf_bl_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32) ->
         if (entry_axis == 0) { uv_e = vec2<f32>(lp_e.z, lp_e.y); }
         else if (entry_axis == 1) { uv_e = vec2<f32>(lp_e.x, lp_e.z); }
         else { uv_e = vec2<f32>(lp_e.x, lp_e.y); }
-        let val = tuft_texel(8u + u32(clamp(uv_e.x * 16.0, 0.0, 15.0)),
+        let val = tuft_texel(TUFT_OAK, 8u + u32(clamp(uv_e.x * 16.0, 0.0, 15.0)),
                              8u + u32(clamp(uv_e.y * 16.0, 0.0, 15.0)));
         if (val != 0u) {
             var n = vec3<f32>(0.0);
@@ -859,7 +844,7 @@ fn leaf_bl_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32) ->
         if (exit_axis == 0) { uv_x = vec2<f32>(lp_x.z, lp_x.y); }
         else if (exit_axis == 1) { uv_x = vec2<f32>(lp_x.x, lp_x.z); }
         else { uv_x = vec2<f32>(lp_x.x, lp_x.y); }
-        let val = tuft_texel(8u + u32(clamp(uv_x.x * 16.0, 0.0, 15.0)),
+        let val = tuft_texel(TUFT_OAK, 8u + u32(clamp(uv_x.x * 16.0, 0.0, 15.0)),
                              8u + u32(clamp(uv_x.y * 16.0, 0.0, 15.0)));
         if (val != 0u) {
             var n = vec3<f32>(0.0);
@@ -913,7 +898,7 @@ fn sprite_cross_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u3
     let vh = hash3f(voxel_min);
     if (vh > 0.92) { return out; } // sparse gaps, same density as before
 
-    var sprite = SPR_TALL_GRASS;
+    var sprite = SPR_TALL_GRASS_A;
     if (mat == MAT_FLOWER) { sprite = select(SPR_POPPY, SPR_DAISY, vh > 0.46); }
 
     let voxel_center = voxel_min + vec3<f32>(0.5);

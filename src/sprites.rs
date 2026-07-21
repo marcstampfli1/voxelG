@@ -1,29 +1,74 @@
 // Hand-authored 16x16 foliage sprites, drawn as ASCII art and encoded to
 // 2-bit texels for the raymarch shader (storage binding 18).
 //
-// This is the Allumeria/Minecraft foliage recipe: leaves and plants get their
-// look from deliberately drawn cutout textures — clumped holes, silhouettes,
-// two-tone shading — not from hash noise. Editing a sprite = editing the
-// ASCII art below; the encoder packs it at startup and a unit test guards the
-// dimensions and charset.
+// This is the Allumeria/Minecraft foliage recipe: plants get their look from
+// deliberately drawn cutout textures - clumped holes, silhouettes, two-tone
+// shading - not from hash noise. Editing a sprite = editing the ASCII art
+// below; the encoder packs it at startup and unit tests guard the dimensions,
+// charset and shape contracts.
 //
 // Legend: '.' transparent  '#' primary  'o' secondary (dark/stem)  '*' accent
 // Rows are written top-down as you read them; the encoder flips them so texel
 // y = 0 is the sprite's BOTTOM row (the shader's v coordinate grows upward).
+//
+// Atlas layout: N_SPRITES 16x16 sprites first, then the 32x32 Better Leaves
+// tufts at word offset TUFT_BASE_WORDS. All indices and offsets are defined
+// ONCE here and mirrored into the shader via `wgsl_consts()` (prepended to
+// the raymarch source), so the two sides can never drift.
 
 pub const SPRITE_DIM: usize = 16;
 /// 16x16 texels x 2 bits = 512 bits = 16 u32 words per sprite.
 pub const SPRITE_WORDS: usize = SPRITE_DIM * SPRITE_DIM * 2 / 32;
+pub const BL_TUFT_DIM: usize = 32;
+/// 32x32 texels x 2 bits = 64 u32 words per tuft.
+pub const BL_TUFT_WORDS: usize = BL_TUFT_DIM * BL_TUFT_DIM * 2 / 32;
 
-// Sprite indices — keep in sync with the SPR_* consts in shaders/raymarch.wgsl.
-pub const SPR_LEAF_A: usize = 0; // upright X-quad leaf cluster, variant A
-pub const SPR_LEAF_B: usize = 1; // upright X-quad leaf cluster, variant B
-pub const SPR_LEAF_PINE: usize = 2; // drooping needle fan for pine X-quads
-pub const SPR_TALL_GRASS: usize = 3;
-pub const SPR_POPPY: usize = 4;
-pub const SPR_DAISY: usize = 5;
-pub const SPR_LEAF_TOP: usize = 6; // horizontal canopy cap, seen from above
-pub const SPR_LEAF_FACE: usize = 7; // solid block-face texture (0 = shadow crevice)
+macro_rules! atlas_consts {
+    ($($(#[$doc:meta])* $name:ident = $val:expr;)*) => {
+        $($(#[$doc])* pub const $name: usize = $val;)*
+
+        /// WGSL mirror of every atlas constant, prepended to the raymarch
+        /// shader source (like build.rs does for the world dimensions).
+        pub fn wgsl_consts() -> String {
+            let mut s = String::with_capacity(512);
+            $(s.push_str(&format!("const {}: u32 = {}u;\n", stringify!($name), $name));)*
+            s
+        }
+    };
+}
+
+atlas_consts! {
+    /// Tuft of tapering blades, dark toward the base (classic tall grass).
+    SPR_TALL_GRASS_A = 0;
+    /// Wide arcing blades fanning outward.
+    SPR_TALL_GRASS_B = 1;
+    /// Short dense meadow clump (top rows empty - reads shorter).
+    SPR_TALL_GRASS_C = 2;
+    /// Sparse forked dry straw for sand/snow ground.
+    SPR_DRY_TUFT = 3;
+    /// Red petal head, dark centre. Flowers are contiguous from here so a
+    /// species pick is `SPR_POPPY + n`.
+    SPR_POPPY = 4;
+    /// White radiating petals, yellow centre.
+    SPR_DAISY = 5;
+    /// Warm cup blossom on a stem.
+    SPR_TULIP = 6;
+    /// Spiky ragged head.
+    SPR_CORNFLOWER = 7;
+    /// Round fluffy puff head.
+    SPR_DANDELION = 8;
+    /// Number of 16x16 sprites in the atlas.
+    N_SPRITES = 9;
+    /// Word offset of the first 32x32 tuft (after the 16x16 sprites).
+    TUFT_BASE_WORDS = N_SPRITES * SPRITE_WORDS;
+    /// Better Leaves tuft indices: tuft i lives at word
+    /// TUFT_BASE_WORDS + i * BL_TUFT_WORDS.
+    TUFT_OAK = 0;
+    TUFT_BIRCH = 1;
+    TUFT_PINE = 2;
+    /// Number of 32x32 tufts in the atlas.
+    N_TUFTS = 3;
+}
 
 /// IMPORTANT (flowers): the cross-quad renderer draws the SAME sprite on two
 /// diagonal planes through the voxel centre. The stem must sit exactly on the
@@ -31,67 +76,8 @@ pub const SPR_LEAF_FACE: usize = 7; // solid block-face texture (0 = shadow crev
 /// quads render two separate stems instead of one X.
 
 #[rustfmt::skip]
-const ART: [[&str; SPRITE_DIM]; 8] = [
-    // SPR_LEAF_A — bushy leaf-cluster quad for canopy fringes: large clear
-    // leaves with highlight tips (*), dark understory (o), ragged silhouette
-    // (transparent border texels so quad edges never read as straight lines).
-    [
-        "....#*....##....",
-        "..######.####*..",
-        ".o##*#########..",
-        "#######o####o#*.",
-        "o####o##*######.",
-        ".#o####*####o##o",
-        "..######o######.",
-        ".#*##o####*###o.",
-        "###*####o######.",
-        "o######o####*##o",
-        ".####*####o####.",
-        "..o###o##*###o..",
-        ".##*#####o##*#..",
-        "..#o##*####o#...",
-        "....###.##o.....",
-        "......#*...#....",
-    ],
-    // SPR_LEAF_B — fringe cluster variant with a different silhouette.
-    [
-        ".....##....#*...",
-        "...#####.#####..",
-        ".#########*###o.",
-        ".o###*####o####.",
-        "#########o###*#o",
-        "o###o#*########.",
-        ".#####o###o####o",
-        "#*####o#*######.",
-        ".######o######o.",
-        "o##*#####o##*##.",
-        "#####o#*#######o",
-        ".o####o###o###..",
-        "..##*######*#o..",
-        "..o######o##.#..",
-        "....##o.###.....",
-        ".....#...#o.....",
-    ],
-    // SPR_LEAF_PINE — drooping needle fan for pine X-quads.
-    [
-        ".......##.......",
-        "....o.####.o....",
-        "..#..######..#..",
-        ".#o.###*###.o#..",
-        "#..##o####o##..#",
-        ".#.#####o####.#.",
-        "#.###o##*##o##.#",
-        ".###.##o##.###o.",
-        "#o#.####o##.#o#.",
-        ".##.#o####.##.#o",
-        "#.#.####o#.#.#..",
-        ".#..#o###.#o.#..",
-        "#...####.#..#...",
-        ".#..#o##.#...o..",
-        "....###..o......",
-        ".....#o...#.....",
-    ],
-    // SPR_TALL_GRASS — a tuft of tapering blades, dark toward the base.
+const ART: [[&str; SPRITE_DIM]; N_SPRITES] = [
+    // SPR_TALL_GRASS_A - a tuft of tapering blades, dark toward the base.
     [
         "................",
         ".....#..........",
@@ -110,7 +96,66 @@ const ART: [[&str; SPRITE_DIM]; 8] = [
         "...#oo#o#o#.##..",
         "..o#o#oo#oo#o...",
     ],
-    // SPR_POPPY — red petal head, dark centre, stem dead-centre on cols 7-8.
+    // SPR_TALL_GRASS_B - wide arcing blades fanning outward from the root.
+    [
+        "................",
+        ".#............#.",
+        ".#....#...#...#.",
+        "..#...#...#..#..",
+        "..#...#...#..#..",
+        "...#..##.##..#..",
+        "...#..#o.#..##..",
+        "....#.#o.#..#...",
+        "....#o#..#o#....",
+        ".....o#..#o.....",
+        ".....o#..#o.#...",
+        ".#...#o..o#..#..",
+        "..#..#o..o#.#...",
+        "...#o#o..o#o#...",
+        "....o#o..o#o....",
+        "...o#oo##oo#o...",
+    ],
+    // SPR_TALL_GRASS_C - short dense meadow clump; top rows stay empty so
+    // the clump reads visibly shorter than A/B.
+    [
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+        "....#...#..#....",
+        "..#.#..##..#.#..",
+        "..#.##.#o.##.#..",
+        "...#.#.#o#.#.#..",
+        "...#o#.#o#o#.#..",
+        "..#.#o##o#o#.#..",
+        "..#o#o#oo#o#o#..",
+        "...#oo#o#oo#o...",
+        "..o#o#oo#o#o#o..",
+        ".oo#o#oo#o#oo#o.",
+    ],
+    // SPR_DRY_TUFT - sparse forked straw for deserts and snow: thin dark
+    // stalks ('o'), a couple of lit strands ('#') at the root.
+    [
+        "................",
+        ".o..............",
+        ".o...........o..",
+        "..o...o......o..",
+        "..o...o.....o...",
+        "...o..o.o...o...",
+        "...o..o.o..o....",
+        "....o.o.o..o....",
+        "....o.oo.o.o....",
+        ".....o.o.o.o....",
+        ".....o.oo.o.....",
+        "..o...oo.oo..o..",
+        "...oo.o..o..o...",
+        "....o.oo.o.o....",
+        ".....o.ooo.o....",
+        "....oo#oo#oo....",
+    ],
+    // SPR_POPPY - red petal head, dark centre, stem dead-centre on cols 7-8.
     [
         "................",
         "......####......",
@@ -129,7 +174,7 @@ const ART: [[&str; SPRITE_DIM]; 8] = [
         ".......oo.......",
         ".......oo.......",
     ],
-    // SPR_DAISY — white radiating petals, yellow centre, stem on cols 7-8.
+    // SPR_DAISY - white radiating petals, yellow centre, stem on cols 7-8.
     [
         "................",
         "......#..#......",
@@ -148,67 +193,76 @@ const ART: [[&str; SPRITE_DIM]; 8] = [
         ".....o.oo.o.....",
         ".......oo.......",
     ],
-    // SPR_LEAF_TOP — horizontal canopy layer seen from above: a ragged
-    // radial rosette of leaves, transparent at the corners so stacked layers
-    // never read as square plates.
+    // SPR_TULIP - closed cup blossom with pointed petal tips, stem on 7-8.
     [
-        ".....o#..#o.....",
-        "...####*###o....",
-        "..o######*###...",
-        ".#####o######o..",
-        ".###*#####o###*.",
-        "o###o##*######..",
-        "######o###o####o",
-        ".#*###o#*#####*.",
-        "o####*#o######o.",
-        "#####o####o####.",
-        ".####o##*###o##.",
-        "..##*######o##..",
-        ".o######*#####..",
-        "..####o####o#...",
-        "....###*##o.....",
-        "......#o.#......",
+        "................",
+        "................",
+        ".....#.##.#.....",
+        ".....######.....",
+        ".....#*##*#.....",
+        ".....#####*.....",
+        ".....######.....",
+        "......####......",
+        ".......oo.......",
+        ".......oo.......",
+        ".......oo.......",
+        "....o..oo.......",
+        ".....o.oo..o....",
+        "......ooo.o.....",
+        ".......oo.......",
+        ".......oo.......",
     ],
-    // SPR_LEAF_FACE — the LEAF MOSAIC: distinct overlapping oval leaves,
-    // each with a dark outline side (o), a lit body (#) and a bright tip
-    // (*), separated by deep-shadow gaps (.). Triplanar-projected onto the
-    // canopy surface — this is what makes individual leaves readable.
+    // SPR_CORNFLOWER - spiky ragged head with bright fringe tips, stem 7-8.
     [
-        "..o#*..*#o...o#*",
-        ".o##*..*##o..o##",
-        "o###*..*###o.o##",
-        "o#o#....o#o..o#o",
-        ".*#o..o#*...*#o.",
-        "*##o..o##*..*##o",
-        "###o.o####..###o",
-        ".o#..o#o#o...o#.",
-        "..o#*..o#*...o#*",
-        ".o##*.o###*..o##",
-        "o###..o###o..o##",
-        "o#o...o#o#......",
-        ".*#o...*#o..*#o.",
-        "*##o..*##o.*###o",
-        "###o..###o..###o",
-        ".o#....o#....o#.",
+        "................",
+        ".......#........",
+        "....#..#..#.....",
+        ".....#####......",
+        "...#*##*##*#....",
+        "....#*###*#.....",
+        "...##*###*##....",
+        ".....#####......",
+        "......#o#.......",
+        ".......oo.......",
+        ".......oo.......",
+        "....o..oo.......",
+        ".....o.oo..o....",
+        "......ooo.o.....",
+        ".......oo.......",
+        ".......oo.......",
+    ],
+    // SPR_DANDELION - round fluffy puff head on a stem, ringed by a dark
+    // seed-edge so it reads as a sphere.
+    [
+        "................",
+        "................",
+        "......o##o......",
+        "....#o####o#....",
+        "....o##**##o....",
+        "...#o#****#o#...",
+        "...o##****##o...",
+        "....o##**##o....",
+        "....#o####o#....",
+        "......o##o......",
+        ".......oo.......",
+        "....o..oo.......",
+        ".....o.oo..o....",
+        "......ooo.o.....",
+        ".......oo.......",
+        ".......oo.......",
     ],
 ];
 
-
 // ---------------------------------------------------------------------------
-// Better Leaves tuft (32x32): ported from "Motschen's Better Leaves Lite"
-// (github.com/TeamMidnightDust/BetterLeavesLite, MIT License, (c) Motschen) —
-// the pre-rounded ragged leaf tuft its big diagonal quads carry. Converted
-// from oak_leaves.png: '.' = transparent, o/#/* = dark/mid/bright leaf pixels
-// (the original is grayscale and tinted in-game, exactly like our palette
-// tint). The block faces sample the CENTRE 16x16 of this texture.
-pub const BL_TUFT_DIM: usize = 32;
-/// 32x32 texels x 2 bits = 64 u32 words.
-pub const BL_TUFT_WORDS: usize = BL_TUFT_DIM * BL_TUFT_DIM * 2 / 32;
-/// Word offset of the tuft inside the encoded atlas (after the 16x16 sprites).
-pub const BL_TUFT_WORD_OFFSET: usize = 8 * SPRITE_WORDS;
+// Better Leaves tufts (32x32): ported from "Motschen's Better Leaves Lite"
+// (github.com/TeamMidnightDust/BetterLeavesLite, MIT License, (c) Motschen) -
+// the pre-rounded ragged leaf tufts its big diagonal quads carry. Converted
+// from the pack's *_leaves.png: '.' = transparent, o/#/* = dark/mid/bright
+// leaf pixels (the originals are grayscale and tinted in-game, exactly like
+// our palette tint). The block faces sample the CENTRE 16x16 of each tuft.
 
 #[rustfmt::skip]
-const BL_TUFT: [&str; BL_TUFT_DIM] = [
+const BL_TUFT_OAK: [&str; BL_TUFT_DIM] = [
         "...............#................",
         "............o.o##..##...........",
         ".........#....###*.#...*........",
@@ -243,11 +297,17 @@ const BL_TUFT: [&str; BL_TUFT_DIM] = [
         ".............*..o..#............",
 ];
 
+// Tuft art table, indexed by TUFT_*. Birch and pine currently alias the oak
+// art as a structural placeholder: the atlas layout (offsets, count) is
+// final, and the ported birch/spruce conversions land in the next change.
+const TUFT_ART: [&[&str; BL_TUFT_DIM]; N_TUFTS] = [&BL_TUFT_OAK, &BL_TUFT_OAK, &BL_TUFT_OAK];
+
 /// Encode all sprites into the flat u32 word array the shader indexes.
-/// Texel (x, y) of sprite s lives at bit `(y*16 + x) * 2` of word block
-/// `s * SPRITE_WORDS`.
+/// Texel (x, y) of 16x16 sprite s lives at bit `(y*16 + x) * 2` of word block
+/// `s * SPRITE_WORDS`; tuft t at bit `(y*32 + x) * 2` of word block
+/// `TUFT_BASE_WORDS + t * BL_TUFT_WORDS`.
 pub fn encoded() -> Vec<u32> {
-    let mut out = vec![0u32; ART.len() * SPRITE_WORDS];
+    let mut out = vec![0u32; TUFT_BASE_WORDS + N_TUFTS * BL_TUFT_WORDS];
     for (si, art) in ART.iter().enumerate() {
         for (row, line) in art.iter().enumerate() {
             assert_eq!(
@@ -269,31 +329,37 @@ pub fn encoded() -> Vec<u32> {
             }
         }
     }
-    // Append the 32x32 Better Leaves tuft after the 16x16 sprites.
-    debug_assert_eq!(out.len(), BL_TUFT_WORD_OFFSET);
-    out.extend(std::iter::repeat(0u32).take(BL_TUFT_WORDS));
-    for (row, line) in BL_TUFT.iter().enumerate() {
-        assert_eq!(line.len(), BL_TUFT_DIM, "tuft row {row} width");
-        let y = BL_TUFT_DIM - 1 - row;
-        for (x, ch) in line.bytes().enumerate() {
-            let v = match ch {
-                b'.' => 0u32,
-                b'o' => 1, // NOTE: tuft uses 1 = dark, 2 = mid, 3 = bright
-                b'#' => 2,
-                b'*' => 3,
-                _ => panic!("tuft row {row}: bad char '{}'", ch as char),
-            };
-            let bit = (y * BL_TUFT_DIM + x) * 2;
-            out[BL_TUFT_WORD_OFFSET + bit / 32] |= v << (bit % 32);
+    for (ti, art) in TUFT_ART.iter().enumerate() {
+        for (row, line) in art.iter().enumerate() {
+            assert_eq!(line.len(), BL_TUFT_DIM, "tuft {ti} row {row} width");
+            let y = BL_TUFT_DIM - 1 - row;
+            for (x, ch) in line.bytes().enumerate() {
+                let v = match ch {
+                    b'.' => 0u32,
+                    b'o' => 1, // NOTE: tufts use 1 = dark, 2 = mid, 3 = bright
+                    b'#' => 2,
+                    b'*' => 3,
+                    _ => panic!("tuft {ti} row {row}: bad char '{}'", ch as char),
+                };
+                let bit = (y * BL_TUFT_DIM + x) * 2;
+                out[TUFT_BASE_WORDS + ti * BL_TUFT_WORDS + bit / 32] |= v << (bit % 32);
+            }
         }
     }
     out
 }
 
-/// Decode one texel back out (test + tooling mirror of the WGSL sprite_texel).
+/// Decode one 16x16 texel back out (test + tooling mirror of the WGSL
+/// sprite_texel).
 pub fn texel(words: &[u32], sprite: usize, x: usize, y: usize) -> u32 {
     let bit = (y * SPRITE_DIM + x) * 2;
     (words[sprite * SPRITE_WORDS + bit / 32] >> (bit % 32)) & 3
+}
+
+/// Decode one 32x32 tuft texel back out (mirror of the WGSL tuft_texel).
+pub fn tuft_texel(words: &[u32], tuft: usize, x: usize, y: usize) -> u32 {
+    let bit = (y * BL_TUFT_DIM + x) * 2;
+    (words[TUFT_BASE_WORDS + tuft * BL_TUFT_WORDS + bit / 32] >> (bit % 32)) & 3
 }
 
 #[cfg(test)]
@@ -303,28 +369,26 @@ mod tests {
     #[test]
     fn encodes_all_sprites() {
         let w = encoded();
-        assert_eq!(w.len(), 8 * SPRITE_WORDS + BL_TUFT_WORDS);
+        assert_eq!(w.len(), TUFT_BASE_WORDS + N_TUFTS * BL_TUFT_WORDS);
+        assert_eq!(TUFT_BASE_WORDS, N_SPRITES * SPRITE_WORDS);
     }
 
-    /// The leaf mosaic needs enough leaf coverage that the gaps read as
-    /// shadow crevices between leaves, not as the dominant surface.
+    /// The generated WGSL consts are the shader's only source of atlas
+    /// indices - guard the emission format and a couple of values.
     #[test]
-    fn leaf_mosaic_coverage() {
-        let w = encoded();
-        let o = opacity(&w, SPR_LEAF_FACE);
-        assert!((0.60..=0.85).contains(&o), "leaf mosaic coverage: {o}");
+    fn wgsl_consts_emitted() {
+        let s = wgsl_consts();
+        assert!(s.contains("const SPR_POPPY: u32 = 4u;"), "{s}");
+        assert!(s.contains(&format!("const TUFT_BASE_WORDS: u32 = {TUFT_BASE_WORDS}u;")), "{s}");
+        assert!(s.contains("const TUFT_PINE: u32 = 2u;"), "{s}");
     }
 
-    /// The ported Better Leaves tuft: right size, round (transparent
-    /// corners), and roughly the original's ~46% coverage.
+    /// The ported Better Leaves tufts: right size, round (transparent
+    /// corners), and roughly the original's ~46% coverage (oak).
     #[test]
     fn better_leaves_tuft_intact() {
         let w = encoded();
-        assert_eq!(w.len(), BL_TUFT_WORD_OFFSET + BL_TUFT_WORDS);
-        let tex = |x: usize, y: usize| -> u32 {
-            let bit = (y * BL_TUFT_DIM + x) * 2;
-            (w[BL_TUFT_WORD_OFFSET + bit / 32] >> (bit % 32)) & 3
-        };
+        let tex = |x: usize, y: usize| tuft_texel(&w, TUFT_OAK, x, y);
         for (x, y) in [(0, 0), (31, 0), (0, 31), (31, 31)] {
             assert_eq!(tex(x, y), 0, "tuft corner ({x},{y}) must be clear");
         }
@@ -359,7 +423,7 @@ mod tests {
     #[test]
     fn flower_stems_centred() {
         let w = encoded();
-        for s in [SPR_POPPY, SPR_DAISY] {
+        for s in [SPR_POPPY, SPR_DAISY, SPR_TULIP, SPR_CORNFLOWER, SPR_DANDELION] {
             for y in [0usize, 1, 4, 5] {
                 assert_eq!(texel(&w, s, 7, y), 2, "sprite {s} stem col 7 y {y}");
                 assert_eq!(texel(&w, s, 8, y), 2, "sprite {s} stem col 8 y {y}");
@@ -369,46 +433,12 @@ mod tests {
         }
     }
 
-
-    fn opacity(w: &[u32], s: usize) -> f32 {
-        let n: usize = (0..SPRITE_DIM)
-            .flat_map(|y| (0..SPRITE_DIM).map(move |x| (x, y)))
-            .filter(|&(x, y)| texel(w, s, x, y) != 0)
-            .count();
-        n as f32 / 256.0
-    }
-
-    #[test]
-    fn leaf_clusters_in_authored_range() {
-        let w = encoded();
-        let a = opacity(&w, SPR_LEAF_A);
-        let b = opacity(&w, SPR_LEAF_B);
-        let pine = opacity(&w, SPR_LEAF_PINE);
-        let top = opacity(&w, SPR_LEAF_TOP);
-        assert!((0.45..=0.78).contains(&a), "cluster A {a}");
-        assert!((0.45..=0.78).contains(&b), "cluster B {b}");
-        assert!((0.30..=0.60).contains(&pine), "pine fan {pine}");
-        assert!((0.45..=0.80).contains(&top), "top rosette {top}");
-    }
-
-    /// Quad edges must never read as straight lines: every leaf-cluster
-    /// sprite needs transparent corners (ragged silhouette).
-    #[test]
-    fn leaf_clusters_have_ragged_corners() {
-        let w = encoded();
-        for s in [SPR_LEAF_A, SPR_LEAF_B, SPR_LEAF_PINE, SPR_LEAF_TOP] {
-            for (x, y) in [(0, 0), (15, 0), (0, 15), (15, 15)] {
-                assert_eq!(texel(&w, s, x, y), 0, "sprite {s} corner ({x},{y})");
-            }
-        }
-    }
-
     #[test]
     fn grass_is_rooted_and_tapers() {
         let w = encoded();
         let row_count = |y: usize| {
             (0..SPRITE_DIM)
-                .filter(|&x| texel(&w, SPR_TALL_GRASS, x, y) != 0)
+                .filter(|&x| texel(&w, SPR_TALL_GRASS_A, x, y) != 0)
                 .count()
         };
         // Dense near the ground, sparse at the tips, empty at the very top.

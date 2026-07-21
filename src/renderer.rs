@@ -14,6 +14,20 @@ const WORLD_CONSTS_WGSL: &str = include_str!(concat!(env!("OUT_DIR"), "/world_co
 /// definition instead of a hand-maintained copy each. NOT used by physics/blit.
 const COMMON_WGSL: &str = include_str!("../shaders/common.wgsl");
 
+/// Full raymarch shader source: world consts + common prelude + the sprite
+/// atlas consts generated from `src/sprites.rs` + the shader body. The ONE
+/// assembly point shared by the pipeline, the naga validation test and the
+/// GPU test harness, so what is validated/tested is what runs.
+pub(crate) fn raymarch_source() -> String {
+    format!(
+        "{}\n{}\n{}\n{}",
+        WORLD_CONSTS_WGSL,
+        COMMON_WGSL,
+        crate::sprites::wgsl_consts(),
+        include_str!("../shaders/raymarch.wgsl")
+    )
+}
+
 /// Pack a Vec<u8> into Vec<u32> for storage-buffer upload (WGSL storage
 /// buffers can't directly index u8 arrays; reading byte b of word w via
 /// `(packed[w] >> ((b & 3) * 8)) & 0xFF` is the canonical pattern).
@@ -461,12 +475,7 @@ impl Renderer {
             bind_group_layouts: &[&compute_bgl],
             push_constant_ranges: &[],
         });
-        let raymarch_src = format!(
-            "{}\n{}\n{}",
-            WORLD_CONSTS_WGSL,
-            COMMON_WGSL,
-            include_str!("../shaders/raymarch.wgsl")
-        );
+        let raymarch_src = raymarch_source();
         let compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("raymarch shader"),
             source: wgpu::ShaderSource::Wgsl(raymarch_src.into()),
@@ -1413,7 +1422,7 @@ mod shader_tests {
     //! validated at runtime when the pipelines are created. The const-prepending
     //! mirrors exactly what `Renderer::new` does, so the validated source is the
     //! source that actually runs.
-    use super::{WORLD_CONSTS_WGSL, COMMON_WGSL};
+    use super::{raymarch_source, WORLD_CONSTS_WGSL, COMMON_WGSL};
 
     fn validate(name: &str, src: &str) {
         let module = naga::front::wgsl::parse_str(src)
@@ -1428,7 +1437,7 @@ mod shader_tests {
 
     #[test]
     fn raymarch_wgsl_valid() {
-        let src = format!("{}\n{}\n{}", WORLD_CONSTS_WGSL, COMMON_WGSL, include_str!("../shaders/raymarch.wgsl"));
+        let src = raymarch_source();
         validate("raymarch.wgsl", &src);
     }
 
@@ -1604,7 +1613,7 @@ mod gpu_render_tests {
             bind_group_layouts: &[&bgl],
             push_constant_ranges: &[],
         });
-        let src = format!("{}\n{}\n{}", WORLD_CONSTS_WGSL, COMMON_WGSL, include_str!("../shaders/raymarch.wgsl"));
+        let src = raymarch_source();
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("test raymarch"),
             source: wgpu::ShaderSource::Wgsl(src.into()),
@@ -1847,7 +1856,7 @@ mod gpu_render_tests {
         let (water_c, leaf_c, leaf_ground) = find_scene_anchors(&world);
         std::fs::create_dir_all("target/lookdev").unwrap();
 
-        let mut save = |name: &str, cam: &Camera| {
+        let save = |name: &str, cam: &Camera| {
             let Some(rgba) = render_rgba(&world, cam, w, h) else {
                 eprintln!("no GPU — skipping lookdev dump");
                 return;
@@ -1966,7 +1975,7 @@ mod gpu_render_tests {
         let bgl = create_compute_bgl(&device);
         let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &ov, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr);
         let pll = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[&bgl], push_constant_ranges: &[] });
-        let src = format!("{}\n{}\n{}", WORLD_CONSTS_WGSL, COMMON_WGSL, include_str!("../shaders/raymarch.wgsl"));
+        let src = raymarch_source();
         let m = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(src.into()) });
         let pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: Some(&pll), module: &m, entry_point: Some("cs_main"), compilation_options: Default::default(), cache: None });
         let pipe_transp = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: Some(&pll), module: &m, entry_point: Some("cs_transparent"), compilation_options: Default::default(), cache: None });
