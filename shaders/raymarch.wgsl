@@ -614,6 +614,7 @@ const MAT_LEAVES_AUTUMN:   u32 = 27u;
 const MAT_FLOWER:          u32 = 30u;
 const MAT_TALL_GRASS:      u32 = 31u;
 const MAT_LEAF_FRINGE:     u32 = 33u;
+const MAT_TALL_GRASS_DRY:  u32 = 34u;
 
 fn is_water_mat(m: u32) -> bool {
     return m >= MAT_WATER_L1 && m <= MAT_WATER_L8;
@@ -629,7 +630,7 @@ fn is_foliage_mat(m: u32) -> bool {
     return m == MAT_LEAVES || m == MAT_LEAVES_BIRCH
         || m == MAT_LEAVES_PINE || m == MAT_LEAVES_AUTUMN
         || m == MAT_FLOWER || m == MAT_TALL_GRASS
-        || m == MAT_LEAF_FRINGE;
+        || m == MAT_LEAF_FRINGE || m == MAT_TALL_GRASS_DRY;
 }
 fn is_leaf_block_mat(m: u32) -> bool {
     return m == MAT_LEAVES || m == MAT_LEAVES_BIRCH
@@ -640,7 +641,8 @@ fn is_leaf_block_mat(m: u32) -> bool {
 // instead. Leaves, by contrast, stay solid cubes far away so tree canopies
 // don't disappear.
 fn is_decoration_mat(m: u32) -> bool {
-    return m == MAT_FLOWER || m == MAT_TALL_GRASS || m == MAT_LEAF_FRINGE;
+    return m == MAT_FLOWER || m == MAT_TALL_GRASS || m == MAT_LEAF_FRINGE
+        || m == MAT_TALL_GRASS_DRY;
 }
 
 struct SubHit {
@@ -1005,7 +1007,17 @@ fn cross_sprite_tint(mat: u32, sprite: u32, val: u32, v: f32, vh: f32) -> vec3<f
     if (mat == MAT_TALL_GRASS) {
         // Dark base -> bright tip, darker secondary texels, per-voxel hue.
         let b = (0.60 + 0.55 * v) * select(1.0, 0.72, val == 2u);
-        return vec3<f32>(b) * (0.85 + vh * 0.30);
+        // Couple the blade hue 60% toward the ground-block palette so grass
+        // tracks its terrain colour from the one palette source instead of
+        // floating over it.
+        let ground = mix(vec3<f32>(1.0),
+                         palette[MAT_GRASS].rgb / max(palette[MAT_TALL_GRASS].rgb, vec3<f32>(1e-3)),
+                         0.6);
+        return vec3<f32>(b) * (0.85 + vh * 0.30) * ground;
+    }
+    if (mat == MAT_TALL_GRASS_DRY) {
+        // Pale straw: brightness ramp along the stalk, small per-clump spread.
+        return vec3<f32>(0.55 + 0.70 * v) * (0.90 + vh * 0.20);
     }
     // Flowers. Tints are target-colour / flower-palette-colour ratios
     // (palette MAT_FLOWER = 1.10, 0.35, 0.65).
@@ -1027,7 +1039,20 @@ fn sprite_cross_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u3
     if (vh > 0.92) { return out; } // sparse gaps, same density as before
 
     var sprite = SPR_TALL_GRASS_A;
-    if (mat == MAT_FLOWER) { sprite = select(SPR_POPPY, SPR_DAISY, vh > 0.46); }
+    if (mat == MAT_TALL_GRASS) {
+        // Blade-shape variants on an independent hash channel.
+        let r = fract(vh * 8.0);
+        if (r >= 0.4) { sprite = SPR_TALL_GRASS_B; }
+        if (r >= 0.75) { sprite = SPR_TALL_GRASS_C; }
+    } else if (mat == MAT_TALL_GRASS_DRY) {
+        sprite = SPR_DRY_TUFT;
+    } else if (mat == MAT_FLOWER) {
+        sprite = select(SPR_POPPY, SPR_DAISY, vh > 0.46);
+    }
+    // Per-clump height (grass and straw only): flowers keep hs = 1.0, their
+    // stems must reach the ground plane at full sprite height.
+    var hs = 1.0;
+    if (mat != MAT_FLOWER) { hs = 0.70 + fract(vh * 4.0) * 0.30; }
 
     let voxel_center = voxel_min + vec3<f32>(0.5);
     let phase = voxel_min.x * 0.40 + voxel_min.z * 0.55 + vh * 6.28;
@@ -1059,6 +1084,8 @@ fn sprite_cross_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u3
          || local.z < 0.0 || local.z > 1.0) { continue; }
 
         let v = local.y;
+        if (v > hs) { continue; } // above this clump's height: transparent
+        let vn = v / hs;          // normalized height along the clump
         // Shear the sampling space by the wind in WORLD xz, weighted by
         // height — identically for both planes, so the two quads keep
         // intersecting in one vertical line. (Shearing each plane along its
@@ -1070,13 +1097,13 @@ fn sprite_cross_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u3
         let u = clamp((s_w + 0.70711) / 1.41421, 0.0, 0.99999);
         var tx = u32(u * 16.0);
         if (mirror_u) { tx = 15u - tx; }
-        let ty = u32(clamp(v * 16.0, 0.0, 15.0));
+        let ty = u32(clamp(vn * 16.0, 0.0, 15.0));
         let val = sprite_texel(sprite, tx, ty);
         if (val == 0u) { continue; }
 
         best_t = t;
         best_n = select(pn, -pn, denom > 0.0);
-        tint = cross_sprite_tint(mat, sprite, val, v, vh);
+        tint = cross_sprite_tint(mat, sprite, val, vn, vh);
     }
 
     if (best_t < 1e30) {
@@ -1090,7 +1117,7 @@ fn sprite_cross_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u3
 
 fn foliage_subvoxel(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32) -> SubHit {
     var hit: SubHit;
-    if (mat == MAT_TALL_GRASS || mat == MAT_FLOWER) {
+    if (mat == MAT_TALL_GRASS || mat == MAT_FLOWER || mat == MAT_TALL_GRASS_DRY) {
         hit = sprite_cross_hit(voxel, origin, dir, mat);
     } else if (mat == MAT_LEAF_FRINGE) {
         hit = leaf_fringe_hit(voxel, origin, dir);
@@ -1854,7 +1881,8 @@ fn shade(
         // Flowers + tall grass sway harder (thin & light) than tree leaves.
         // Leaf amplitude raised 0.30 -> 0.45 (and brightness ripple 0.12 ->
         // 0.16) so canopies visibly move even past the leaf-card radius.
-        let amp = select(0.45, 0.55, hit.mat == MAT_FLOWER || hit.mat == MAT_TALL_GRASS);
+        let amp = select(0.45, 0.55, hit.mat == MAT_FLOWER || hit.mat == MAT_TALL_GRASS
+                                   || hit.mat == MAT_TALL_GRASS_DRY);
         n.x += sway * amp;
         n.z += sway * amp * 0.7;
         n = normalize(n);

@@ -527,17 +527,23 @@ mod tests {
         }
     }
 
+    /// Every grass/straw variant must be rooted (dense base), taper toward
+    /// the tips and leave the top row clear. The dry tuft is deliberately
+    /// sparser, hence its lower base floor.
     #[test]
     fn grass_is_rooted_and_tapers() {
         let w = encoded();
-        let row_count = |y: usize| {
-            (0..SPRITE_DIM)
-                .filter(|&x| texel(&w, SPR_TALL_GRASS_A, x, y) != 0)
-                .count()
-        };
-        // Dense near the ground, sparse at the tips, empty at the very top.
-        assert!(row_count(0) >= 8, "base row density");
-        assert!(row_count(12) <= 4, "tip row density");
-        assert_eq!(row_count(15), 0, "top row clear");
+        for (s, base_floor) in [
+            (SPR_TALL_GRASS_A, 8),
+            (SPR_TALL_GRASS_B, 8),
+            (SPR_TALL_GRASS_C, 8),
+            (SPR_DRY_TUFT, 5),
+        ] {
+            let row_count =
+                |y: usize| (0..SPRITE_DIM).filter(|&x| texel(&w, s, x, y) != 0).count();
+            assert!(row_count(0) >= base_floor, "sprite {s} base row density");
+            assert!(row_count(12) <= 4, "sprite {s} tip row density");
+            assert_eq!(row_count(15), 0, "sprite {s} top row clear");
+        }
     }
 }

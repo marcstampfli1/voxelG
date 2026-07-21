@@ -122,6 +122,7 @@ use crate::voxel::{
     MAT_COAL, MAT_IRON, MAT_GOLD, MAT_DIAMOND,
     MAT_WOOD_BIRCH, MAT_WOOD_PINE, MAT_LEAVES_BIRCH, MAT_LEAVES_PINE, MAT_LEAVES_AUTUMN,
     MAT_SMOKE, MAT_FIRE, MAT_FLOWER, MAT_TALL_GRASS, MAT_CACTUS,
+    MAT_TALL_GRASS_DRY,
 };
 
 #[repr(C)]
@@ -174,6 +175,7 @@ fn default_palette() -> [PaletteEntry; PALETTE_SIZE] {
     // Canopy fringe: never drawn as a cube, but give it the leaf colour in
     // case any debug path samples it.
     p[crate::voxel::MAT_LEAF_FRINGE as usize] = PaletteEntry([0.30, 0.58, 0.20, 1.0]);
+    p[MAT_TALL_GRASS_DRY as usize] = PaletteEntry([0.78, 0.68, 0.38, 1.0]); // pale straw
     p
 }
 
@@ -1937,21 +1939,23 @@ mod gpu_render_tests {
         canopy_top.pitch = -1.45;
         save("canopy_top", &canopy_top);
 
-        // Per-species canopy close-ups (skipped when the demo seed grew none).
-        for (name, mat) in [
-            ("birch_close", crate::voxel::MAT_LEAVES_BIRCH),
-            ("pine_close", crate::voxel::MAT_LEAVES_PINE),
+        // Per-species canopy close-ups and a ground-flora meadow view
+        // (skipped when the demo seed grew none). Canopy views back off and
+        // look slightly down (a camera inside the anchor cell sees only cube
+        // faces); the meadow view sits at eye height in the grass.
+        for (name, mat, dy, dz, pitch) in [
+            ("birch_close", crate::voxel::MAT_LEAVES_BIRCH, 14.0, -26.0, -0.18),
+            ("pine_close", crate::voxel::MAT_LEAVES_PINE, 14.0, -26.0, -0.18),
+            ("meadow", MAT_TALL_GRASS, 3.0, -9.0, -0.14),
         ] {
             if let Some((c, ground)) = find_species_anchor(&world, mat) {
                 let mut cam = Camera::new();
-                // Back off and look slightly down: the anchor cell is the
-                // canopy itself, and a camera inside it sees only cube faces.
                 cam.pos = glam::Vec3::new(
                     clamp_anchor(c.x) + 1.0,
-                    ground as f32 + 14.0,
-                    clamp_anchor(c.y) - 26.0,
+                    ground as f32 + dy,
+                    clamp_anchor(c.y) + dz,
                 );
-                cam.pitch = -0.18;
+                cam.pitch = pitch;
                 save(name, &cam);
             } else {
                 eprintln!("no {name} anchor in demo world - skipped");
@@ -2017,7 +2021,7 @@ mod gpu_render_tests {
             cam.pitch = pitch;
             cam
         };
-        let scenarios = [
+        let mut scenarios = vec![
             ("terrain", mk_cam(glam::Vec3::new(256.0, 150.0, 256.0), -0.5)),
             (
                 "water",
@@ -2038,6 +2042,17 @@ mod gpu_render_tests {
                 ),
             ),
         ];
+        // Eye-height ground-flora view (dense cross-quad sprites), when the
+        // demo seed grew a meadow.
+        if let Some((c, ground)) = find_species_anchor(&world, crate::voxel::MAT_TALL_GRASS) {
+            scenarios.push((
+                "meadow",
+                mk_cam(
+                    glam::Vec3::new(clamp_anchor(c.x) + 1.0, ground as f32 + 3.0, clamp_anchor(c.y) - 9.0),
+                    -0.14,
+                ),
+            ));
+        }
 
         // World buffers are shared across scenarios; only the camera changes.
         let cu0 = CameraUniform::from_camera(&scenarios[0].1, w, h, 0.0, glam::IVec3::ZERO, [0.0, 0.0], 0.0);

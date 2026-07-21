@@ -140,6 +140,9 @@ pub const MAT_CACTUS: u8 = 32;
 /// side, not only from above. Never rendered as a cube, never casts
 /// shadows, skipped by picking.
 pub const MAT_LEAF_FRINGE: u8 = 33;
+/// Dry straw tuft decoration for sand (desert/savanna) and snow (tundra)
+/// tops - same cross-quad renderer as tall grass, its own sprite + palette.
+pub const MAT_TALL_GRASS_DRY: u8 = 34;
 
 #[inline(always)]
 pub fn is_leaf_mat(m: u8) -> bool {
@@ -1377,22 +1380,48 @@ pub fn gen_slot_bricks(world_chunk: glam::IVec3, seed: u64) -> Vec<Brick> {
                 }
             }
 
-            // Surface decoration: tall grass + flowers on grass tops. No
-            // decoration over water/sand/etc — only on actual grass blocks.
+            // Surface decoration: tall grass + flowers on grass tops (with
+            // clustered flower meadows), dry straw tufts on desert/savanna
+            // sand and tundra snow. Never over water; beaches stay clean.
             if ts.water_top == 0 && (h_signed as u32) < WORLD_VOXELS_Y - 1 {
                 let surface_top = biome.top_block(h_u32, sea_level);
-                if surface_top == MAT_GRASS {
-                    let dec_y = h_signed + 1;
-                    if dec_y >= world_y0 && dec_y < world_y0 + STORAGE_CHUNK_VOXELS as i32 {
-                        let h = hash3(wx_int, dec_y, wz_int);
-                        let v = h * 0.5 + 0.5;  // 0..1
-                        let dec_mat = if v > 0.985 { MAT_FLOWER }
-                                      else if v > 0.92 { MAT_TALL_GRASS }
-                                      else { 0u8 };
-                        if dec_mat != 0 {
-                            let dy = (dec_y - world_y0) as u32;
-                            write_into_scratch(&mut bricks, dx, dy, dz, dec_mat);
+                let dec_y = h_signed + 1;
+                if dec_y >= world_y0 && dec_y < world_y0 + STORAGE_CHUNK_VOXELS as i32 {
+                    let h = hash3(wx_int, dec_y, wz_int);
+                    let v = h * 0.5 + 0.5; // 0..1
+                    let dec_mat = match surface_top {
+                        MAT_GRASS => {
+                            let (mut fp, gp) = biome.flora_probs();
+                            // Meadow patches: low-frequency noise clusters the
+                            // flowers into wildflower fields instead of a
+                            // uniform sprinkle.
+                            let meadow = fbm_2d(
+                                wx_int as f32 * 0.02 + 7.0,
+                                wz_int as f32 * 0.02 - 3.0,
+                                2,
+                            ) > 0.30;
+                            if meadow {
+                                fp *= 3.0;
+                            }
+                            if v > 1.0 - fp {
+                                MAT_FLOWER
+                            } else if v > 1.0 - fp - gp {
+                                MAT_TALL_GRASS
+                            } else {
+                                0u8
+                            }
                         }
+                        MAT_SAND if matches!(biome, Biome::Desert | Biome::Savanna) => {
+                            if v > 0.99 { MAT_TALL_GRASS_DRY } else { 0u8 }
+                        }
+                        MAT_SNOW if matches!(biome, Biome::Tundra) => {
+                            if v > 0.995 { MAT_TALL_GRASS_DRY } else { 0u8 }
+                        }
+                        _ => 0u8,
+                    };
+                    if dec_mat != 0 {
+                        let dy = (dec_y - world_y0) as u32;
+                        write_into_scratch(&mut bricks, dx, dy, dz, dec_mat);
                     }
                 }
             }
@@ -1760,6 +1789,19 @@ impl Biome {
             Biome::Jungle => match hash % 4 { 0 => 3, _ => 0 },  // oak/autumn — dense
             Biome::Savanna => 0,
             _ => 0,
+        }
+    }
+    /// (flower, tall grass) probability per grass-top voxel. Close to the
+    /// previous global constants (flower 0.015, grass 0.065) - plains get a
+    /// mild boost, and meadow patches multiply the flower probability 3x
+    /// locally. Denser than this measurably slows every view containing
+    /// grass tops (more occupied cells = more DDA descents).
+    pub fn flora_probs(self) -> (f32, f32) {
+        match self {
+            Biome::Plains => (0.020, 0.08),
+            Biome::Forest => (0.010, 0.065),
+            Biome::Jungle => (0.012, 0.09),
+            _ => (0.015, 0.065),
         }
     }
     /// Trees per chunk multiplier — Jungle is dense, Savanna sparse.
