@@ -169,7 +169,11 @@ fn default_palette() -> [PaletteEntry; PALETTE_SIZE] {
     p[MAT_LEAVES_AUTUMN as usize] = PaletteEntry([0.90, 0.42, 0.15, 1.0]);
     p[MAT_SMOKE as usize]   = PaletteEntry([0.65, 0.65, 0.70, 1.0]);
     p[MAT_FIRE as usize]    = PaletteEntry([1.60, 0.60, 0.10, 1.0]);
-    p[MAT_FLOWER as usize]      = PaletteEntry([1.10, 0.35, 0.65, 1.0]);
+    // White: flower colours are absolute in the shader's flower_color()
+    // table (five species from one material). Safe because decorations are
+    // never cube-rendered (far ones vanish) and MAT_FLOWER is not in the
+    // player-placeable key list, so no other consumer reads this entry.
+    p[MAT_FLOWER as usize]      = PaletteEntry([1.0, 1.0, 1.0, 1.0]);
     p[MAT_TALL_GRASS as usize]  = PaletteEntry([0.38, 0.70, 0.25, 1.0]);
     p[MAT_CACTUS as usize]      = PaletteEntry([0.28, 0.50, 0.30, 1.0]);
     // Canopy fringe: never drawn as a cube, but give it the leaf colour in

@@ -1019,15 +1019,36 @@ fn cross_sprite_tint(mat: u32, sprite: u32, val: u32, v: f32, vh: f32) -> vec3<f
         // Pale straw: brightness ramp along the stalk, small per-clump spread.
         return vec3<f32>(0.55 + 0.70 * v) * (0.90 + vh * 0.20);
     }
-    // Flowers. Tints are target-colour / flower-palette-colour ratios
-    // (palette MAT_FLOWER = 1.10, 0.35, 0.65).
-    if (val == 2u) { return vec3<f32>(0.182, 1.286, 0.200); } // stem/leaf green
+    // Flowers: absolute colours (palette MAT_FLOWER is white). Poppy and
+    // daisy values are the previous ratio constants multiplied through the
+    // old palette entry, so their look is unchanged.
+    return flower_color(sprite, val);
+}
+
+// Absolute flower colours per species and tone. '#' = petal body, '*' =
+// accent (centre or bright fringe), 'o' = stem/leaf green - shared by the
+// stem and any collar ring around a head.
+fn flower_color(sprite: u32, val: u32) -> vec3<f32> {
+    if (val == 2u) { return vec3<f32>(0.200, 0.450, 0.130); } // stem/leaf
     if (sprite == SPR_POPPY) {
-        if (val == 3u) { return vec3<f32>(0.109, 0.257, 0.077); } // dark centre
-        return vec3<f32>(0.864, 0.429, 0.185);                    // red petals
+        if (val == 3u) { return vec3<f32>(0.120, 0.090, 0.050); } // dark centre
+        return vec3<f32>(0.950, 0.150, 0.120);                    // red petals
     }
-    if (val == 3u) { return vec3<f32>(1.045, 2.429, 0.231); }     // yellow centre
-    return vec3<f32>(0.864, 2.714, 1.385);                        // white petals
+    if (sprite == SPR_DAISY) {
+        if (val == 3u) { return vec3<f32>(1.150, 0.850, 0.150); } // yellow centre
+        return vec3<f32>(0.950, 0.950, 0.900);                    // white petals
+    }
+    if (sprite == SPR_TULIP) {
+        if (val == 3u) { return vec3<f32>(1.100, 0.550, 0.200); } // lit rim
+        return vec3<f32>(1.000, 0.320, 0.100);                    // red-orange cup
+    }
+    if (sprite == SPR_CORNFLOWER) {
+        if (val == 3u) { return vec3<f32>(0.480, 0.620, 1.100); } // bright fringe
+        return vec3<f32>(0.240, 0.350, 0.950);                    // cornflower blue
+    }
+    // Dandelion.
+    if (val == 3u) { return vec3<f32>(1.150, 1.000, 0.250); }     // bright core
+    return vec3<f32>(1.050, 0.820, 0.120);                        // yellow puff
 }
 
 fn sprite_cross_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32) -> SubHit {
@@ -1047,7 +1068,9 @@ fn sprite_cross_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u3
     } else if (mat == MAT_TALL_GRASS_DRY) {
         sprite = SPR_DRY_TUFT;
     } else if (mat == MAT_FLOWER) {
-        sprite = select(SPR_POPPY, SPR_DAISY, vh > 0.46);
+        // Five species on an independent hash channel; the flower sprites
+        // are contiguous in the atlas so the pick is an index offset.
+        sprite = SPR_POPPY + min(u32(fract(vh * 128.0) * 5.0), 4u);
     }
     // Per-clump height (grass and straw only): flowers keep hs = 1.0, their
     // stems must reach the ground plane at full sprite height.

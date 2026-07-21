@@ -527,6 +527,27 @@ mod tests {
         }
     }
 
+    /// Every flower needs a readable head: total opacity in a sane band and
+    /// at least a couple of accent texels ('*') for the species colour
+    /// table to work with.
+    #[test]
+    fn flower_heads_have_body_and_accents() {
+        let w = encoded();
+        for s in [SPR_POPPY, SPR_DAISY, SPR_TULIP, SPR_CORNFLOWER, SPR_DANDELION] {
+            let n: usize = (0..SPRITE_DIM)
+                .flat_map(|y| (0..SPRITE_DIM).map(move |x| (x, y)))
+                .filter(|&(x, y)| texel(&w, s, x, y) != 0)
+                .count();
+            let o = n as f32 / 256.0;
+            assert!((0.08..=0.35).contains(&o), "flower {s} opacity {o}");
+            let accents = (0..SPRITE_DIM)
+                .flat_map(|y| (0..SPRITE_DIM).map(move |x| (x, y)))
+                .filter(|&(x, y)| texel(&w, s, x, y) == 3)
+                .count();
+            assert!(accents >= 2, "flower {s} needs accent texels, has {accents}");
+        }
+    }
+
     /// Every grass/straw variant must be rooted (dense base), taper toward
     /// the tips and leave the top row clear. The dry tuft is deliberately
     /// sparser, hence its lower base floor.
