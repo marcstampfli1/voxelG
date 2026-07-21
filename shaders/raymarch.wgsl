@@ -717,6 +717,50 @@ fn leaf_species_tint(mat: u32, vh: f32) -> vec3<f32> {
     return vec3<f32>(1.0);
 }
 
+// Material at voxel+off, with a register-resident fast path when the offset
+// stays inside the DDA's already-loaded home brick (slot_v/bp/bi are the hit
+// cell's slot voxel, brick coords and brick index the trace loop already
+// holds). A negative or out-of-brick candidate falls back to the full
+// hierarchical point query; no signed % anywhere (arithmetic >> keeps
+// negatives out of the fast path by failing the bp comparison). Shared by
+// canopy AO and the water surface neighbourhood.
+fn neighbor_material(voxel: vec3<i32>, slot_v: vec3<i32>, bp: vec3<i32>, bi: i32, off: vec3<i32>) -> u32 {
+    let s = slot_v + off;
+    let nbp = s >> vec3<u32>(2u);
+    if (nbp.x == bp.x && nbp.y == bp.y && nbp.z == bp.z) {
+        let local = s - nbp * BRICK_DIM;
+        let vi = brick_voxel_idx(local.x, local.y, local.z);
+        if (!brick_voxel_solid(bi, vi)) { return 0u; }
+        return brick_voxel_material(bi, vi);
+    }
+    return voxel_material_at(voxel + off);
+}
+
+// Occluders for canopy AO: anything solid except the invisible fringe shell
+// and ground decoration (counting those would darken faces with invisible
+// geometry - the exact bug generic cube AO has on canopies, see shade()).
+fn leaf_occluder(voxel: vec3<i32>, slot_v: vec3<i32>, bp: vec3<i32>, bi: i32, off: vec3<i32>) -> bool {
+    let m = neighbor_material(voxel, slot_v, bp, bi, off);
+    return m != 0u && !is_decoration_mat(m);
+}
+
+// Sky-weighted 6-probe occupancy AO for leaf cells, range [0.36, 1.0]:
+// cells under more canopy darken, exposed crown cells stay lit, so canopies
+// read volumetric instead of flat. Evaluated at the DDA cell containing the
+// visible point (fringe-shell hits are exposed by construction and stay
+// bright). Replaces generic cube AO for leaf materials - exactly one
+// occlusion mechanism per material class.
+fn leaf_canopy_ao(cell: vec3<i32>, slot_v: vec3<i32>, bp: vec3<i32>, bi: i32) -> f32 {
+    var occ = 0.0;
+    if (leaf_occluder(cell, slot_v, bp, bi, vec3<i32>(0, 1, 0)))  { occ += 0.28; }
+    if (leaf_occluder(cell, slot_v, bp, bi, vec3<i32>(0, 2, 0)))  { occ += 0.12; }
+    if (leaf_occluder(cell, slot_v, bp, bi, vec3<i32>(1, 0, 0)))  { occ += 0.06; }
+    if (leaf_occluder(cell, slot_v, bp, bi, vec3<i32>(-1, 0, 0))) { occ += 0.06; }
+    if (leaf_occluder(cell, slot_v, bp, bi, vec3<i32>(0, 0, 1)))  { occ += 0.06; }
+    if (leaf_occluder(cell, slot_v, bp, bi, vec3<i32>(0, 0, -1))) { occ += 0.06; }
+    return 1.0 - occ;
+}
+
 // The two big diagonal tuft quads of one leaf block (Better Leaves model:
 // 2.3 x 2.0 blocks — the pack geometry scaled up ~15% per user taste — at
 // 22.5 / -45 degrees plus the block hash 90-degree rotation, quad 1 slightly
@@ -1737,8 +1781,11 @@ fn shade(
     // sphere normal already gives rim/falloff that reads as 3D.
     // AO (12 hierarchical neighbour lookups) only near the camera — its
     // contact-shadow detail is invisible far away, so skip it past AO_DIST and
-    // for sub-voxel foliage hits.
-    let skip_ao = hit.last_axis < 0 || hit.t_hit > AO_DIST;
+    // for sub-voxel foliage hits. Leaf-block faces use leaf_canopy_ao in the
+    // tracer instead: generic cube AO counts the invisible fringe shell as
+    // solid and darkens exposed canopy faces (and would double-occlude on
+    // top of the canopy AO).
+    let skip_ao = hit.last_axis < 0 || hit.t_hit > AO_DIST || is_leaf_block_mat(hit.mat);
     var ao: f32;
     if (reuse_light) { ao = (*light).y; }
     else { ao = select(compute_ao(hit, origin, dir), 1.0, skip_ao); }
@@ -2367,7 +2414,15 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
                     // return oblique normals -> -1, as before.
                     out.last_axis = axis_from_face_normal(fh.normal);
                     out.t_hit = fh.t_hit;
-                    out.tint = fh.color_tint;
+                    var tint = fh.color_tint;
+                    // Canopy occupancy AO (primary rays only - shadow rays
+                    // must not pay for it). Tuft quads previously had ZERO
+                    // occlusion; cube faces switch from the generic cube AO,
+                    // which counted the invisible fringe shell as solid.
+                    if ((is_leaf_block_mat(m) || m == MAT_LEAF_FRINGE) && fh.t_hit < AO_DIST) {
+                        tint = tint * leaf_canopy_ao(voxel, slot_v, bp, bi);
+                    }
+                    out.tint = tint;
                     return out;
                 }
                 // cutout missed → fall through to the DDA step below.
