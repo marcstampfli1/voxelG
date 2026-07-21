@@ -51,9 +51,13 @@ Shading and effects:
   block is a cutout cube (faces sample the centre of its species' pre-rounded 32×32 tuft — oak, birch
   and spruce ported via `examples/convert_tuft.rs`, carried as ASCII art in `src/sprites.rs`) plus two
   big double-sided diagonal tuft quads (species-scaled, 22.5°/−45°, four hash-picked rotations per
-  block) that shear gently in the wind; autumn canopies add a per-voxel red-to-gold mottle, and
-  individual leaf-silhouette sprigs (lobed oak, serrated birch, pine needle whisks) stand on canopy
-  tops up close so crowns read as actual leaves, not texture. A
+  block) that shear gently in the wind; autumn canopies add a per-voxel red-to-gold mottle. Up close,
+  a volumetric leaf cloud scatters individual leaf-silhouette cards (lobed oak, serrated birch, pine
+  needle whisks) through the whole canopy shell - varied depth, size, tone and orientation with sky
+  gaps at the crown edge - so crowns read as actual leaves, not texture; beyond the cloud a horizontal
+  cap tuft keeps distant tops fluffy. Leaves also FALL: a deterministic CPU simulation detaches up to
+  256 leaves near the camera that pendulum down through their canopies, drift with the wind, rest
+  where they land and dissolve on water, drawn as depth-tested tumbling cards composited after TAA. A
   sky-weighted occupancy AO darkens canopy interiors so crowns read volumetric. Worldgen paints an
   invisible one-voxel fringe shell around every canopy whose cells render the neighbouring blocks'
   protruding tuft parts — and lay a horizontal cap tuft over canopy tops — so the bushy overhang reads

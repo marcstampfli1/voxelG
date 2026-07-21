@@ -72,12 +72,21 @@ Validation tooling added so changes are checkable without a display:
   GPU-bound; breakdown in the feat commit). *(Known scalable follow-up: a
   per-frame surface-cell corner precompute would take the probes off the
   per-ray path entirely.)*
+- **falling leaves** → deterministic CPU sim (src/leaffall.rs, SplitMix64,
+  256 cap, canopy-top spawns through the fringe cap, ground/water/TTL
+  kill) driving an instanced card pass composited AFTER the TAA
+  resolve-to-history copy (never in the feedback loop - no ghosting) and
+  manually depth-tested against a new r32float primary-hit depth export
+  (binding 19; water pixels carry the surface t). Validated by the sim
+  test suite, the red-leaf occlusion content test, the leaffall lookdev
+  still and an A/B timing gate (256 in-view leaves <= 0.05 ms at 1080p).
 - **foliage overhaul** → per-species Better Leaves tufts (birch/spruce ported by
   `examples/convert_tuft.rs`, oak self-validation 100%), autumn mottle, canopy
   occupancy AO (fixes generic cube AO counting the invisible fringe shell as
   solid; probes use the brick-local `neighbor_material` fast path), horizontal
-  cap tufts on canopy tops, per-species leaf-silhouette sprigs standing on
-  canopy tops within LEAF_SPRIG_T=40 (+1.9% foliage scenario),
+  cap tufts on distant canopy tops, a volumetric leaf cloud (six leaf-
+  silhouette cards per fringe cell within LEAF_CLOUD_T=32, tuned in the
+  isolated leaf-lab bench; ~+0.7 ms foliage scenario),
   three grass blade variants + per-clump height +
   dry straw tufts on sand/snow, five flower species with an absolute colour
   table, and a traveling gust field shared by geometric shear and shading
