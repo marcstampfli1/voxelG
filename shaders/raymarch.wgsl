@@ -949,16 +949,18 @@ fn leaf_cloud_hit(cell_min: vec3<f32>, origin: vec3<f32>, dir: vec3<f32>, t_lo: 
     let species = leaf_species_tint(mat, base_h);
     let wind = wind_offset(cell_min, base_h * 6.28, 0.15);
     var best_t: f32 = 1e30;
-    for (var k: i32 = 0; k < 6; k = k + 1) {
+    for (var k: i32 = 0; k < 8; k = k + 1) {
         // Per-leaf channels from one base hash via a golden-ratio lattice.
         let hk = fract(base_h * 71.7 + f32(k) * 0.6180339);
         let h1 = fract(hk * 13.91);
         let h2 = fract(hk * 41.23);
         let h3 = fract(hk * 97.51);
-        // Hug the inner part of the fringe cell (toward the leaf mass) so
-        // cards read as the canopy's edge, not detached floaters; vary the
-        // card size per leaf.
-        let c = cell_min + vec3<f32>(0.1) + vec3<f32>(h1, h2, h3) * 0.8 - outward * 0.28;
+        // Cluster the cards around the SHARED LEAF FACE (its centre is half
+        // a cell inward along the outward axis; for a notch's diagonal
+        // outward that point is the notch edge): scatter around it and pull
+        // slightly inward, so no card hangs laterally off the canopy corner.
+        let face_c = cell_min + vec3<f32>(0.5) - outward * 0.5;
+        let c = face_c + (vec3<f32>(h1, h2, h3) - vec3<f32>(0.5)) * 0.85 - outward * 0.10;
         let scale = 0.80 + h3 * 0.45;
         let n = normalize(outward + (vec3<f32>(h1, h2, h3) - vec3<f32>(0.5)) * 1.4);
         let denom = dot(dir, n);
