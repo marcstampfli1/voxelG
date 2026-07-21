@@ -1845,6 +1845,124 @@ mod gpu_render_tests {
         hits as f32 / n.max(1) as f32
     }
 
+    /// Isolated leaf-rendering bench: a flat grass plain with four hand-built
+    /// canopies (oak, birch, pine, autumn) at known positions, fringe shells
+    /// painted with the same sphere semantics as worldgen paint_canopy
+    /// (fringe r+1 first, leaves overwrite, trunk overwrites both). Leaf
+    /// rendering changes are tuned and judged HERE, in isolation, before the
+    /// full-world views.
+    fn build_leaf_lab_world() -> World {
+        use crate::voxel::{
+            MAT_GRASS, MAT_LEAF_FRINGE, MAT_LEAVES, MAT_LEAVES_AUTUMN, MAT_LEAVES_BIRCH,
+            MAT_LEAVES_PINE, MAT_STONE, MAT_WOOD, MAT_WOOD_BIRCH, MAT_WOOD_PINE,
+        };
+        let mut world = World::new();
+        for z in 80..136u32 {
+            for x in 88..152u32 {
+                for y in 58..62u32 {
+                    world.set_voxel(x, y, z, MAT_STONE);
+                }
+                world.set_voxel(x, 62, z, MAT_GRASS);
+            }
+        }
+        let trees: [(u32, u32, u8, u8); 4] = [
+            (100, 100, MAT_WOOD, MAT_LEAVES),
+            (112, 100, MAT_WOOD_BIRCH, MAT_LEAVES_BIRCH),
+            (124, 100, MAT_WOOD_PINE, MAT_LEAVES_PINE),
+            (136, 100, MAT_WOOD, MAT_LEAVES_AUTUMN),
+        ];
+        for (cx, cz, wood, leaf) in trees {
+            let cy = 69i32;
+            // Fringe shell r=4, then leaves r=3, then trunk - same overwrite
+            // order as worldgen's paint_canopy.
+            for (r, m) in [(4i32, MAT_LEAF_FRINGE), (3, leaf)] {
+                for dy in -r..=r {
+                    for dx in -r..=r {
+                        for dz in -r..=r {
+                            if dx * dx + dy * dy + dz * dz > r * r {
+                                continue;
+                            }
+                            world.set_voxel(
+                                (cx as i32 + dx) as u32,
+                                (cy + dy) as u32,
+                                (cz as i32 + dz) as u32,
+                                m,
+                            );
+                        }
+                    }
+                }
+            }
+            for y in 63..=69u32 {
+                world.set_voxel(cx, y, cz, wood);
+            }
+        }
+        world
+    }
+
+    fn leaf_lab_cams() -> [(&'static str, Camera); 3] {
+        // Side view: eye level, ~4.5 units from the oak crown edge, sky
+        // behind the silhouette - the discriminating view for whether
+        // individual leaves read.
+        let mut side = Camera::new();
+        side.pos = glam::Vec3::new(100.0, 69.0, 91.5);
+        side.yaw = 0.0;
+        side.pitch = 0.0;
+        let mut top = Camera::new();
+        top.pos = glam::Vec3::new(100.0, 78.5, 100.0);
+        top.yaw = 0.0;
+        top.pitch = -1.5;
+        let mut all = Camera::new();
+        all.pos = glam::Vec3::new(118.0, 70.0, 83.0);
+        all.yaw = 0.0;
+        all.pitch = -0.08;
+        [("leaf_lab_side", side), ("leaf_lab_top", top), ("leaf_lab_all", all)]
+    }
+
+    /// Individual leaves at the crown edge = high local contrast + sky gaps
+    /// INSIDE the silhouette. Prints the metrics; the discriminating
+    /// thresholds are set from measured pre/post values when the leaf cloud
+    /// lands (fail-first proof recorded there).
+    #[test]
+    fn leaf_lab_reads_individual_leaves() {
+        let world = build_leaf_lab_world();
+        let [(_, side), _, _] = leaf_lab_cams();
+        let (w, h) = (640usize, 400usize);
+        let Some(frame) = render_rgba(&world, &side, w as u32, h as u32) else {
+            eprintln!("no GPU adapter — skipping leaf lab test");
+            return;
+        };
+        // Crown-edge crop: upper-left region of the canopy against sky.
+        let (x0, y0, cw, ch) = (200usize, 90usize, 96usize, 96usize);
+        let mut lumas = Vec::with_capacity(cw * ch);
+        let mut sky = 0usize;
+        let mut green = 0usize;
+        for y in y0..y0 + ch {
+            for x in x0..x0 + cw {
+                let i = (y * w + x) * 4;
+                let (r, g, b) = (
+                    frame[i] as f32 / 255.0,
+                    frame[i + 1] as f32 / 255.0,
+                    frame[i + 2] as f32 / 255.0,
+                );
+                lumas.push((r + g + b) / 3.0);
+                if b > 0.55 && b > g + 0.05 {
+                    sky += 1;
+                }
+                if g > r && g > b {
+                    green += 1;
+                }
+            }
+        }
+        let n = lumas.len() as f32;
+        let mean = lumas.iter().sum::<f32>() / n;
+        let var = lumas.iter().map(|l| (l - mean) * (l - mean)).sum::<f32>() / n;
+        let sky_f = sky as f32 / n;
+        let green_f = green as f32 / n;
+        eprintln!("leaf lab edge crop: luma std {:.4} sky {sky_f:.3} green {green_f:.3}", var.sqrt());
+        // Sanity only until the cloud lands: the crop must contain canopy.
+        assert!(green_f > 0.15, "crown edge crop missed the canopy (green {green_f:.3})");
+    }
+
     /// Two water bodies meeting only at a diagonal corner, one level apart:
     /// the crafted scene for the connected-surface tests and lookdev. Basin
     /// A (y=64, full L8) over a sand floor; basin B (y=65) floats with open
@@ -2066,18 +2184,25 @@ mod gpu_render_tests {
         canopy_top.pitch = -1.45;
         save("canopy_top", &canopy_top);
 
-        // Crafted diagonal-terrace water scene (same builder as the
-        // connected-surface tests).
-        {
-            let (tw_world, tcam) = build_water_terrace_world();
-            if let Some(rgba) = render_rgba(&tw_world, &tcam, w, h) {
-                let path = "target/lookdev/water_terrace.png";
-                let file = std::fs::File::create(path).unwrap();
+        // Crafted scenes: diagonal-terrace water + the leaf lab (same
+        // builders as their content tests).
+        let save_world = |world: &World, name: &str, cam: &Camera| {
+            if let Some(rgba) = render_rgba(world, cam, w, h) {
+                let path = format!("target/lookdev/{name}.png");
+                let file = std::fs::File::create(&path).unwrap();
                 let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w, h);
                 enc.set_color(png::ColorType::Rgba);
                 enc.set_depth(png::BitDepth::Eight);
                 enc.write_header().unwrap().write_image_data(&rgba).unwrap();
                 eprintln!("wrote {path}");
+            }
+        };
+        {
+            let (tw_world, tcam) = build_water_terrace_world();
+            save_world(&tw_world, "water_terrace", &tcam);
+            let lab = build_leaf_lab_world();
+            for (name, cam) in leaf_lab_cams() {
+                save_world(&lab, name, &cam);
             }
         }
 
@@ -2202,6 +2327,11 @@ mod gpu_render_tests {
         // surface path (pins, mixed levels) that open sea never fires.
         let (terrace_world, terrace_cam) = build_water_terrace_world();
         time_scenarios(&device, &queue, &terrace_world, &[("terrace", terrace_cam)], w, h);
+
+        // The leaf lab close-up: worst-case per-pixel leaf-shell work.
+        let lab = build_leaf_lab_world();
+        let [(_, lab_side), _, _] = leaf_lab_cams();
+        time_scenarios(&device, &queue, &lab, &[("leaf_lab", lab_side)], w, h);
     }
 
     /// Upload one world and time cs_main + cs_transparent for each scenario
