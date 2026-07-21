@@ -74,8 +74,12 @@ Shading and effects:
 - **Volumetrics**: slab-raymarched cumulus clouds (fbm body under a low-frequency coverage mask, 3 cone
   samples toward the sun for self-shadowing, Henyey, Greenstein forward scattering) and god rays
   accumulated as jittered sun-visibility samples along the primary ray.
-- **Tri-planar procedural materials**: world-projected luminance textures, running-bond brick on stone,
-  ring and longitudinal wood grain, snow sparkle, lava cracks, continuous across voxel boundaries.
+- **Tri-planar procedural materials**: world-projected rgb-multiplier textures with a shared
+  micro-grain layer, continuous across voxel boundaries. Natural strata-and-crack stone, clumpy
+  dirt with pebbles, wind-rippled sand, drifted sparkling snow, per-species bark (coarse oak
+  ridges, birch lenticels, pine plates) with ring end-grain, streaked ice, ore veins (dark coal
+  seams, rusty iron, glinting gold, cyan diamond crystals), pulsing lava crust cracks and ribbed
+  spiny cactus.
 
 ## World, simulation, multiplayer
 

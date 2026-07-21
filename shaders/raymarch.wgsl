@@ -1473,75 +1473,101 @@ fn tex_uv(p: vec3<f32>, n: vec3<f32>) -> vec2<f32> {
     return p.xy;                                        // ±Z face
 }
 
-// Classic running-bond brick: rows offset by half a brick. Returns a
-// brightness multiplier (1.0 = brick face, 0.55 = mortar gap).
-fn brick_pattern(uv: vec2<f32>) -> f32 {
-    let bw = 1.6;   // brick width  (voxels)
-    let bh = 0.8;   // brick height (voxels)
-    let mw = 0.10;  // mortar thickness
-    let row = floor(uv.y / bh);
-    var offset_row: f32 = 0.0;
-    if ((i32(row) & 1) == 1) { offset_row = bw * 0.5; }
-    let lx = fract((uv.x + offset_row) / bw) * bw;
-    let ly = fract(uv.y / bh) * bh;
-    let in_v = (lx < mw) || (lx > bw - mw);
-    let in_h = (ly < mw) || (ly > bh - mw);
-    if (in_v || in_h) { return 0.55; }
-    return 1.0;
+// 2-3 octave fbm over the value noise - the workhorse for natural mottling.
+fn fbm3(p: vec3<f32>) -> f32 {
+    return vnoise3(p) * 0.55 + vnoise3(p * 2.7) * 0.30 + vnoise3(p * 6.1) * 0.15;
 }
 
-// Wood grain — rings concentric around the trunk's vertical axis (Y) on
-// horizontal faces, longitudinal stripes on side faces.
-fn wood_pattern(p: vec3<f32>, n: vec3<f32>) -> f32 {
+// Thin bright line where a noise field crosses its midpoint - crack/vein
+// networks for stone, ice and lava.
+fn ridge_line(v: f32, w: f32) -> f32 {
+    return 1.0 - smoothstep(0.0, w, abs(v - 0.5));
+}
+
+// Bark per species - side faces get vertical ridge relief; birch gets its
+// signature dark horizontal lenticel scars on a pale smooth bark; pine gets
+// plated scales. End grain (top/bottom) keeps growth rings.
+fn bark_pattern(p: vec3<f32>, n: vec3<f32>, mat: u32) -> vec3<f32> {
     let an = abs(n);
     if (an.y > 0.5) {
-        // End-grain: rings.
+        // End-grain rings, slightly irregular.
         let r = sqrt(p.x * p.x + p.z * p.z);
         let rings = 0.5 + 0.5 * sin(r * 4.5 + vnoise3(vec3<f32>(p.x * 0.4, 0.0, p.z * 0.4)) * 2.0);
-        return 0.75 + rings * 0.25;
+        return vec3<f32>(0.72 + rings * 0.28);
     }
-    // Side: longitudinal grain.
-    let grain = 0.5 + 0.5 * sin(p.y * 6.0 + vnoise3(p * 0.3) * 3.0);
-    let fine = vnoise3(vec3<f32>(p.x * 8.0, p.y * 1.2, p.z * 8.0));
-    return 0.78 + grain * 0.18 + fine * 0.08;
+    let uv = tex_uv(p, n);
+    if (mat == 23u) {
+        // Birch: pale, smooth, with dark lenticel bands stretched wide and
+        // thin (fast noise along y, slow along the face).
+        let lent = smoothstep(0.72, 0.80, vnoise3(vec3<f32>(uv.x * 0.9, p.y * 5.5, 61.0)));
+        let base = 1.04 + vnoise3(vec3<f32>(uv * 3.0, 62.0)) * 0.08;
+        return vec3<f32>(mix(base, 0.38, lent));
+    }
+    if (mat == 24u) {
+        // Pine: scaly plates - dark borders where two stretched noise fields
+        // cross their midlines.
+        let pa = ridge_line(vnoise3(vec3<f32>(uv.x * 2.4, p.y * 1.1, 67.0)), 0.06);
+        let pb = ridge_line(vnoise3(vec3<f32>(uv.x * 1.2, p.y * 2.9, 68.0)), 0.06);
+        let plate = fbm3(vec3<f32>(uv * 2.0, 69.0)) * 0.20 + 0.88;
+        return vec3<f32>(plate * (1.0 - max(pa, pb) * 0.38));
+    }
+    // Oak: deep coarse vertical ridges + fine fibre noise.
+    let ridges = pow(0.5 + 0.5 * sin(uv.x * 9.0 + vnoise3(p * 0.8) * 4.0), 1.4);
+    let fibre = vnoise3(vec3<f32>(p.x * 8.0, p.y * 1.2, p.z * 8.0)) * 0.10;
+    return vec3<f32>(0.66 + ridges * 0.34 + fibre);
 }
 
-// All material textures return a *luminance multiplier* (~0.7–1.2 range)
-// applied to the material's base palette colour. That way each material
-// keeps its identifying colour but gains world-projected detail — voxels of
-// the same material show continuous texture across faces, single voxels
-// removed just gap a slice of the pattern. We deliberately avoid recolouring
-// (e.g. the previous brick pattern turned stone terra-cotta — that was a
-// surprise; user wanted "texture", not a colour swap).
+// All material textures return an rgb multiplier (~0.5-1.4 per channel)
+// applied to the material's base palette colour: identity colours come from
+// the palette, world-projected detail and SUBTLE hue variation come from
+// here. Textures are continuous across faces (world-projected), and hue
+// shifts stay gentle - recolouring a whole material reads as a palette
+// swap, which is not the job of this function.
+// High-frequency micro-grain shared by every textured material: without it
+// the smooth value noise reads as soft low-res blobs.
+fn micro_grain(uv: vec2<f32>) -> f32 {
+    return 0.93 + vnoise3(vec3<f32>(uv * 13.0, 91.0)) * 0.10
+         + vnoise3(vec3<f32>(uv * 27.0, 92.0)) * 0.05;
+}
+
 fn material_texture(p: vec3<f32>, n: vec3<f32>, mat: u32) -> vec3<f32> {
+    let base = material_texture_base(p, n, mat);
+    // Glass and untextured materials skip the grain (identity base).
+    if (mat == 18u || (base.x == 1.0 && base.y == 1.0 && base.z == 1.0)) {
+        return base;
+    }
+    return base * micro_grain(tex_uv(p, n));
+}
+
+fn material_texture_base(p: vec3<f32>, n: vec3<f32>, mat: u32) -> vec3<f32> {
     let uv = tex_uv(p, n);
-    // Stone — cracked mortar look, but the gray base colour is preserved.
+    // Stone - natural rock: strata banding, fbm mottling, thin crack veins.
     if (mat == 4u) {
-        let cracks = brick_pattern(uv);          // 0.55 in mortar, 1.0 in face
-        let grain = vnoise3(vec3<f32>(uv * 2.0, 0.0)) * 0.20 + 0.90;
-        return vec3<f32>(grain * mix(0.7, 1.0, cracks));
+        let strata = 0.92 + 0.10 * sin(p.y * 1.7 + vnoise3(p * 0.35) * 3.0);
+        let mottle = fbm3(vec3<f32>(uv * 2.7, p.y * 0.8)) * 0.26 + 0.84;
+        let crack = ridge_line(vnoise3(vec3<f32>(uv * 1.1, 7.7)), 0.035);
+        return vec3<f32>(strata * mottle * (1.0 - crack * 0.35));
     }
-    // Wood variants — directional grain.
+    // Bark - per species.
     if (mat == 13u || mat == 23u || mat == 24u) {
-        return vec3<f32>(wood_pattern(p, n));
+        return bark_pattern(p, n, mat);
     }
-    // Grass block — the Minecraft/Allumeria treatment: green top, dirt sides
-    // with a ragged green fringe hanging over the top edge, dirt bottom.
-    // Side/bottom colours are expressed as (dirt palette / grass palette)
-    // channel ratios so the multiplier recolours green -> dirt.
+    // Grass block - green top with clump/blade detail and dry patches, dirt
+    // sides with a ragged green fringe, dirt bottom.
     if (mat == 2u) {
         if (n.y > 0.5) {
-            // Top face: small clumpy variation (unchanged).
-            let nn = vnoise3(vec3<f32>(uv * 2.2, 0.0));
-            return vec3<f32>(0.85 + nn * 0.30);
+            let clump = vnoise3(vec3<f32>(uv * 2.1, 11.0));
+            let blades = vnoise3(vec3<f32>(uv * 14.0, 5.0));
+            let lum = 0.78 + clump * 0.26 + blades * 0.12;
+            // Dry patches: warm the reds slightly, never a full recolour.
+            let dry = smoothstep(0.62, 0.80, vnoise3(vec3<f32>(uv * 0.5, 23.0)));
+            return vec3<f32>(lum * (1.0 + dry * 0.20), lum, lum * (1.0 - dry * 0.10));
         }
         let dirt = vec3<f32>(1.3333, 0.4154, 0.75); // (0.40,0.27,0.15)/(0.30,0.65,0.20)
         let nn = vnoise3(vec3<f32>(uv * 1.6, 0.0));
         if (n.y < -0.5) {
             return dirt * (0.78 + nn * 0.30);
         }
-        // Side face: uv = (world horizontal, world y). Fringe depth varies
-        // per 1/16-texel column so the edge looks torn, not ruler-straight.
         let hcol = hash3f(vec3<f32>(floor(uv.x * 16.0) * 0.37, floor(uv.y) * 0.11, 3.7));
         let fringe_depth = (2.0 + hcol * 4.0) / 16.0;
         if (fract(uv.y) > 1.0 - fringe_depth) {
@@ -1549,39 +1575,75 @@ fn material_texture(p: vec3<f32>, n: vec3<f32>, mat: u32) -> vec3<f32> {
         }
         return dirt * (0.78 + nn * 0.30);
     }
-    // Dirt.
+    // Dirt - clumpy soil with lighter pebbles and dark pores.
     if (mat == 3u) {
-        let nn = vnoise3(vec3<f32>(uv * 1.6, 0.0));
-        return vec3<f32>(0.78 + nn * 0.30);
+        let clump = fbm3(vec3<f32>(uv * 3.2, 3.0)) * 0.30 + 0.74;
+        let pebble = smoothstep(0.72, 0.80, vnoise3(vec3<f32>(uv * 6.5, 9.5))) * 0.35;
+        let pore = smoothstep(0.72, 0.80, vnoise3(vec3<f32>(uv * 5.1, 17.0))) * 0.25;
+        return vec3<f32>(clump + pebble - pore);
     }
-    // Sand — fine granular.
+    // Sand - wind ripples over fine grain, sparse glints.
     if (mat == 1u) {
-        let nn = vnoise3(vec3<f32>(uv * 7.0, 0.0));
-        return vec3<f32>(0.92 + nn * 0.16);
+        let ripple = 0.94 + 0.08 * sin(uv.x * 2.1 + vnoise3(vec3<f32>(uv * 0.4, 31.0)) * 4.0);
+        let grain = vnoise3(vec3<f32>(uv * 15.0, 41.0)) * 0.12 + 0.90;
+        let glint = max(0.0, (vnoise3(vec3<f32>(uv * 17.0, 43.0)) - 0.88) * 4.0);
+        return vec3<f32>(ripple * grain + glint);
     }
-    // Snow — sparkles.
+    // Snow - soft drifts, cool shadowed dips, hard sparkles.
     if (mat == 15u) {
-        let nn = vnoise3(vec3<f32>(uv * 16.0, 0.0));
-        let sparkle = max(0.0, (nn - 0.85) * 6.0);
-        return vec3<f32>(0.97 + sparkle);
+        let drift = 0.92 + 0.10 * vnoise3(vec3<f32>(uv * 0.8, 51.0));
+        let dip = smoothstep(0.30, 0.0, vnoise3(vec3<f32>(uv * 2.3, 53.0))) * 0.10;
+        let sparkle = max(0.0, (vnoise3(vec3<f32>(uv * 16.0, 0.0)) - 0.85) * 6.0);
+        return vec3<f32>(drift - dip * 1.3 + sparkle, drift - dip * 0.9 + sparkle, drift + sparkle);
     }
-    // Leaves carry their own mosaic detail in leaf_blob_hit — adding noise
-    // here on top just muddied the colour.
-    // Ice.
+    // Leaves carry their own art; no extra noise here.
+    // Ice - clarity gradient with bright blue-white internal crack streaks.
     if (mat == 17u) {
-        let nn = vnoise3(vec3<f32>(uv * 1.2, 0.0));
-        return vec3<f32>(0.88 + nn * 0.20);
+        let base = 0.88 + vnoise3(vec3<f32>(uv * 1.2, 0.0)) * 0.14;
+        let crackn = vnoise3(vec3<f32>(uv.x * 2.6 + uv.y * 0.4, uv.y * 2.6, 71.0));
+        let streak = ridge_line(crackn, 0.05);
+        return vec3<f32>(base + streak * 0.24, base + streak * 0.30, base + streak * 0.42);
     }
-    // Coal.
+    // Coal - dark lumpy seams in the rock with glossy specks.
     if (mat == 19u) {
-        let nn = vnoise3(vec3<f32>(uv * 3.5, 0.0));
-        return vec3<f32>(0.70 + nn * 0.50);
+        let base = fbm3(vec3<f32>(uv * 2.0, 73.0)) * 0.22 + 0.86;
+        let seam = smoothstep(0.52, 0.62, fbm3(vec3<f32>(uv * 2.6, 74.0)));
+        let gloss = max(0.0, (vnoise3(vec3<f32>(uv * 13.0, 75.0)) - 0.88) * 5.0) * seam;
+        return vec3<f32>(mix(base, 0.34, seam) + gloss);
     }
-    // Lava — keep the warm palette colour; modulate luminance with crack noise.
+    // Iron - rusty warm veins through grey rock.
+    if (mat == 20u) {
+        let base = fbm3(vec3<f32>(uv * 2.0, 77.0)) * 0.22 + 0.86;
+        let vein = smoothstep(0.55, 0.63, fbm3(vec3<f32>(uv * 2.9, 78.0)));
+        return mix(vec3<f32>(base), vec3<f32>(1.30, 0.78, 0.52) * (base * 0.9 + 0.2), vein);
+    }
+    // Gold - bright glinting veins.
+    if (mat == 21u) {
+        let base = fbm3(vec3<f32>(uv * 2.0, 79.0)) * 0.22 + 0.86;
+        let vein = smoothstep(0.56, 0.63, fbm3(vec3<f32>(uv * 3.1, 80.0)));
+        let glint = max(0.0, (vnoise3(vec3<f32>(uv * 15.0, 81.0)) - 0.86) * 6.0) * vein;
+        return mix(vec3<f32>(base), vec3<f32>(1.55, 1.22, 0.45), vein) + vec3<f32>(glint);
+    }
+    // Diamond - sparse cyan crystals with hard sparkle.
+    if (mat == 22u) {
+        let base = fbm3(vec3<f32>(uv * 2.0, 83.0)) * 0.22 + 0.86;
+        let crystal = smoothstep(0.74, 0.80, vnoise3(vec3<f32>(uv * 4.2, 84.0)));
+        let sparkle = max(0.0, (vnoise3(vec3<f32>(uv * 18.0, 85.0)) - 0.84) * 7.0) * crystal;
+        return mix(vec3<f32>(base), vec3<f32>(0.85, 1.45, 1.55), crystal) + vec3<f32>(sparkle);
+    }
+    // Lava - dark cooling crust plates over slowly pulsing glow cracks.
     if (mat == 16u) {
-        let nn = vnoise3(vec3<f32>(uv * 1.4, p.y * 0.05));
-        let crack = smoothstep(0.45, 0.55, nn);
-        return vec3<f32>(mix(1.15, 0.55, crack));
+        let flow = vnoise3(vec3<f32>(uv * 1.1, camera.time * 0.06));
+        let crack = ridge_line(flow, 0.09);
+        let crust = fbm3(vec3<f32>(uv * 2.3, 5.0)) * 0.25 + 0.45;
+        let pulse = 0.85 + 0.15 * sin(camera.time * 0.8 + flow * 6.0);
+        return mix(vec3<f32>(crust * 0.55), vec3<f32>(2.2, 1.35, 0.60) * pulse, crack);
+    }
+    // Cactus - vertical ribs with pale spine dots on the crests.
+    if (mat == 32u) {
+        let ribs = 0.76 + 0.24 * pow(0.5 + 0.5 * cos(uv.x * 12.6), 0.8);
+        let spine = max(0.0, (vnoise3(vec3<f32>(uv.x * 6.3, uv.y * 3.2, 83.0)) - 0.86) * 6.0);
+        return vec3<f32>(ribs + spine * 1.2, ribs + spine * 1.4, ribs * 0.95 + spine);
     }
     return vec3<f32>(1.0);
 }
