@@ -1549,35 +1549,38 @@ fn ridge_line(v: f32, w: f32) -> f32 {
     return 1.0 - smoothstep(0.0, w, abs(v - 0.5));
 }
 
-// 2D cellular (Worley) noise: distance to the nearest and second-nearest
-// feature point plus the nearest cell's hash. f2 - f1 is ~0 exactly on the
-// border between two cells, giving ANGULAR plate borders - fractured rock
-// facets and ice panes, where smooth ridge lines read as water waves.
+// 3D cellular (Worley) noise over WORLD position: f2 - f1 is ~0 on the
+// border between two cells, giving angular plate borders. 3D (not a 2D
+// slice per face projection) so the fracture network is one world-space
+// structure - crack lines continue seamlessly across face orientations
+// and block boundaries, which per-face 2D cells cannot do.
 struct CellNoise {
     f1: f32,
     f2: f32,
     id: f32,
 }
 
-fn worley2(p: vec2<f32>) -> CellNoise {
+fn worley3(p: vec3<f32>) -> CellNoise {
     let ip = floor(p);
     let fp = fract(p);
     var out: CellNoise;
     out.f1 = 8.0;
     out.f2 = 8.0;
     out.id = 0.0;
-    for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
-        for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
-            let g = vec2<f32>(f32(dx), f32(dy));
-            let h = hash3f(vec3<f32>(ip + g, 17.0));
-            let o = vec2<f32>(fract(h * 7.13), fract(h * 13.71));
-            let d = length(g + o - fp);
-            if (d < out.f1) {
-                out.f2 = out.f1;
-                out.f1 = d;
-                out.id = h;
-            } else if (d < out.f2) {
-                out.f2 = d;
+    for (var dz: i32 = -1; dz <= 1; dz = dz + 1) {
+        for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
+            for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
+                let g = vec3<f32>(f32(dx), f32(dy), f32(dz));
+                let h = hash3f(ip + g);
+                let o = vec3<f32>(fract(h * 7.13), fract(h * 13.71), fract(h * 5.39));
+                let d = length(g + o - fp);
+                if (d < out.f1) {
+                    out.f2 = out.f1;
+                    out.f1 = d;
+                    out.id = h;
+                } else if (d < out.f2) {
+                    out.f2 = d;
+                }
             }
         }
     }
@@ -1645,8 +1648,8 @@ fn material_texture_base(p: vec3<f32>, n: vec3<f32>, mat: u32) -> vec3<f32> {
     // (flat-ish grey per plate, thin dark borders as cracks), a hint of
     // strata. Smooth ridge/wave lines are exactly what stone must NOT be.
     if (mat == 4u) {
-        let jig = fbm3g(vec3<f32>(uv * 0.5, 3.0)) * 0.8;
-        let w = worley2(uv * 1.6 + vec2<f32>(jig));
+        let jig = fbm3g(p * 0.4) * 0.7;
+        let w = worley3(p * 1.5 + vec3<f32>(jig));
         let facet = 0.82 + fract(w.id * 9.7) * 0.24;
         let border = smoothstep(0.10, 0.02, w.f2 - w.f1);
         let strata = 0.95 + 0.05 * sin(p.y * 1.9 + w.id * 2.0);
@@ -1704,7 +1707,7 @@ fn material_texture_base(p: vec3<f32>, n: vec3<f32>, mat: u32) -> vec3<f32> {
     // Ice - large clear panes with sparse bright fracture borders and a
     // subtle per-pane clarity difference.
     if (mat == 17u) {
-        let w = worley2(uv * 0.85);
+        let w = worley3(p * 0.8);
         let body = 0.90 + fract(w.id * 7.3) * 0.10;
         let border = smoothstep(0.14, 0.03, w.f2 - w.f1);
         return vec3<f32>(body + border * 0.28, body + border * 0.32, body + border * 0.42);
@@ -2446,16 +2449,19 @@ fn shade(
     // so they look animated even though the underlying voxel is rigid.
     var n = hit.normal;
     if (is_foliage_mat(hit.mat)) {
+        // Wind shimmer via wind-advected gradient noise. NEVER a separable
+        // sin(x)*cos(z) product here: that IS a checkerboard lattice in
+        // brightness, and traveling with time it reads as a diffused
+        // checkerboard shadow drifting across every field and canopy - the
+        // artifact repeatedly blamed on cloud shadows.
         let t = camera.time;
-        let sway = sin(p_hit.x * 0.40 + t * 1.8) * cos(p_hit.z * 0.40 + t * 1.2)
-                 + 0.4 * sin((p_hit.x + p_hit.z) * 0.25 + t * 2.4);
-        // Flowers + tall grass sway harder (thin & light) than tree leaves.
-        // Leaf amplitude raised 0.30 -> 0.45 (and brightness ripple 0.12 ->
-        // 0.16) so canopies visibly move even past the leaf-card radius.
-        // Amplitude rides the SAME traveling gust field as the geometric
-        // shear (one source of truth), so brightness ripples move with the
-        // front instead of pulsing in place.
-        let gust = 0.5 + 0.5 * wind_gust(p_hit.xz, wind_dir_now());
+        let wd = wind_dir_now();
+        let sway = (gnoise3(vec3<f32>(
+            (p_hit.x - wd.x * t * 2.2) * 0.09,
+            (p_hit.z - wd.y * t * 2.2) * 0.09,
+            t * 0.30,
+        )) * 2.0 - 1.0) * 1.4;
+        let gust = 0.5 + 0.5 * wind_gust(p_hit.xz, wd);
         let amp = select(0.60, 0.75, hit.mat == MAT_FLOWER || hit.mat == MAT_TALL_GRASS
                                    || hit.mat == MAT_TALL_GRASS_DRY) * gust;
         n.x += sway * amp;
@@ -2464,8 +2470,14 @@ fn shade(
         base *= 1.0 + sway * 0.20 * gust;
     } else if (hit.mat == MAT_GRASS && hit.normal.y > 0.5) {
         let t = camera.time;
-        let gust = 0.5 + 0.5 * wind_gust(p_hit.xz, wind_dir_now());
-        let sway = sin(p_hit.x * 0.55 + t * 2.1) * cos(p_hit.z * 0.55 + t * 1.7);
+        let wd = wind_dir_now();
+        let gust = 0.5 + 0.5 * wind_gust(p_hit.xz, wd);
+        // Same rule: organic advected noise, not a sin*cos lattice.
+        let sway = gnoise3(vec3<f32>(
+            (p_hit.x - wd.x * t * 2.2) * 0.12,
+            (p_hit.z - wd.y * t * 2.2) * 0.12,
+            t * 0.35,
+        )) * 2.0 - 1.0;
         n.x += sway * 0.26 * gust;
         n.z += sway * 0.24 * gust;
         n = normalize(n);
@@ -2626,11 +2638,19 @@ fn render_clouds(origin: vec3<f32>, dir: vec3<f32>, t_terrain: f32, pix: vec2<f3
     // (checklist: clouds at reduced res + temporal upsample).
     let N: i32 = 6;
     let step_t = (t_far_clamp - t_start) / f32(N);
-    // Spatial-only jitter (no time) — time-varying jitter combined with the
-    // temporal-differential pass that re-renders only some tiles per frame
-    // creates a stable-but-time-correlated mismatch between adjacent
-    // pixels, which reads as a checkerboard pattern over time.
-    let h = ign(pix.x, pix.y, 0.0);
+    // Per-frame time-varying jitter, averaged by TAA into a smooth march.
+    // History: this was once time-varying, then made spatial-only because
+    // the composite lived in the TILE-GATED main pass (stale tiles froze
+    // the jitter at mismatched phases = checkerboard #1). But the static
+    // dither is its own artifact: every half-res pixel marches at a
+    // permanently different phase, printing a fixed dither lattice into
+    // the cloud alpha - the diffused checkerboard that travels with cloud
+    // shade over terrain (checkerboard #2). With the composite now in the
+    // full-screen per-frame cs_compose, time-varying jitter is finally
+    // CORRECT: every pixel re-marches every frame and TAA averages the
+    // phases. Do not de-time this again - move work out of tile-gated
+    // passes instead.
+    let h = ign(pix.x, pix.y, camera.time * 60.0);
 
     // Henyey-Greenstein forward-scatter — gives the "silver lining" effect
     // when looking toward the sun through cloud edges.
@@ -2776,9 +2796,18 @@ fn trace_any(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> bool {
             let m = brick_voxel_material(bi, vi);
             if (m == MAT_LEAF_FRINGE) {
                 // Invisible canopy fringe never occludes shadow rays.
+            } else if (is_decoration_mat(m)) {
+                // Ground decoration (grass tufts, flowers, straw): the near
+                // cutout gives dappled micro-shadow; far away a tuft is 90%
+                // air, and blocking as a solid cube stamped a square shadow
+                // per tuft across every meadow. Far decorations don't block.
+                if (t_cur <= FOLIAGE_NEAR_T) {
+                    let fh = foliage_subvoxel(voxel, origin, dir, m);
+                    if (fh.hit) { return true; }
+                }
             } else if (is_foliage_mat(m)) {
-                // Far foliage blocks as a solid cube (cheap); only near foliage
-                // pays for the dappled-shadow cutout test.
+                // Leaves: far canopies block as solid cubes (they really are
+                // dense); near ones pay the cutout test.
                 if (t_cur > FOLIAGE_NEAR_T) { return true; }
                 let fh = foliage_subvoxel(voxel, origin, dir, m);
                 if (fh.hit) { return true; }
@@ -2840,10 +2869,21 @@ fn compute_ao(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> f32 {
     return mix(ao_x0, ao_x1, fb_c);
 }
 
+// A cell occludes ambient light only if it holds an actually-solid block:
+// grass tufts, flowers, dry straw and the invisible canopy fringe occupy
+// their cells (the DDA must find them) but must NOT stamp AO squares onto
+// the ground - thousands of hash-scattered tufts otherwise read as a
+// diffused checkerboard-pattern shadow carpet. The material fetch is
+// gated on the occupancy bit, so probes over open ground stay one load.
+fn ao_occluder(c: vec3<i32>) -> bool {
+    if (!is_voxel_solid(c)) { return false; }
+    return !is_decoration_mat(voxel_material_at(c));
+}
+
 fn ao_corner(face_base: vec3<i32>, da: vec3<i32>, db: vec3<i32>) -> f32 {
-    let s1 = is_voxel_solid(face_base + da);
-    let s2 = is_voxel_solid(face_base + db);
-    let cd = is_voxel_solid(face_base + da + db);
+    let s1 = ao_occluder(face_base + da);
+    let s2 = ao_occluder(face_base + db);
+    let cd = ao_occluder(face_base + da + db);
     // Full occlusion if both side voxels are solid (corner case).
     if (s1 && s2) { return 0.35; }
     let cnt = i32(s1) + i32(s2) + i32(cd);

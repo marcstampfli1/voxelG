@@ -1861,15 +1861,26 @@ mod gpu_render_tests {
         render_rgba_ext(world, cam, w, h, &[])
     }
 
+    fn render_rgba_at_time(world: &World, cam: &Camera, w: u32, h: u32, t: f32) -> Option<Vec<u8>> {
+        render_rgba_full(world, cam, w, h, &[], t)
+    }
+
     /// render_rgba plus injected falling-leaf instances, drawn by the real
     /// leaf pipeline after cs_transparent. An empty slice skips the pass, so
     /// the plain render_rgba path is byte-for-byte what it always was.
     fn render_rgba_ext(
         world: &World, cam: &Camera, w: u32, h: u32, leaves: &[crate::leaffall::LeafInstance],
     ) -> Option<Vec<u8>> {
+        render_rgba_full(world, cam, w, h, leaves, 0.0)
+    }
+
+    fn render_rgba_full(
+        world: &World, cam: &Camera, w: u32, h: u32, leaves: &[crate::leaffall::LeafInstance],
+        t: f32,
+    ) -> Option<Vec<u8>> {
         let (device, queue) = headless_device()?;
         let wo = world.world_origin_voxel();
-        let cu = CameraUniform::from_camera(cam, w, h, 0.0, 0.0, wo, [0.0, 0.0], 0.0);
+        let cu = CameraUniform::from_camera(cam, w, h, t, t, wo, [0.0, 0.0], 0.0);
 
         let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("camera"),
@@ -2489,6 +2500,34 @@ mod gpu_render_tests {
         );
     }
 
+    /// The user's cloud-shade artifact view: high above the cloud slab,
+    /// looking straight down - ground seen through/around clouds, cloud
+    /// shade as semi-transparent darkening. Rendered at two times to study
+    /// the moving pattern.
+    #[test]
+    #[ignore]
+    fn dump_cloud_shade_views() {
+        let mut world = World::new();
+        world.fill_demo_terrain();
+        let mut cam = Camera::new();
+        cam.pos = glam::Vec3::new(256.0, 120.0, 256.0);
+        cam.yaw = 0.0;
+        cam.pitch = -1.55;
+        for (name, t) in [("cloudshade_t0", 30.0f32), ("cloudshade_t1", 34.0f32)] {
+            let Some(rgba) = render_rgba_at_time(&world, &cam, 960, 540, t) else {
+                eprintln!("no GPU — skipping");
+                return;
+            };
+            let path = format!("target/lookdev/{name}.png");
+            let file = std::fs::File::create(&path).unwrap();
+            let mut enc = png::Encoder::new(std::io::BufWriter::new(file), 960, 540);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            enc.write_header().unwrap().write_image_data(&rgba).unwrap();
+            eprintln!("wrote {path}");
+        }
+    }
+
     /// Isolated material bench: a stone plain with a 4x4x4 cube of every
     /// textured material in two sunlit rows, for tuning the procedural
     /// block textures against one view.
@@ -2942,6 +2981,9 @@ mod gpu_render_tests {
             ("birch_close", crate::voxel::MAT_LEAVES_BIRCH, 14.0, -26.0, -0.18),
             ("pine_close", crate::voxel::MAT_LEAVES_PINE, 14.0, -26.0, -0.18),
             ("meadow", MAT_TALL_GRASS, 3.0, -9.0, -0.14),
+            // Top-down over the meadow: the view class where decoration-AO
+            // halos read as a diffused checkerboard shadow carpet.
+            ("meadow_top", MAT_TALL_GRASS, 42.0, 0.0, -1.5),
         ] {
             if let Some((c, ground)) = find_species_anchor(&world, mat) {
                 let mut cam = Camera::new();
