@@ -911,6 +911,79 @@ fn leaf_cap_hit(nb_min: vec3<f32>, origin: vec3<f32>, dir: vec3<f32>, cap_y: f32
     return out;
 }
 
+// How near individual canopy-sprig leaves render: they are ~0.7-block
+// features, sub-pixel past this, and skipping the whole call is the point
+// of the gate (unlike the cap, the sprig test is real per-cell work).
+const LEAF_SPRIG_T: f32 = 40.0;
+
+// Which leaf silhouette a species' sprigs carry.
+fn leaf_sprig_sprite(mat: u32) -> u32 {
+    if (mat == MAT_LEAVES_BIRCH) { return SPR_LEAF_BIRCH; }
+    if (mat == MAT_LEAVES_PINE)  { return SPR_LEAF_NEEDLE; }
+    return SPR_LEAF_OAK;
+}
+
+// Individual leaf-silhouette sprigs on a canopy top: two hash-placed leaf
+// quads (0.6 x 0.84 blocks) standing on the shared face, leaning outward
+// ~33 degrees from vertical so they read from above AND from the side,
+// shearing sideways in the wind. This is what puts leaves SHAPED like
+// leaves on top of the Better Leaves tufts.
+fn leaf_sprig_hit(nb_min: vec3<f32>, origin: vec3<f32>, dir: vec3<f32>, t_lo: f32, t_hi: f32, mat: u32) -> SubHit {
+    var out: SubHit;
+    out.hit = false;
+    out.color_tint = vec3<f32>(1.0);
+    // Decorrelated from the tuft hash so sprig placement does not follow
+    // the tuft rotation variant.
+    let vh = hash3f(nb_min + vec3<f32>(0.0, 0.37, 0.0));
+    let vox_shade = 0.90 + fract(vh * 32.0) * 0.20;
+    let species = leaf_species_tint(mat, vh);
+    let sprite = leaf_sprig_sprite(mat);
+    let ang = vh * 6.2831853;
+    let ca = cos(ang);
+    let sa = sin(ang);
+    let wind = wind_offset(nb_min, vh * 6.28, 0.10);
+    var best_t: f32 = 1e30;
+    for (var q: i32 = 0; q < 2; q = q + 1) {
+        // Second leaf: rotated 90 degrees (free component swap), placed by
+        // an independent hash channel.
+        var qa = ca;
+        var qb = sa;
+        if (q == 1) { qa = -sa; qb = ca; }
+        let bx = 0.15 + 0.70 * fract(vh * select(16.0, 64.0, q == 1));
+        let bz = 0.15 + 0.70 * fract(vh * select(23.0, 87.0, q == 1));
+        let base = nb_min + vec3<f32>(bx, 1.0, bz);
+        // Leaf plane basis: u horizontal, v up-and-outward.
+        let u_ax = vec3<f32>(qa, 0.0, -qb);
+        let v_ax = normalize(vec3<f32>(qb * 0.84, 0.55, qa * 0.84));
+        let n = cross(u_ax, v_ax);
+        let denom = dot(dir, n);
+        if (abs(denom) < 1e-4) { continue; }
+        let c = base + v_ax * 0.42;
+        let t = dot(c - origin, n) / denom;
+        if (t <= t_lo || t >= min(t_hi, best_t)) { continue; }
+        let lp = origin + dir * t - c;
+        var lu = dot(lp, u_ax);
+        let lv = dot(lp, v_ax);
+        if (abs(lv) > 0.42) { continue; }
+        // Wind shear, stronger toward the leaf tip.
+        lu = lu - (wind.x * qa - wind.y * qb) * (lv / 0.84 + 0.5);
+        if (abs(lu) > 0.30) { continue; }
+        let tx = u32(clamp((lu / 0.30 * 0.5 + 0.5) * 16.0, 0.0, 15.0));
+        let ty = u32(clamp((lv / 0.42 * 0.5 + 0.5) * 16.0, 0.0, 15.0));
+        let val = sprite_texel(sprite, tx, ty);
+        if (val == 0u) { continue; }
+        var tone = 0.95;
+        if (val == 2u) { tone = 0.62; }
+        if (val == 3u) { tone = 1.30; }
+        best_t = t;
+        out.hit = true;
+        out.t_hit = t;
+        out.normal = select(n, -n, denom > 0.0);
+        out.color_tint = vec3<f32>(tone * vox_shade) * species;
+    }
+    return out;
+}
+
 // A fringe cell renders the parts of its neighbouring leaf blocks tuft
 // quads that protrude into it — this is what makes tufts visible from the
 // SIDE (rays grazing past a canopy never enter the leaf cells themselves,
@@ -961,6 +1034,17 @@ fn leaf_fringe_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>) -> SubHi
                 ch.color_tint = ch.color_tint * palette[nb_mat].rgb
                     / max(palette[MAT_LEAF_FRINGE].rgb, vec3<f32>(1e-3));
                 out = ch;
+            }
+            if (t_enter < LEAF_SPRIG_T) {
+                // Individual leaf silhouettes standing on the canopy top.
+                var sh = leaf_sprig_hit(nb_min, origin, dir,
+                                        max(t_enter - 0.05, 0.0), min(t_exit + 0.05, best_t), nb_mat);
+                if (sh.hit) {
+                    best_t = sh.t_hit;
+                    sh.color_tint = sh.color_tint * palette[nb_mat].rgb
+                        / max(palette[MAT_LEAF_FRINGE].rgb, vec3<f32>(1e-3));
+                    out = sh;
+                }
             }
         }
     }

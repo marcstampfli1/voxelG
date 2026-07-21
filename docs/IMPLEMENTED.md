@@ -76,7 +76,9 @@ Validation tooling added so changes are checkable without a display:
   `examples/convert_tuft.rs`, oak self-validation 100%), autumn mottle, canopy
   occupancy AO (fixes generic cube AO counting the invisible fringe shell as
   solid; probes use the brick-local `neighbor_material` fast path), horizontal
-  cap tufts on canopy tops, three grass blade variants + per-clump height +
+  cap tufts on canopy tops, per-species leaf-silhouette sprigs standing on
+  canopy tops within LEAF_SPRIG_T=40 (+1.9% foliage scenario),
+  three grass blade variants + per-clump height +
   dry straw tufts on sand/snow, five flower species with an absolute colour
   table, and a traveling gust field shared by geometric shear and shading
   sway (wind direction lifted into the camera uniform). Validated by the

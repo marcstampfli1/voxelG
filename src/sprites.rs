@@ -57,8 +57,14 @@ atlas_consts! {
     SPR_CORNFLOWER = 7;
     /// Round fluffy puff head.
     SPR_DANDELION = 8;
+    /// Individual leaf silhouettes for canopy-top sprigs: lobed oak leaf.
+    SPR_LEAF_OAK = 9;
+    /// Serrated birch teardrop leaf.
+    SPR_LEAF_BIRCH = 10;
+    /// Pine needle whisk.
+    SPR_LEAF_NEEDLE = 11;
     /// Number of 16x16 sprites in the atlas.
-    N_SPRITES = 9;
+    N_SPRITES = 12;
     /// Word offset of the first 32x32 tuft (after the 16x16 sprites).
     TUFT_BASE_WORDS = N_SPRITES * SPRITE_WORDS;
     /// Better Leaves tuft indices: tuft i lives at word
@@ -250,6 +256,65 @@ const ART: [[&str; SPRITE_DIM]; N_SPRITES] = [
         "......ooo.o.....",
         ".......oo.......",
         ".......oo.......",
+    ],
+    // SPR_LEAF_OAK - a single lobed oak leaf, tip up, stem at the bottom:
+    // alternating edge widths make the lobes, '*' lit lobe tips on the sun
+    // side, 'o' shaded edge on the other.
+    [
+        "................",
+        ".......#........",
+        "......###.......",
+        ".....#####......",
+        "...*#######o....",
+        "....######......",
+        "..*#########o...",
+        "....########....",
+        "..*##########o..",
+        "...#########....",
+        "..*#########o...",
+        "....#######.....",
+        ".....#####......",
+        "......#o#.......",
+        ".......o........",
+        ".......o........",
+    ],
+    // SPR_LEAF_BIRCH - serrated ovate teardrop, pointed tip.
+    [
+        "................",
+        ".......#........",
+        "......##*.......",
+        ".....####.......",
+        "....#####*......",
+        "...#######......",
+        "....######*.....",
+        "...########.....",
+        "....#######.....",
+        "...########*....",
+        "....#######.....",
+        ".....#####......",
+        "......###.......",
+        ".......o........",
+        ".......o........",
+        "................",
+    ],
+    // SPR_LEAF_NEEDLE - a whisk of pine needles fanning up from a twig.
+    [
+        "................",
+        "#......*......#.",
+        ".#.....#.....#..",
+        "..#....#....#...",
+        "..*#...#...#*...",
+        "....#..#..#.....",
+        ".....#.#.#......",
+        "......###.......",
+        ".......o........",
+        ".......o........",
+        ".......o........",
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
     ],
 ];
 
@@ -545,6 +610,28 @@ mod tests {
                 .filter(|&(x, y)| texel(&w, s, x, y) == 3)
                 .count();
             assert!(accents >= 2, "flower {s} needs accent texels, has {accents}");
+        }
+    }
+
+    /// The canopy-sprig leaf silhouettes: readable coverage per species
+    /// (needle whisks are deliberately airy) and an empty top row so the
+    /// quad edge never reads as a straight cut.
+    #[test]
+    fn leaf_silhouettes_read() {
+        let w = encoded();
+        for (s, band) in [
+            (SPR_LEAF_OAK, 0.28..=0.45),
+            (SPR_LEAF_BIRCH, 0.16..=0.32),
+            (SPR_LEAF_NEEDLE, 0.06..=0.20),
+        ] {
+            let n: usize = (0..SPRITE_DIM)
+                .flat_map(|y| (0..SPRITE_DIM).map(move |x| (x, y)))
+                .filter(|&(x, y)| texel(&w, s, x, y) != 0)
+                .count();
+            let o = n as f32 / 256.0;
+            assert!(band.contains(&o), "leaf sprite {s} coverage {o}");
+            let top: usize = (0..SPRITE_DIM).filter(|&x| texel(&w, s, x, 15) != 0).count();
+            assert_eq!(top, 0, "leaf sprite {s} top row must be clear");
         }
     }
 
