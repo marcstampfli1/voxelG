@@ -2684,6 +2684,27 @@ mod gpu_render_tests {
         let lab = build_leaf_lab_world();
         let [(_, lab_side), _, _] = leaf_lab_cams();
         time_scenarios(&device, &queue, &lab, &[("leaf_lab", lab_side)], w, h);
+
+        // Falling-leaf pass A/B: the identical lab view with a full 256
+        // in-view leaves appended - the delta IS the particle pass cost.
+        let mut leaves = Vec::with_capacity(256);
+        for i in 0..256u32 {
+            let f = i as f32;
+            leaves.push(crate::leaffall::LeafInstance {
+                pos: [
+                    96.0 + (f * 7.3) % 12.0,
+                    64.0 + (f * 3.1) % 10.0,
+                    94.0 + (f * 5.7) % 10.0,
+                ],
+                size: 0.26,
+                rot: f * 0.7,
+                tilt_phase: f * 1.3,
+                sprite: crate::sprites::SPR_LEAF_OAK as u32,
+                tint: 0xff40_a040,
+            });
+        }
+        let [(_, lab_side2), _, _] = leaf_lab_cams();
+        time_scenarios_ext(&device, &queue, &lab, &[("leaf_lab+256leaves", lab_side2)], w, h, &leaves);
     }
 
     /// Upload one world and time cs_main + cs_transparent for each scenario
@@ -2695,6 +2716,20 @@ mod gpu_render_tests {
         scenarios: &[(&str, Camera)],
         w: u32,
         h: u32,
+    ) {
+        time_scenarios_ext(device, queue, world, scenarios, w, h, &[]);
+    }
+
+    /// time_scenarios plus injected falling leaves so the particle pass can
+    /// be A/B timed against the same scene.
+    fn time_scenarios_ext(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        world: &World,
+        scenarios: &[(&str, Camera)],
+        w: u32,
+        h: u32,
+        leaves: &[crate::leaffall::LeafInstance],
     ) {
         // World buffers are shared across scenarios; only the camera changes.
         let cu0 = CameraUniform::from_camera(&scenarios[0].1, w, h, 0.0, glam::IVec3::ZERO, [0.0, 0.0], 0.0);
@@ -2733,6 +2768,13 @@ mod gpu_render_tests {
         let m = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(src.into()) });
         let pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: Some(&pll), module: &m, entry_point: Some("cs_main"), compilation_options: Default::default(), cache: None });
         let pipe_transp = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: Some(&pll), module: &m, entry_point: Some("cs_transparent"), compilation_options: Default::default(), cache: None });
+        let leaf_pass = (!leaves.is_empty()).then(|| {
+            let buf = storage(&device, "leaves", bytemuck::cast_slice(leaves));
+            let bgl = create_leaf_bgl(device);
+            let pipe = create_leaf_pipeline(device, &bgl);
+            let bg = make_leaf_bg(device, &bgl, &camera_buf, &buf, &spr, &dv);
+            (pipe, bg, leaves.len() as u32)
+        });
 
         for (name, cam) in scenarios {
             let cu = CameraUniform::from_camera(cam, w, h, 0.0, glam::IVec3::ZERO, [0.0, 0.0], 0.0);
@@ -2750,6 +2792,22 @@ mod gpu_render_tests {
                     cp.set_pipeline(&pipe_transp);
                     cp.set_bind_group(0, &bg, &[]);
                     cp.dispatch_workgroups(tw, th, 1);
+                }
+                if let Some((lp, lbg, n)) = &leaf_pass {
+                    let mut rp = e.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("timing leaves"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &ov,
+                            resolve_target: None,
+                            ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    rp.set_pipeline(lp);
+                    rp.set_bind_group(0, lbg, &[]);
+                    rp.draw(0..6, 0..*n);
                 }
                 e.finish()
             };
