@@ -80,6 +80,15 @@ Validation tooling added so changes are checkable without a display:
   (binding 19; water pixels carry the surface t). Validated by the sim
   test suite, the red-leaf occlusion content test, the leaffall lookdev
   still and an A/B timing gate (256 in-view leaves <= 0.05 ms at 1080p).
+- **cloud-shadow checkerboard, root-caused and fixed** → per-frame-varying
+  terms (god-ray time jitter, cloud composite, underwater effect) were baked
+  inside the tile-gated primary pass, freezing at a different phase per 8x8
+  tile under the rotating anim-refresh. They now live in cs_compose, a
+  full-screen every-frame pass reading the tile-cached geometry colour +
+  exported depth. MECHANISM RULE: nothing that changes without its inputs
+  changing may be computed in a tile-gated pass. Proven by the two-phase
+  checkerboard probe (no_tile_checkerboard_in_god_rays): boundary-luma
+  excess 0.0283 pre-fix -> -0.0001 post-fix.
 - **foliage overhaul** → per-species Better Leaves tufts (birch/spruce ported by
   `examples/convert_tuft.rs`, oak self-validation 100%), autumn mottle, canopy
   occupancy AO (fixes generic cube AO counting the invisible fringe shell as
