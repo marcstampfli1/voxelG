@@ -1160,6 +1160,12 @@ fn create_beam_texture(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture,
     (tex, view)
 }
 
+/// Species colour straight from the render palette, so CPU systems (the
+/// falling-leaf sim) cannot drift from what the shader shows.
+pub fn palette_color(mat: u8) -> [f32; 4] {
+    default_palette()[mat as usize].0
+}
+
 /// Full-resolution primary-hit depth (r32float): written by cs_main, read by
 /// the falling-leaf pass for manual depth testing.
 fn create_depth_texture(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture, wgpu::TextureView) {

@@ -103,6 +103,14 @@ pub struct CameraUniform {
     pub _pad9: f32,
 }
 
+/// Frame-constant wind direction (unit XZ). ONE definition shared by the
+/// camera uniform (shaders read it as camera.wind_x/wind_z) and the CPU
+/// falling-leaf simulation.
+pub fn wind_dir(time: f32) -> glam::Vec2 {
+    let a = time * 0.04 + 0.4 * (time * 0.12).sin();
+    glam::Vec2::new(a.cos(), a.sin())
+}
+
 impl CameraUniform {
     pub fn from_camera(
         c: &Camera,
@@ -124,14 +132,14 @@ impl CameraUniform {
             tan_half_fov: (c.fov_y * 0.5).tan(),
             resolution: [width as f32, height as f32],
             time,
-            wind_x: (time * 0.04 + 0.4 * (time * 0.12).sin()).cos(),
+            wind_x: wind_dir(time).x,
             world_origin: [world_origin_voxel.x, world_origin_voxel.y, world_origin_voxel.z],
             _pad4: 0,
             jitter,
             taa_blend,
             reproject_lighting: 0.0,
             prev_origin: c.pos.to_array(),
-            wind_z: (time * 0.04 + 0.4 * (time * 0.12).sin()).sin(),
+            wind_z: wind_dir(time).y,
             prev_forward: c.forward().to_array(),
             _pad7: 0.0,
             prev_right: c.right().to_array(),
