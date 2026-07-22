@@ -2749,7 +2749,16 @@ fn shade(
     let s = sun_dir();
     let s_int = sun_intensity(s);
     let p_off = p_hit + n * 0.001;
-    let n_dot_l = max(0.0, dot(n, s));
+    var n_dot_l = max(0.0, dot(n, s));
+    // Foliage light response: leaf cards catch the sun on wildly-varied
+    // (often sun-facing) normals, so raw n.l swings from 0 to 1 and leaves
+    // brighten/darken with the light FAR more than a flat block face (which
+    // only ever sees n.l = sun elevation). Blend the foliage n.l partway
+    // toward that flat response so leaves track light like the blocks do -
+    // this touches only the LIGHT magnitude; the sway MOTION is untouched.
+    if (is_foliage_mat(hit.mat)) {
+        n_dot_l = mix(n_dot_l, max(0.0, s.y), 0.45);
+    }
     var shadow_term = 0.0;
     if (reuse_light) {
         shadow_term = (*light).x;
