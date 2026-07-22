@@ -4200,7 +4200,10 @@ mod gpu_render_tests {
         let (sw_main, sw_transp, sw_compose) = (mk(&sw_m, &sw_pl, "cs_main", &[]), mk(&sw_m, &sw_pl, "cs_transparent", &[]), mk(&sw_m, &sw_pl, "cs_compose", &[]));
         // RT with GI off: measure the OCCLUSION path against software apples-to-apples.
         let gi_off: &[(&'static str, f64)] = &[("GI_ENABLE", 0.0)];
+        let gi_on: &[(&'static str, f64)] = &[("GI_ENABLE", 1.0)];
         let (rt_main, rt_transp, rt_compose) = (mk(&rt_m, &rt_pl, "cs_main", gi_off), mk(&rt_m, &rt_pl, "cs_transparent", gi_off), mk(&rt_m, &rt_pl, "cs_compose", gi_off));
+        // RT with GI on: the one-bounce indirect cost on top.
+        let (gi_main, gi_transp, gi_compose) = (mk(&rt_m, &rt_pl, "cs_main", gi_on), mk(&rt_m, &rt_pl, "cs_transparent", gi_on), mk(&rt_m, &rt_pl, "cs_compose", gi_on));
 
         // Foliage-heavy and terrain-overview cameras (occlusion cost differs a
         // lot: dense canopy AO/shadow rays vs open terrain).
@@ -4239,9 +4242,10 @@ mod gpu_render_tests {
             };
             let sw_ms = run(&sw_main, &sw_transp, &sw_compose, false);
             let rt_ms = run(&rt_main, &rt_transp, &rt_compose, true);
+            let gi_ms = run(&gi_main, &gi_transp, &gi_compose, true);
             eprintln!(
-                "rt_vs_software_timing [{name}] {w}x{h}: software {sw_ms:.2} ms  |  RT {rt_ms:.2} ms  |  RT is {:.2}x software",
-                sw_ms / rt_ms
+                "rt_vs_software_timing [{name}] {w}x{h}: software {sw_ms:.2} ms  |  RT-occl {rt_ms:.2} ms ({:.2}x)  |  RT+1bounce-GI {gi_ms:.2} ms ({:.2}x sw)",
+                sw_ms / rt_ms, sw_ms / gi_ms
             );
         }
     }
