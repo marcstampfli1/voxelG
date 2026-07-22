@@ -1385,18 +1385,46 @@ fn hash3f(pin: vec3<f32>) -> f32 {
     q = q + dot(q, q.yzx + 33.33);
     return fract((q.x + q.y) * q.z);
 }
+
+// Bit-exact lattice hash (PCG-3D mix, Jarzynski-Olano): noise LATTICE cells
+// must be hashed with integer arithmetic only. The float hash above takes
+// fract() of products around 2e4, where one f32 ULP is ~2e-3: for
+// knife-edge cells the result flips with whichever FMA contraction the
+// driver picks PER INLINED CALL SITE, so the same lattice cell can hash
+// differently on the two sides of a lattice line - a hard pattern seam in
+// the middle of a flat face (the "stone rows shifted" bug; same compiler-
+// freedom family as the naga OpSRem poison, but legal float behaviour).
+// Integer ops have no rounding: bit-stable across every call site, every
+// unrolled loop copy, every driver. Takes integer-VALUED floats (floor()
+// results / lattice corners; salts encoded as whole numbers).
+fn hash_lattice3(ip: vec3<f32>) -> f32 {
+    var v = vec3<u32>(
+        bitcast<u32>(i32(ip.x)),
+        bitcast<u32>(i32(ip.y)),
+        bitcast<u32>(i32(ip.z)),
+    );
+    v = v * vec3<u32>(1664525u) + vec3<u32>(1013904223u);
+    v.x = v.x + v.y * v.z;
+    v.y = v.y + v.z * v.x;
+    v.z = v.z + v.x * v.y;
+    v = v ^ (v >> vec3<u32>(16u));
+    v.x = v.x + v.y * v.z;
+    v.y = v.y + v.z * v.x;
+    v.z = v.z + v.x * v.y;
+    return f32(v.x) * 2.3283064e-10;
+}
 fn vnoise3(p: vec3<f32>) -> f32 {
     let i = floor(p);
     let f = fract(p);
     let u = f * f * (3.0 - 2.0 * f);
-    let n000 = hash3f(i + vec3<f32>(0.0, 0.0, 0.0));
-    let n100 = hash3f(i + vec3<f32>(1.0, 0.0, 0.0));
-    let n010 = hash3f(i + vec3<f32>(0.0, 1.0, 0.0));
-    let n110 = hash3f(i + vec3<f32>(1.0, 1.0, 0.0));
-    let n001 = hash3f(i + vec3<f32>(0.0, 0.0, 1.0));
-    let n101 = hash3f(i + vec3<f32>(1.0, 0.0, 1.0));
-    let n011 = hash3f(i + vec3<f32>(0.0, 1.0, 1.0));
-    let n111 = hash3f(i + vec3<f32>(1.0, 1.0, 1.0));
+    let n000 = hash_lattice3(i + vec3<f32>(0.0, 0.0, 0.0));
+    let n100 = hash_lattice3(i + vec3<f32>(1.0, 0.0, 0.0));
+    let n010 = hash_lattice3(i + vec3<f32>(0.0, 1.0, 0.0));
+    let n110 = hash_lattice3(i + vec3<f32>(1.0, 1.0, 0.0));
+    let n001 = hash_lattice3(i + vec3<f32>(0.0, 0.0, 1.0));
+    let n101 = hash_lattice3(i + vec3<f32>(1.0, 0.0, 1.0));
+    let n011 = hash_lattice3(i + vec3<f32>(0.0, 1.0, 1.0));
+    let n111 = hash_lattice3(i + vec3<f32>(1.0, 1.0, 1.0));
     let a = mix(n000, n100, u.x);
     let b = mix(n010, n110, u.x);
     let c = mix(n001, n101, u.x);
@@ -1503,7 +1531,7 @@ fn gvec(i: vec3<f32>) -> vec3<f32> {
     // ONE hash fanned into three channels: a third of the inlined code of
     // hashing per channel, which matters because the driver inlines every
     // instance (3x cost = minutes of driver compile, measured).
-    let h = hash3f(i);
+    let h = hash_lattice3(i);
     return vec3<f32>(fract(h * 5.37), fract(h * 7.79), fract(h * 9.13)) * 2.0 - vec3<f32>(1.0);
 }
 
@@ -1576,7 +1604,7 @@ fn worley2(p: vec2<f32>) -> CellNoise {
     for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
         for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
             let g = vec2<f32>(f32(dx), f32(dy));
-            let h = hash3f(vec3<f32>(ip + g, 17.0));
+            let h = hash_lattice3(vec3<f32>(ip + g, 17.0));
             let o = vec2<f32>(fract(h * 7.13), fract(h * 13.71));
             let d = length(g + o - fp);
             if (d < out.f1) {

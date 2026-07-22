@@ -2729,6 +2729,34 @@ mod gpu_render_tests {
         }
     }
 
+    /// One-off high-res probe of the stone-corner macro view (2x the lookdev
+    /// resolution): discriminates world-space texture seams (stick to block
+    /// boundaries) from screen-space artifacts (stick to the 8px tile grid).
+    #[test]
+    #[ignore]
+    fn dump_stone_probe() {
+        let world = build_material_lab_world();
+        let [_, _, (_, corner)] = material_lab_cams();
+        let mut faceon = Camera::new();
+        faceon.pos = glam::Vec3::new(94.0, 65.0, 98.0);
+        faceon.yaw = 0.0;
+        faceon.pitch = 0.0;
+        std::fs::create_dir_all("target/lookdev").unwrap();
+        for (name, cam) in [("stone_probe_2x", corner), ("stone_probe_faceon", faceon)] {
+            let Some(rgba) = render_rgba(&world, &cam, 1920, 1080) else {
+                eprintln!("no GPU — skipping");
+                return;
+            };
+            let path = format!("target/lookdev/{name}.png");
+            let file = std::fs::File::create(&path).unwrap();
+            let mut enc = png::Encoder::new(std::io::BufWriter::new(file), 1920, 1080);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            enc.write_header().unwrap().write_image_data(&rgba).unwrap();
+            eprintln!("wrote {path}");
+        }
+    }
+
     fn material_lab_cams() -> [(&'static str, Camera); 3] {
         let mut front = Camera::new();
         front.pos = glam::Vec3::new(124.0, 68.5, 76.0);
@@ -2848,7 +2876,10 @@ mod gpu_render_tests {
                     frame[i + 2] as f32 / 255.0,
                 );
                 lumas.push((r + g + b) / 3.0);
-                if b > 0.55 && b > g + 0.05 {
+                // Sky gap = blue sky OR a bright cloud behind the crown
+                // (cloud layouts move whenever the shared noise stack
+                // changes; leaves match neither branch).
+                if (b > 0.55 && b > g + 0.05) || (r > 0.62 && g > 0.62 && b > 0.62) {
                     sky += 1;
                 }
                 if g > r && g > b {
