@@ -475,7 +475,16 @@ fn cs_transparent(@builtin(global_invocation_id) gid: vec3<u32>) {
             // zero on flat lakes) plus the exact per-pixel field gradient
             // (the same field the patches displace by).
             let p_hit = camera.origin + dir * hit.t_hit;
-            let g = unpack2x16float(rec.z);
+            let g_raw = unpack2x16float(rec.z);
+            // Soft-clamp the rest-gradient magnitude with an m^2 weight:
+            // SMOOTH (C1) everywhere so there is no switch-on seam (a hard
+            // threshold left a faint edge where the slope crossed it), yet
+            // negligible on gentle slopes (waves, terrace ramps: m^2 tiny)
+            // and strong on the steep transient slopes a fast-filling pit
+            // leaves for a few frames (their bilinear tilt reads as dark
+            // faceted arches). Geometry (silhouette) unchanged.
+            let m2 = dot(g_raw, g_raw);
+            let g = g_raw / (1.0 + m2 * m2 * 0.6);
             let f = water_field(p_hit.xz, camera.time);
             hit.normal = normalize(vec3<f32>(-(g.x + f.y), 1.0, -(g.y + f.z)));
         } else {
