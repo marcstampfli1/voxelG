@@ -1661,15 +1661,38 @@ fn paint_tree(
     }
 }
 
-// A canopy blob = a fringe shell (radius + 1, only into empty cells) plus
-// the leaf sphere itself (replacing its own interior fringe). The fringe
-// ring is what lets the renderer show tuft quads protruding sideways.
+// A canopy blob = a fringe shell (radius + 1, widened one EXTRA cell on
+// the horizontal axes, only into empty cells) plus the leaf sphere itself
+// (replacing its own interior fringe). The fringe ring is what lets the
+// renderer show tuft quads and leaf-cloud cards protruding sideways; the
+// horizontal widening gives the outer ring where overhanging cards render
+// instead of being clipped at the shell boundary.
 fn paint_canopy(
     bricks: &mut [Brick], cmin: (i32, i32, i32), cmax: (i32, i32, i32),
     c: glam::IVec3, r: i32, leaf_mat: u8,
 ) {
-    paint_sphere(bricks, cmin, cmax, c, r + 1, MAT_LEAF_FRINGE);
+    paint_fringe_shell(bricks, cmin, cmax, c, r + 1);
     paint_sphere(bricks, cmin, cmax, c, r, leaf_mat);
+}
+
+// Sphere of radius r stretched +1 cell along +-x/+-z: the horizontal axes
+// shrink toward the sphere test by one cell first, so the vertical extent
+// stays r while the sides gain one ring.
+fn paint_fringe_shell(
+    bricks: &mut [Brick], cmin: (i32, i32, i32), cmax: (i32, i32, i32),
+    center: glam::IVec3, r: i32,
+) {
+    let r2 = r * r;
+    for dy in -r..=r {
+        for dx in -(r + 1)..=(r + 1) {
+            for dz in -(r + 1)..=(r + 1) {
+                let hx = (dx.abs() - 1).max(0);
+                let hz = (dz.abs() - 1).max(0);
+                if hx * hx + dy * dy + hz * hz > r2 { continue; }
+                try_write_tree_voxel(bricks, center.x + dx, center.y + dy, center.z + dz, MAT_LEAF_FRINGE, cmin, cmax);
+            }
+        }
+    }
 }
 
 // thickness=0 → 1-voxel-wide line (no spheres along the line). Otherwise a

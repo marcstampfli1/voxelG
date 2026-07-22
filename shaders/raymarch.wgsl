@@ -1014,7 +1014,10 @@ fn leaf_cloud_hit(cell_min: vec3<f32>, origin: vec3<f32>, dir: vec3<f32>, t_lo: 
         // slightly inward, so no card hangs laterally off the canopy corner.
         let face_c = cell_min + vec3<f32>(0.5) - outward * 0.5;
         let c = face_c + (vec3<f32>(h1, h2, h3) - vec3<f32>(0.5)) * 0.85 - outward * 0.10;
-        let scale = 0.92 + h3 * 0.48;
+        // Wide per-leaf size spread: small sprigs through big fans read as
+        // a real crown; the horizontal overhang ring renders whatever pokes
+        // past the cell, so large cards no longer clip.
+        let scale = 0.70 + h3 * 0.85;
         let n = normalize(outward + (vec3<f32>(h1, h2, h3) - vec3<f32>(0.5)) * 1.4);
         let denom = dot(dir, n);
         if (abs(denom) < 1e-4) { continue; }
@@ -1068,6 +1071,42 @@ fn leaf_cloud_hit(cell_min: vec3<f32>, origin: vec3<f32>, dir: vec3<f32>, t_lo: 
         out.color_tint = vec3<f32>(tone * block_shade * leaf_shade) * species * hue;
     }
     return out;
+}
+
+struct CloudCtx {
+    mat: u32,
+    vh: f32,
+    outward: vec3<f32>,
+}
+
+// EXACTLY mirrors the accumulation inside leaf_fringe_hit's neighbour loop
+// (first leaf neighbour in the same 0..6 order = mat + block hash; outward
+// = accumulated -dirs). The outer overhang ring reconstructs the INNER
+// cell's card set with this - keep the two in lockstep or overhanging
+// cards pop at the ring boundary. Separate on purpose: folding this into
+// the main loop would add 6 hierarchical probes to EVERY fringe cell,
+// while only the sparse outer ring needs the reconstruction.
+fn leaf_cloud_context(voxel: vec3<i32>) -> CloudCtx {
+    var ctx: CloudCtx;
+    ctx.mat = 0u;
+    ctx.vh = 0.5;
+    ctx.outward = vec3<f32>(0.0);
+    for (var i: i32 = 0; i < 6; i = i + 1) {
+        var off = vec3<i32>(0);
+        if (i == 0) { off.x = 1; } else if (i == 1) { off.x = -1; }
+        else if (i == 2) { off.y = 1; } else if (i == 3) { off.y = -1; }
+        else if (i == 4) { off.z = 1; } else { off.z = -1; }
+        let nb = voxel + off;
+        let nb_mat = voxel_material_at(nb);
+        if (!is_leaf_block_mat(nb_mat)) { continue; }
+        if (ctx.mat == 0u) {
+            ctx.mat = nb_mat;
+            ctx.vh = hash3f(vec3<f32>(f32(nb.x), f32(nb.y), f32(nb.z)));
+        }
+        ctx.outward = ctx.outward - vec3<f32>(f32(off.x), f32(off.y), f32(off.z));
+    }
+    ctx.outward = normalize(ctx.outward + vec3<f32>(0.0, 1e-4, 0.0));
+    return ctx;
 }
 
 // A fringe cell renders the parts of its neighbouring leaf blocks tuft
@@ -1148,6 +1187,30 @@ fn leaf_fringe_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>) -> SubHi
             lh.color_tint = lh.color_tint * palette[cloud_mat].rgb
                 / max(palette[MAT_LEAF_FRINGE].rgb, vec3<f32>(1e-3));
             out = lh;
+        }
+    } else if (cloud_mat == 0u && t_enter < LEAF_CLOUD_T) {
+        // Outer overhang ring (the horizontally-widened fringe shell): no
+        // leaf neighbour at distance 1, so look laterally at distance 2 and
+        // render the INNER fringe cell's IDENTICAL card set restricted to
+        // this cell's ray window - cards poking past the inner cell
+        // continue here seamlessly instead of clipping at the shell plane.
+        for (var i: i32 = 0; i < 4; i = i + 1) {
+            var off = vec3<i32>(0);
+            if (i == 0) { off.x = 2; } else if (i == 1) { off.x = -2; }
+            else if (i == 2) { off.z = 2; } else { off.z = -2; }
+            if (!is_leaf_block_mat(voxel_material_at(voxel + off))) { continue; }
+            let inner = voxel + off / 2;
+            let ctx = leaf_cloud_context(inner);
+            if (ctx.mat == 0u) { continue; }
+            let inner_min = vec3<f32>(f32(inner.x), f32(inner.y), f32(inner.z));
+            var lh = leaf_cloud_hit(inner_min, origin, dir,
+                                    max(t_enter - 0.05, 0.0), min(t_exit + 0.05, best_t), ctx.mat, ctx.outward, ctx.vh);
+            if (lh.hit) {
+                lh.color_tint = lh.color_tint * palette[ctx.mat].rgb
+                    / max(palette[MAT_LEAF_FRINGE].rgb, vec3<f32>(1e-3));
+                out = lh;
+                best_t = lh.t_hit;
+            }
         }
     }
     return out;

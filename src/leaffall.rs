@@ -277,7 +277,7 @@ impl LeafSim {
             let ang = self.rng.next_f32() * std::f32::consts::TAU;
             self.leaves.push(Leaf {
                 pos: Vec3::new(x as f32 + 0.5, hit_y as f32 + 1.3, z as f32 + 0.5),
-                base_size: 0.20 + 0.12 * self.rng.next_f32(),
+                base_size: 0.16 + 0.20 * self.rng.next_f32(),
                 sway_axis: Vec2::new(ang.cos(), ang.sin()),
                 sway_amp: 0.35 + 0.55 * self.rng.next_f32(),
                 sway_freq: 1.2 + 1.0 * self.rng.next_f32(),

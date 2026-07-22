@@ -2909,13 +2909,16 @@ mod gpu_render_tests {
         ];
         for (cx, cz, wood, leaf) in trees {
             let cy = 69i32;
-            // Fringe shell r=4, then leaves r=3, then trunk - same overwrite
-            // order as worldgen's paint_canopy.
-            for (r, m) in [(4i32, MAT_LEAF_FRINGE), (3, leaf)] {
+            // Fringe shell r=4 (widened one cell horizontally), then leaves
+            // r=3, then trunk - same overwrite order and shell shape as
+            // worldgen's paint_canopy/paint_fringe_shell.
+            for (r, m, wide) in [(4i32, MAT_LEAF_FRINGE, 1i32), (3, leaf, 0)] {
                 for dy in -r..=r {
-                    for dx in -r..=r {
-                        for dz in -r..=r {
-                            if dx * dx + dy * dy + dz * dz > r * r {
+                    for dx in -(r + wide)..=(r + wide) {
+                        for dz in -(r + wide)..=(r + wide) {
+                            let hx = (dx.abs() - wide).max(0);
+                            let hz = (dz.abs() - wide).max(0);
+                            if hx * hx + dy * dy + hz * hz > r * r {
                                 continue;
                             }
                             world.set_voxel(
