@@ -32,8 +32,10 @@ struct Hit {
     vy: i32,
     vz: i32,
     mat: u32,
+    nx: i32,
+    ny: i32,
+    nz: i32,
     _p0: u32,
-    _p1: u32,
 };
 
 @group(0) @binding(0) var<storage, read> bricks: array<Brick>;
@@ -79,23 +81,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // truth for the voxel.
     var best_t = 1.0e30;
     var best_v = vec3<i32>(0);
+    var best_n = vec3<i32>(0);
     var best_mat = 0u;
     var found = false;
-    var n_cand = 0u;
     while (rayQueryProceed(&rq)) {
         let c = rayQueryGetCandidateIntersection(&rq);
         if (c.kind == RAY_QUERY_INTERSECTION_AABB) {
-            n_cand = n_cand + 1u;
             let bi = i32(brick_map[c.primitive_index]);
             let a = aabbs[c.primitive_index];
             let bmin = vec3<f32>(a.min_x, a.min_y, a.min_z);
             var fv = vec3<i32>(0);
-            let t = resolve_brick(bi, bmin, o, d, 0.0, best_t, &fv);
+            var fnrm = vec3<i32>(0);
+            let t = resolve_brick(bi, bmin, o, d, 0.0, best_t, &fv, &fnrm);
             if (t >= 0.0) {
                 rayQueryGenerateIntersection(&rq, t);
                 if (t < best_t) {
                     best_t = t;
                     best_v = vec3<i32>(bmin) + fv;
+                    best_n = fnrm;
                     let vi = brick_voxel_idx(fv.x, fv.y, fv.z);
                     best_mat = brick_voxel_material(bi, vi);
                     found = true;
@@ -110,11 +113,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         out.hit = 1u;
         out.vx = best_v.x; out.vy = best_v.y; out.vz = best_v.z;
         out.mat = best_mat;
+        out.nx = best_n.x; out.ny = best_n.y; out.nz = best_n.z;
     } else {
         out.t = -1.0;
         out.hit = 0u;
         out.vx = 0; out.vy = 0; out.vz = 0; out.mat = 0u;
+        out.nx = 0; out.ny = 0; out.nz = 0;
     }
-    out._p0 = n_cand;
     hits[i] = out;
 }

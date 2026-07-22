@@ -221,8 +221,10 @@ mod tests {
         vy: i32,
         vz: i32,
         mat: u32,
+        nx: i32,
+        ny: i32,
+        nz: i32,
         _p0: u32,
-        _p1: u32,
     }
 
     /// Headless device WITH the experimental ray-query feature + AS limits. The
@@ -540,6 +542,14 @@ mod tests {
                     grazing += 1;
                 } else {
                     clean_assert += 1;
+                    // A clean face hit: the RT entry-face normal must match the
+                    // CPU raycaster's (needed for primary-ray shading, Phase 4).
+                    let cpu_n = oracle.as_ref().unwrap().normal;
+                    assert_eq!(
+                        [h.nx, h.ny, h.nz], cpu_n,
+                        "origin ({},{}) clean hit {:?}: RT normal {:?} != CPU {:?}",
+                        wo.x, wo.z, rt_world, [h.nx, h.ny, h.nz], cpu_n
+                    );
                     // window-local y<=60 is the floor (rt_world.y == wo.y + local).
                     if h.vy <= 60 { clean_floor += 1; } else { clean_pillar += 1; }
                 }
