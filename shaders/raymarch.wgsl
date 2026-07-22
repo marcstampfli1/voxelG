@@ -2048,22 +2048,31 @@ fn water_subvoxel_far(
 // The k-loop enumerates the corner's 4 sharing columns in increasing z then
 // x WORLD order - keep it that way, bitwise cross-cell equality depends on
 // the accumulation order.
-fn water_corner_h(lf9: ptr<function, array<f32, 9>>, up9: u32, voxel: vec3<i32>, cx: i32, cz: i32) -> vec2<f32> {
-    var pinned = false;
+fn water_corner_h(lf9: ptr<function, array<f32, 9>>, up9: u32, dn9: u32, voxel: vec3<i32>, cx: i32, cz: i32) -> vec2<f32> {
+    var pinned_up = false;
+    var pinned_dn = false;
     var sum = 0.0;
     var cnt = 0.0;
     for (var k: i32 = 0; k < 4; k = k + 1) {
         let ox = cx - 1 + (k & 1);
         let oz = cz - 1 + (k >> 1);
         let idx = (ox + 1) + (oz + 1) * 3;
-        if (((up9 >> u32(idx)) & 1u) == 1u) { pinned = true; }
+        if (((up9 >> u32(idx)) & 1u) == 1u) { pinned_up = true; }
+        if (((dn9 >> u32(idx)) & 1u) == 1u) { pinned_dn = true; }
         let lf = (*lf9)[idx];
         if (lf > 0.0) {
             sum = sum + lf;
             cnt = cnt + 1.0;
         }
     }
-    if (pinned) { return vec2<f32>(1.0, 1.0); }
+    if (pinned_up) { return vec2<f32>(1.0, 1.0); }
+    // Step-down pin (mirror of the step-up pin): a corner-sharing column
+    // whose water sits one level BELOW pulls this corner to the cell floor,
+    // so the upper surface sweeps down to its floor exactly where the lower
+    // cell's pinned corner sweeps up to its ceiling - together a continuous
+    // two-piece ramp connecting the lower surface to the TOP of the upper
+    // one, one voxel of reach only. Up-pin wins when both apply.
+    if (pinned_dn) { return vec2<f32>(WATER_MIN_H, WATER_MIN_H); }
     let avg = sum / cnt; // own column always counts: cnt >= 1
     let f = water_field(vec2<f32>(f32(voxel.x + cx), f32(voxel.z + cz)), camera.time);
     let h_rest = clamp(WATER_BASE * avg, WATER_MIN_H, 1.0);
@@ -2130,13 +2139,27 @@ fn water_subvoxel(
             }
         }
     }
+    // Stage C - step-down probes, only for columns that hold NO water at
+    // this y (a watery column's surface is at this level, it cannot be a
+    // step down; interior lakes therefore pay zero extra probes - the cost
+    // concentrates at shores and terrace rims where it matters).
+    var dn9: u32 = 0u;
+    for (var oz: i32 = -1; oz <= 1; oz = oz + 1) {
+        for (var ox: i32 = -1; ox <= 1; ox = ox + 1) {
+            if (ox == 0 && oz == 0) { continue; }
+            if (lf9[(ox + 1) + (oz + 1) * 3] > 0.0) { continue; }
+            if (is_water_mat(neighbor_material(voxel, slot_v, bp, bi, vec3<i32>(ox, -1, oz)))) {
+                dn9 = dn9 | (1u << u32((ox + 1) + (oz + 1) * 3));
+            }
+        }
+    }
 
     // The four corner heights (h, h_rest) and the bilinear coefficients
     // S(x,z) = h00 + a1 x + a2 z + a3 xz over the unit cell.
-    let c00 = water_corner_h(&lf9, up9, voxel, 0, 0);
-    let c10 = water_corner_h(&lf9, up9, voxel, 1, 0);
-    let c01 = water_corner_h(&lf9, up9, voxel, 0, 1);
-    let c11 = water_corner_h(&lf9, up9, voxel, 1, 1);
+    let c00 = water_corner_h(&lf9, up9, dn9, voxel, 0, 0);
+    let c10 = water_corner_h(&lf9, up9, dn9, voxel, 1, 0);
+    let c01 = water_corner_h(&lf9, up9, dn9, voxel, 0, 1);
+    let c11 = water_corner_h(&lf9, up9, dn9, voxel, 1, 1);
     let a1 = c10.x - c00.x;
     let a2 = c01.x - c00.x;
     let a3 = c00.x - c10.x - c01.x + c11.x;
