@@ -2954,7 +2954,7 @@ mod gpu_render_tests {
     /// strata level on terrace tops).
     fn normal_shift_diff(mat: u8, top_face: bool) -> Option<f32> {
         let (w, h) = (640u32, 400u32);
-        let mut render = |shift: u32| -> Option<Vec<u8>> {
+        let render = |shift: u32| -> Option<Vec<u8>> {
             let mut world = World::new();
             if top_face {
                 for y in 56..64 + shift {
