@@ -1975,7 +1975,14 @@ fn water_field(xz: vec2<f32>, t: f32) -> vec3<f32> {
 // algebraically to the previous centre-sampled plane. Shading uses the
 // carried rest-gradient plus the exact per-pixel field normal
 // (cs_transparent); only the ray-patch intersection is per-cell geometry.
-const WATER_DETAIL_T: f32 = 96.0;   // beyond this, water is a plain cube top
+const WATER_DETAIL_T: f32 = 96.0;   // beyond this, the wave field is skipped (flat rest plane)
+// Beyond this, water really is a plain cube top. The 0.28-voxel drop from
+// cube top (1.0) to rest surface (0.72) subtends under a pixel out here,
+// and fog has saturated by 280 - while the old 96 cutoff put the drop in
+// plain view: the water level visibly sank in a radius around the camera
+// as it approached ("far water looks higher"). Grazing cost stays bounded:
+// past 400 the first water cell stops the ray as a cube again.
+const WATER_FAR_T: f32 = 400.0;
 // Corner-connected patches only this near: a 1-voxel terrace step subtends
 // >2 px inside this range and the connection is visible; beyond it the
 // cheap centre-plane facet takes over (water_subvoxel_far) - horizon-
@@ -2015,7 +2022,13 @@ fn water_subvoxel_far(
     out.grad_rest = vec2<f32>(0.0);
     let level_frac = f32(m - MAT_WATER_L1 + 1u) * 0.125;
     let vc = vec2<f32>(f32(voxel.x) + 0.5, f32(voxel.z) + 0.5);
-    let f = water_field(vc, camera.time);
+    // Third tier (WATER_DETAIL_T..WATER_FAR_T): the flat rest plane. The
+    // wave field is sub-pixel out there, but the SURFACE HEIGHT must stay
+    // at ~0.72 or the level jumps a visible 0.28 voxels at the tier ring.
+    var f = vec3<f32>(0.0);
+    if (t_entry <= WATER_DETAIL_T) {
+        f = water_field(vc, camera.time);
+    }
     let slope = clamp(f.yz, vec2<f32>(-0.30), vec2<f32>(0.30)) * level_frac;
     let margin = 0.5 * (abs(slope.x) + abs(slope.y)) + 0.02;
     let h = clamp(WATER_BASE + f.x, margin, 1.0 - margin) * level_frac;
@@ -3376,7 +3389,7 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
                 // cutout missed → fall through to the DDA step below.
             } else if (is_decoration_mat(m)) {
                 // Far decoration → invisible; fall through to the DDA step.
-            } else if (is_water_mat(m) && t_cur <= WATER_DETAIL_T) {
+            } else if (is_water_mat(m) && t_cur <= WATER_FAR_T) {
                 // Near water: sub-voxel patch surface. A miss means the ray
                 // passed above the patch — keep stepping.
                 let en = entry_normal_and_t(last_axis, step, t_max, t_delta, t_enter, tmin3);
