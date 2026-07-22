@@ -2645,7 +2645,7 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
         // would self-occlude. Lift the origin to just above the cell's top
         // face: the column above a surface cell is air by construction.
         let glint_origin = vec3<f32>(p_hit.x, floor(p_hit.y) + 1.001, p_hit.z);
-        shadow = select(1.0, 0.0, trace_any(glint_origin, s, SHADOW_MAX_DIST));
+        shadow = select(1.0, 0.0, shadow_occluded(glint_origin, s, SHADOW_MAX_DIST));
     }
 
     // ---- shoreline foam: triggered by shallow water (under.t_hit small) ----
@@ -2850,7 +2850,7 @@ fn shade(
         let bitangent = cross(s, tangent);
         let off = (tangent * cos(theta) + bitangent * sin(theta)) * radius;
         let ss = normalize(s + off);
-        shadow_term = select(0.0, 1.0, !trace_any(p_off, ss, SHADOW_MAX_DIST));
+        shadow_term = select(0.0, 1.0, !shadow_occluded(p_off, ss, SHADOW_MAX_DIST));
     }
     // Hand the freshly-computed terms back so the caller can cache them.
     if (!reuse_light) { *light = vec2<f32>(shadow_term, ao); }
@@ -2936,7 +2936,7 @@ fn shade_glass(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     let spec = pow(max(0.0, dot(n, h_vec)), 200.0);
     var shadow = 0.0;
     if (sun_intensity(s) > 0.0 && dot(n, s) > 0.0) {
-        shadow = select(1.0, 0.0, trace_any(refl_origin, s, SHADOW_MAX_DIST));
+        shadow = select(1.0, 0.0, shadow_occluded(refl_origin, s, SHADOW_MAX_DIST));
     }
 
     let cos_theta = clamp(dot(-dir, n), 0.0, 1.0);
@@ -3069,7 +3069,7 @@ fn god_rays(origin: vec3<f32>, dir: vec3<f32>, t_far: f32, pix: vec2<f32>) -> ve
         let p = origin + dir * t;
         // God-ray shafts only need NEARBY occluders — a short occlusion cap lets
         // the hierarchical trace bail out far sooner than a full shadow ray.
-        if (!trace_any(p + s * 0.5, s, GOD_RAY_OCCL_DIST)) {
+        if (!shadow_occluded(p + s * 0.5, s, GOD_RAY_OCCL_DIST)) {
             // Distance-weighted contribution: nearer scatter looks brighter.
             sum = sum + exp(-t * 0.008);
         }
@@ -3192,13 +3192,13 @@ fn sky_access(p: vec3<f32>, n: vec3<f32>) -> f32 {
     // mechanism is a propagated per-voxel sky-light field, O(1) and
     // bounce-aware - noted as the scalable upgrade.)
     let o = p + n * 0.02;
-    if (!trace_any(o, vec3<f32>(0.0, 1.0, 0.0), SKY_ACCESS_DIST)) { return 1.0; }
+    if (!shadow_occluded(o, vec3<f32>(0.0, 1.0, 0.0), SKY_ACCESS_DIST)) { return 1.0; }
     var open = 0.0;
     let c = 0.643; let e = 0.766;
-    if (!trace_any(o, vec3<f32>( e, c, 0.0), SKY_ACCESS_DIST)) { open += c; }
-    if (!trace_any(o, vec3<f32>(-e, c, 0.0), SKY_ACCESS_DIST)) { open += c; }
-    if (!trace_any(o, vec3<f32>(0.0, c,  e), SKY_ACCESS_DIST)) { open += c; }
-    if (!trace_any(o, vec3<f32>(0.0, c, -e), SKY_ACCESS_DIST)) { open += c; }
+    if (!shadow_occluded(o, vec3<f32>( e, c, 0.0), SKY_ACCESS_DIST)) { open += c; }
+    if (!shadow_occluded(o, vec3<f32>(-e, c, 0.0), SKY_ACCESS_DIST)) { open += c; }
+    if (!shadow_occluded(o, vec3<f32>(0.0, c,  e), SKY_ACCESS_DIST)) { open += c; }
+    if (!shadow_occluded(o, vec3<f32>(0.0, c, -e), SKY_ACCESS_DIST)) { open += c; }
     return max(open / (1.0 + 4.0 * c), 0.04);
 }
 

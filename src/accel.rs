@@ -282,9 +282,17 @@ mod tests {
             mapped_at_creation: false,
         });
 
+        // enable directive first, then the SHARED voxel_ray_query primitive
+        // (resolve_brick), then the probe body - the same resolve_brick the
+        // render shader's RT path uses.
+        let probe_src = format!(
+            "enable wgpu_ray_query;\n{}\n{}",
+            include_str!("../shaders/rt_voxel_query.wgsl"),
+            include_str!("../shaders/accel_probe.wgsl"),
+        );
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("accel_probe"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/accel_probe.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(probe_src.into()),
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("accel_probe"),

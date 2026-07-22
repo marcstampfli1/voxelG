@@ -33,3 +33,19 @@ Architecture + rules: see the plan (scratchpad draft) and memory project-voxelg-
   is the reusable pattern for primary/AO too - it yields the exact voxel+material
   with no re-derivation from a committed t. generateIntersection still fires so
   the hardware culls bricks past the current nearest (the coarse-to-fine win).
+- Toroidal fix: accel now builds in WINDOW-LOCAL space (contiguous BVH) reading
+  occupancy from the wrapped storage slot; a shifted-origin streaming test proves
+  the same crafted scene resolves identically at origin 0 and (96,160). Any-hit
+  RT shadow occlusion validated vs the CPU raycaster (2464 samples, 0 disagree).
+- Phase 1b-ii shader path IN: shared voxel_ray_query primitive extracted to
+  shaders/rt_voxel_query.wgsl (used by BOTH the probe and the render shader). The
+  render shader routes ALL occlusion (sun shadows, god rays, sky-access AO)
+  through one `shadow_occluded` dispatcher: the software variant forwards to the
+  DDA trace_any (byte-identical to the pre-RT shader + a tiny wrapper), the RT
+  variant (raymarch_source_variant(true)) enables wgpu_ray_query, binds the world
+  TLAS/brick_map/aabbs at group0 22..24 and forwards to rt_occluded. Both
+  variants naga-validate (proves cross-file WGSL forward refs resolve). Not yet
+  wired to a pipeline - that is next.
+  NEXT Phase 1b-iii: build the RT compute pipeline + bind group (TLAS + brick_map
+  + aabbs) in the HEADLESS harness and A/B render software-vs-RT occlusion (must
+  match within tolerance) before touching the windowed Renderer::new.

@@ -14,18 +14,54 @@ const WORLD_CONSTS_WGSL: &str = include_str!(concat!(env!("OUT_DIR"), "/world_co
 /// definition instead of a hand-maintained copy each. NOT used by physics/blit.
 const COMMON_WGSL: &str = include_str!("../shaders/common.wgsl");
 
+/// The shared in-brick DDA (`resolve_brick`) used by both the RT render path
+/// and the accel-probe test, and the RT occlusion prelude that binds the world
+/// acceleration structure. Only assembled into the RT shader variant.
+const RT_VOXEL_QUERY_WGSL: &str = include_str!("../shaders/rt_voxel_query.wgsl");
+const RT_SHADOW_WGSL: &str = include_str!("../shaders/rt_shadow.wgsl");
+
+/// Software `shadow_occluded` dispatcher: forwards every occlusion ray to the
+/// DDA `trace_any`. Injected into the non-RT variant so the render body's
+/// `shadow_occluded(...)` calls resolve identically to the pre-RT `trace_any(...)`.
+const SHADOW_SW_WGSL: &str =
+    "fn shadow_occluded(o: vec3<f32>, d: vec3<f32>, m: f32) -> bool { return trace_any(o, d, m); }\n";
+
 /// Full raymarch shader source: world consts + common prelude + the sprite
 /// atlas consts generated from `src/sprites.rs` + the shader body. The ONE
 /// assembly point shared by the pipeline, the naga validation test and the
 /// GPU test harness, so what is validated/tested is what runs.
+///
+/// `rt` selects the hardware-ray-tracing variant: it enables `wgpu_ray_query`,
+/// binds the world acceleration structure and routes `shadow_occluded` through
+/// the RT core. The software variant is byte-identical to the pre-RT shader plus
+/// the tiny forwarding dispatcher, so a non-RT GPU renders exactly as before.
+pub(crate) fn raymarch_source_variant(rt: bool) -> String {
+    if rt {
+        format!(
+            "enable wgpu_ray_query;\n{}\n{}\n{}\n{}\n{}\n{}",
+            WORLD_CONSTS_WGSL,
+            COMMON_WGSL,
+            crate::sprites::wgsl_consts(),
+            RT_VOXEL_QUERY_WGSL,
+            RT_SHADOW_WGSL,
+            include_str!("../shaders/raymarch.wgsl"),
+        )
+    } else {
+        format!(
+            "{}\n{}\n{}\n{}\n{}",
+            WORLD_CONSTS_WGSL,
+            COMMON_WGSL,
+            crate::sprites::wgsl_consts(),
+            include_str!("../shaders/raymarch.wgsl"),
+            SHADOW_SW_WGSL,
+        )
+    }
+}
+
+/// Software (non-RT) raymarch source. Kept as the name the existing pipeline,
+/// validation test and GPU harness call.
 pub(crate) fn raymarch_source() -> String {
-    format!(
-        "{}\n{}\n{}\n{}",
-        WORLD_CONSTS_WGSL,
-        COMMON_WGSL,
-        crate::sprites::wgsl_consts(),
-        include_str!("../shaders/raymarch.wgsl")
-    )
+    raymarch_source_variant(false)
 }
 
 /// Pack a Vec<u8> into Vec<u32> for storage-buffer upload (WGSL storage
@@ -1752,6 +1788,17 @@ mod shader_tests {
     fn raymarch_wgsl_valid() {
         let src = raymarch_source();
         validate("raymarch.wgsl", &src);
+    }
+
+    #[test]
+    fn raymarch_rt_wgsl_valid() {
+        // The RT variant enables wgpu_ray_query, binds the acceleration
+        // structure and routes shadow_occluded through the RT core. Validating
+        // it here proves the assembled WGSL is well-formed (incl. the cross-file
+        // forward references to brick_voxel_solid / bricks) without a GPU;
+        // Capabilities::all() covers RAY_QUERY.
+        let src = super::raymarch_source_variant(true);
+        validate("raymarch.wgsl (RT)", &src);
     }
 
     #[test]
