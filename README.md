@@ -3,7 +3,8 @@
 A real-time voxel engine in Rust where the entire world is rendered by a WGSL compute shader. There is no
 triangle geometry for terrain: each frame, rays are marched through a three-level occupancy-bit pyramid
 (chunk → tile → brick) directly on the GPU, and a fullscreen-triangle blit presents the result. The same
-binary runs solo, as a headless server, or as a multiplayer client. Built on wgpu 23 and winit 0.30.
+binary runs solo, as a headless server, or as a multiplayer client. Built on wgpu (GitHub trunk, for
+experimental hardware ray tracing) and winit 0.30.
 
 ## Rendering
 
@@ -110,15 +111,27 @@ src/world_dims.rs      world dimension constants (also emits shaders/world_const
 src/physics.rs         sand / 8-level water / smoke cellular automata (CPU)
 src/temporal.rs        dirty-brick -> screen-tile projection for partial re-render
 src/raycast.rs         CPU DDA for block picking (destroy/place)
+src/accel.rs           builds the hardware-RT acceleration structure from the world (opt-in)
 src/net.rs             TCP client + server over lock-free channels
 src/camera.rs          fly camera
 shaders/beam.wgsl      1/8-resolution first-hit depth pre-pass
 shaders/raymarch.wgsl  primary tracer and all shading (~2000 lines)
+shaders/rt_voxel_query.wgsl  shared in-brick DDA (resolve_brick) for the RT path
+shaders/rt_shadow.wgsl RT any-hit occlusion (shadows / AO / god rays); opt-in
 shaders/taa.wgsl       temporal anti-aliasing resolve
 shaders/physics.wgsl   GPU compute port of the cellular-automaton physics (in progress; see docs/gpu-physics-design.md)
 shaders/blit.wgsl      fullscreen-triangle present + crosshair
 shaders/world_consts.wgsl  generated dimension constants (from src/world_dims.rs)
 ```
+
+### Hardware ray tracing (experimental, opt-in)
+
+Occlusion rays (sun shadows, sky-access AO, god rays) can be traced by the GPU's RT cores instead of the
+software hierarchical DDA. Set `VOXELG_RT=1` on a ray-query-capable adapter to enable it; unset, the
+engine is byte-identical to the software renderer, which remains the default. One AABB per non-empty
+brick goes into a BLAS (the RT core skips empty space in hardware); a small in-brick DDA
+(`shaders/rt_voxel_query.wgsl`) resolves the exact voxel, sharing one occluder rule (`shadow_voxel_occludes`)
+with the software path so the two render identically. Progress and design notes live in `docs/rt/WORKLOG.md`.
 
 ## Building and running
 
@@ -130,6 +143,7 @@ cargo run --release -- --server 7878        # headless server
 cargo run --release -- --connect host:7878  # join a server
 cargo run --release -- --freeze-time 40     # pin sun/water/wind at t=40s (value optional)
 cargo run --release -- --speed 4            # 4x fly speed
+VOXELG_RT=1 cargo run --release             # hardware-RT occlusion (ray-query GPU only; see below)
 ```
 
 Controls: WASD + Space/Shift to fly, Alt to sprint, mouse to look. Left click destroys a sphere, right
