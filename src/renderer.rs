@@ -4118,6 +4118,122 @@ mod gpu_render_tests {
         }
     }
 
+    /// Head-to-head GPU timing of the occlusion passes (cs_main + cs_transparent
+    /// + cs_compose) with SOFTWARE occlusion vs HARDWARE ray-tracing occlusion,
+    /// same scene and device. This is the measurement behind the whole RT rework:
+    /// do the RT cores make the shadow/AO rays cheaper than the software DDA?
+    /// Run with `cargo test --lib rt_vs_software_timing -- --nocapture --ignored`.
+    #[test]
+    #[ignore]
+    fn rt_vs_software_timing() {
+        let Some((device, queue, _gpu)) = rt_headless_device() else {
+            eprintln!("rt_vs_software_timing: no RT adapter, skipping");
+            return;
+        };
+        let (w, h) = (1920u32, 1080u32);
+        let mut world = World::new();
+        world.fill_demo_terrain();
+        let wo = world.world_origin_voxel();
+
+        // Shared group-0 bindings.
+        let cam0 = ab_camera(&world);
+        let cu0 = CameraUniform::from_camera(&cam0, w, h, 0.0, 0.0, wo, [0.0, 0.0], 0.0);
+        let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None, contents: bytemuck::bytes_of(&cu0),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let bricks_buf = storage(&device, "b", bytemuck::cast_slice(&world.bricks));
+        let tm = storage(&device, "tm", bytemuck::cast_slice(&world.tile_mask));
+        let cm = storage(&device, "cm", bytemuck::cast_slice(&world.chunk_mask));
+        let l4 = storage(&device, "l4", bytemuck::cast_slice(&world.l4_mask));
+        let bu = storage(&device, "bu", bytemuck::cast_slice(&pack_u8_to_u32(&world.brick_uniform)));
+        let tu = storage(&device, "tu", bytemuck::cast_slice(&pack_u8_to_u32(&world.tile_uniform)));
+        let palette = default_palette();
+        let palette_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None, contents: bytemuck::cast_slice(&palette),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let tw = (w + 7) / 8; let th = (h + 7) / 8;
+        let words = ((tw * th) as usize + 31) / 32;
+        let td = storage(&device, "td", bytemuck::cast_slice(&vec![u32::MAX; words]));
+        let players = storage(&device, "pl", &vec![0u8; 16 + MAX_REMOTE_PLAYERS * 16]);
+        let (_o, ov) = create_output_texture(&device, w, h);
+        let (_b, bv) = create_beam_texture(&device, w, h);
+        let (_c, csv, _csw) = create_cloud_texture(&device, w, h);
+        let csamp = device.create_sampler(&wgpu::SamplerDescriptor { mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
+        let (_li, liv) = create_lighting_texture(&device, w, h);
+        let (_lo, lov) = create_lighting_texture(&device, w, h);
+        let tpb = create_transp_buf(&device, w, h);
+        let spr = storage(&device, "spr", bytemuck::cast_slice(&crate::sprites::encoded()));
+        let (_d, dv) = create_depth_texture(&device, w, h);
+        let (_g, gv) = create_output_texture(&device, w, h);
+        let (_hh, hv) = create_output_texture(&device, w, h);
+        let (_dd, ddv) = create_depth_texture(&device, 1, 1);
+        let bgl = create_compute_bgl(&device);
+        // Main bg: output -> geom_tex; the geom_in/depth_in slots (20/21) point at
+        // unrelated textures (history/beam) so cs_main's write target is never
+        // also read - matches the live renderer's compute_bg.
+        let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &gv, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &dv, &hv, &bv);
+        let bg_compose = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &ov, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &ddv, &gv, &dv);
+
+        // Group-1 (RT).
+        let accel = crate::accel::build_world_accel(&device, &queue, &world);
+        let rt_bgl = create_rt_bgl(&device);
+        let rt_bg = make_rt_bg(&device, &rt_bgl, &accel);
+
+        // Pipelines: software (one group) and RT (two groups).
+        let sw_m = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(raymarch_source().into()) });
+        let sw_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
+        let rt_m = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(raymarch_source_variant(true).into()) });
+        let rt_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&bgl), Some(&rt_bgl)], immediate_size: 0 });
+        let mk = |m: &wgpu::ShaderModule, pl: &wgpu::PipelineLayout, e: &'static str| device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: Some(pl), module: m, entry_point: Some(e), compilation_options: Default::default(), cache: None });
+        let (sw_main, sw_transp, sw_compose) = (mk(&sw_m, &sw_pl, "cs_main"), mk(&sw_m, &sw_pl, "cs_transparent"), mk(&sw_m, &sw_pl, "cs_compose"));
+        let (rt_main, rt_transp, rt_compose) = (mk(&rt_m, &rt_pl, "cs_main"), mk(&rt_m, &rt_pl, "cs_transparent"), mk(&rt_m, &rt_pl, "cs_compose"));
+
+        // Foliage-heavy and terrain-overview cameras (occlusion cost differs a
+        // lot: dense canopy AO/shadow rays vs open terrain).
+        let (_wa, leaf_anchor, leaf_ground) = find_scene_anchors(&world);
+        let scenarios = [
+            ("terrain", ab_camera(&world)),
+            ("foliage", {
+                let mut c = Camera::new();
+                c.pos = glam::Vec3::new(clamp_anchor(leaf_anchor.x), leaf_ground as f32 + 14.0, clamp_anchor(leaf_anchor.y) - 30.0);
+                c.pitch = -0.35; c
+            }),
+        ];
+
+        for (name, cam) in &scenarios {
+            let cu = CameraUniform::from_camera(cam, w, h, 0.0, 0.0, wo, [0.0, 0.0], 0.0);
+            queue.write_buffer(&camera_buf, 0, bytemuck::bytes_of(&cu));
+            let run = |main: &wgpu::ComputePipeline, transp: &wgpu::ComputePipeline, compose: &wgpu::ComputePipeline, rt: bool| -> f64 {
+                let encode = || {
+                    let mut e = device.create_command_encoder(&Default::default());
+                    for (pipe, bind) in [(main, &bg), (transp, &bg), (compose, &bg_compose)] {
+                        let mut cp = e.begin_compute_pass(&Default::default());
+                        cp.set_pipeline(pipe);
+                        cp.set_bind_group(0, bind, &[]);
+                        if rt { cp.set_bind_group(1, &rt_bg, &[]); }
+                        cp.dispatch_workgroups(tw, th, 1);
+                    }
+                    e.finish()
+                };
+                for _ in 0..5 { queue.submit(std::iter::once(encode())); }
+                device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+                let n = 60;
+                let t0 = std::time::Instant::now();
+                for _ in 0..n { queue.submit(std::iter::once(encode())); }
+                device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+                t0.elapsed().as_secs_f64() * 1000.0 / n as f64
+            };
+            let sw_ms = run(&sw_main, &sw_transp, &sw_compose, false);
+            let rt_ms = run(&rt_main, &rt_transp, &rt_compose, true);
+            eprintln!(
+                "rt_vs_software_timing [{name}] {w}x{h}: software {sw_ms:.2} ms  |  RT {rt_ms:.2} ms  |  RT is {:.2}x software",
+                sw_ms / rt_ms
+            );
+        }
+    }
+
     /// Time the raymarch + deferred-transparent dispatches at 1920x1080 for
     /// three scenarios: a high terrain overview, a water-heavy view, and a
     /// foliage-heavy view (found by scanning the demo world), so water and

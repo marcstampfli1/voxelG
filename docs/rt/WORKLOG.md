@@ -95,3 +95,10 @@ Architecture + rules: see the plan (scratchpad draft) and memory project-voxelg-
   a Documentation PR fixing `BlasAabbGeometry`'s stale `size.stride` reference +
   documenting the AABB buffer layout. Branch in ~/wgpu-contrib, patch + PR body in
   the repo. A dead-variant-removal candidate is flagged there for a maintainer call.
+- PERF MEASURED (headless, RTX 5060, `rt_vs_software_timing`, 1920x1080, occlusion
+  passes cs_main+cs_transparent+cs_compose): RT occlusion is ~1.26x faster on open
+  terrain (16.5 -> 13.1 ms) and ~1.29x on dense foliage (18.5 -> 14.3 ms). So the RT
+  cores DO make the shadow/AO rays cheaper - a real frame-level win from
+  accelerating occlusion alone. The big multiplier the pivot imagined lives in the
+  PRIMARY trace (still the software DDA); RT-accelerating primary rays is Phase 4 and
+  where most of the remaining speedup is. (Windowed fps is the user's own next check.)
