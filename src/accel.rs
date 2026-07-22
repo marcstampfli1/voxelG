@@ -226,6 +226,7 @@ mod tests {
     /// acceleration-structure limits, which default to 0). Returns None when the
     /// adapter can't ray-trace, so the suite stays green on non-RT machines.
     fn rt_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let _init = crate::gpu_init_serial();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
             ..wgpu::InstanceDescriptor::new_without_display_handle_from_env()

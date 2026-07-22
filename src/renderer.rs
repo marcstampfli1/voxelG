@@ -1798,6 +1798,7 @@ mod gpu_render_tests {
     use wgpu::util::DeviceExt;
 
     fn headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let _init = crate::gpu_init_serial();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
             ..wgpu::InstanceDescriptor::new_without_display_handle_from_env()
