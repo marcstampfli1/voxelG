@@ -1,0 +1,52 @@
+From 56e36ae1dc1357be892967c90fad6b57b6341564 Mon Sep 17 00:00:00 2001
+From: mstampfli <marc.kurt.stampfli@icloud.com>
+Date: Wed, 22 Jul 2026 11:13:54 +0200
+Subject: [PATCH] Remove never-constructed CreateBlasError::InvalidAabbStride
+
+create_blas takes no stride, so this variant could never be produced -
+AABB stride is validated only at build time, as
+BuildAccelerationStructureError::InvalidAabbStride. Drop the dead variant
+and its WebGpuError match arm.
+---
+ CHANGELOG.md                 | 1 +
+ wgpu-core/src/ray_tracing.rs | 5 +----
+ 2 files changed, 2 insertions(+), 4 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 74fd2d520..dbe3d80ce 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -68,6 +68,7 @@ Bottom level categories:
+ - Validate pipeline layout `immediate_size` and fix its calculation when there are multiple immediate variables. Now it must be >= required size of the shader entry point. By @beicause in [#9711](https://github.com/gfx-rs/wgpu/pull/9711).
+ - [`immediate_address_space`](https://www.w3.org/TR/WGSL/#language_extension-immediate_address_space) WGSL language extension is implemented. By @beicause in [#9711](https://github.com/gfx-rs/wgpu/pull/9711).
+ - `TextureFormat::is_srgb()` has been renamed to `TextureFormat::has_srgb_suffix()` to clarify its function. By @kpreid in [#9758](https://github.com/gfx-rs/wgpu/pull/9758).
++- Remove the never-constructed `CreateBlasError::InvalidAabbStride` variant. `create_blas` takes no stride, so it could never be produced; AABB stride is validated at build time as `BuildAccelerationStructureError::InvalidAabbStride`. By @mstampfli in [#9998](https://github.com/gfx-rs/wgpu/pull/9998).
+ 
+ #### naga
+ 
+diff --git a/wgpu-core/src/ray_tracing.rs b/wgpu-core/src/ray_tracing.rs
+index 941758d56..c75031f73 100644
+--- a/wgpu-core/src/ray_tracing.rs
++++ b/wgpu-core/src/ray_tracing.rs
+@@ -48,8 +48,6 @@ pub enum CreateBlasError {
+         "Limit `max_blas_primitive_count` is {0}, but the BLAS had a maximum of {1} primitives"
+     )]
+     TooManyPrimitives(u32, u32),
+-    #[error("AABB geometry stride {0} is invalid (must be >= {1} and a multiple of 8)")]
+-    InvalidAabbStride(BufferAddress, BufferAddress),
+ }
+ 
+ impl WebGpuError for CreateBlasError {
+@@ -60,8 +58,7 @@ impl WebGpuError for CreateBlasError {
+             Self::MissingIndexData
+             | Self::InvalidVertexFormat(..)
+             | Self::TooManyGeometries(..)
+-            | Self::TooManyPrimitives(..)
+-            | Self::InvalidAabbStride(..) => ErrorType::Validation,
++            | Self::TooManyPrimitives(..) => ErrorType::Validation,
+         }
+     }
+ }
+-- 
+2.47.3
+

@@ -44,13 +44,36 @@ PR body to paste:
 > **Squash or Rebase?**
 > Squash.
 
-## Candidate (not prepared - needs a maintainer decision)
+## PR 2 - remove the dead `CreateBlasError::InvalidAabbStride` variant
 
-**Remove the dead `CreateBlasError::InvalidAabbStride` variant.** It is declared
-(`wgpu-core/src/ray_tracing.rs:52`) and matched in the `WebGpuError` impl (line 64)
-but is NEVER constructed: `create_blas` takes no stride, so a stride error is
-impossible there - the real check is `BuildAccelerationStructureError::InvalidAabbStride`
-at build time (`wgpu-core/src/command/ray_tracing.rs:1086`). Removing it is a small
-cleanup but a breaking change to a public (experimental) error enum, so it wants a
-maintainer's call (remove vs. keep reserved) and a run of wgpu's test gate before
-proposing. Left as a note rather than a blind breaking PR.
+- Branch: `cleanup/remove-dead-createblaserror-aabb-stride` (in `~/wgpu-contrib`).
+- Patch: [`0002-remove-dead-createblaserror-variant.patch`](0002-remove-dead-createblaserror-variant.patch).
+- Status: READY, `cargo check -p wgpu-core` clean. Note this removes a public
+  (experimental) error variant, a technically-breaking change, so a maintainer may
+  prefer to keep it reserved - the PR body says so and offers that alternative.
+
+The variant is declared and matched in the `WebGpuError` impl but NEVER constructed:
+`create_blas` takes no stride, so a stride error is impossible there - the real check
+is `BuildAccelerationStructureError::InvalidAabbStride` at build time
+(`wgpu-core/src/command/ray_tracing.rs`). Only two references exist (both in
+`wgpu-core/src/ray_tracing.rs`), both removed.
+
+PR body to paste:
+
+> **Connections**
+> None.
+>
+> **Description**
+> `CreateBlasError::InvalidAabbStride` is declared and handled in the `WebGpuError`
+> impl but is never constructed. `create_blas` has no stride input, so a stride
+> error cannot originate there; AABB stride is validated only at build time as
+> `BuildAccelerationStructureError::InvalidAabbStride`. This drops the dead variant
+> and its match arm. It is a (technically breaking) removal from an experimental
+> API - happy to instead keep it as a reserved/`#[doc(hidden)]` variant if you would
+> rather not narrow the enum; let me know your preference.
+>
+> **Testing**
+> `cargo check -p wgpu-core` passes; no other references to the variant exist.
+>
+> **Squash or Rebase?**
+> Squash.
