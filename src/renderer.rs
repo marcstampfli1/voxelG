@@ -20,6 +20,7 @@ const COMMON_WGSL: &str = include_str!("../shaders/common.wgsl");
 const RT_VOXEL_QUERY_WGSL: &str = include_str!("../shaders/rt_voxel_query.wgsl");
 const RT_SHADOW_WGSL: &str = include_str!("../shaders/rt_shadow.wgsl");
 const RT_GI_WGSL: &str = include_str!("../shaders/rt_gi.wgsl");
+const RT_PRIMARY_WGSL: &str = include_str!("../shaders/rt_primary.wgsl");
 
 /// Software dispatchers injected into the non-RT variant so the render body's
 /// `shadow_occluded(...)` and `indirect_light(...)` calls resolve to the
@@ -28,6 +29,7 @@ const RT_GI_WGSL: &str = include_str!("../shaders/rt_gi.wgsl");
 const SHADOW_SW_WGSL: &str = concat!(
     "fn shadow_occluded(o: vec3<f32>, d: vec3<f32>, m: f32) -> bool { return trace_any(o, d, m); }\n",
     "fn indirect_light(p: vec3<f32>, n: vec3<f32>, seed: f32, px: vec2<i32>, t: f32) -> vec3<f32> { return vec3<f32>(0.0); }\n",
+    "fn rt_primary_or_none(origin: vec3<f32>, dir: vec3<f32>, done: ptr<function, bool>) -> Hit { *done = false; var h: Hit; h.hit = false; h.mat = 0u; h.normal = vec3<f32>(0.0); h.voxel = vec3<i32>(0); h.last_axis = -1; h.t_hit = 0.0; h.tint = vec3<f32>(1.0); return h; }\n",
 );
 
 /// Full raymarch shader source: world consts + common prelude + the sprite
@@ -42,13 +44,14 @@ const SHADOW_SW_WGSL: &str = concat!(
 pub(crate) fn raymarch_source_variant(rt: bool) -> String {
     if rt {
         format!(
-            "enable wgpu_ray_query;\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            "enable wgpu_ray_query;\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
             WORLD_CONSTS_WGSL,
             COMMON_WGSL,
             crate::sprites::wgsl_consts(),
             RT_VOXEL_QUERY_WGSL,
             RT_SHADOW_WGSL,
             RT_GI_WGSL,
+            RT_PRIMARY_WGSL,
             include_str!("../shaders/raymarch.wgsl"),
         )
     } else {
@@ -4255,9 +4258,13 @@ mod gpu_render_tests {
         // RT with GI off: measure the OCCLUSION path against software apples-to-apples.
         let gi_off: &[(&'static str, f64)] = &[("GI_ENABLE", 0.0)];
         let gi_on: &[(&'static str, f64)] = &[("GI_ENABLE", 1.0)];
+        // RT primary trace on the RT cores (GI off, so this isolates the primary
+        // traversal cost against the software beam+DDA).
+        let rtp: &[(&'static str, f64)] = &[("GI_ENABLE", 0.0), ("RT_PRIMARY", 1.0)];
         let (rt_main, rt_transp, rt_compose) = (mk(&rt_m, &rt_pl, "cs_main", gi_off), mk(&rt_m, &rt_pl, "cs_transparent", gi_off), mk(&rt_m, &rt_pl, "cs_compose", gi_off));
         // RT with GI on: the one-bounce indirect cost on top.
         let (gi_main, gi_transp, gi_compose) = (mk(&rt_m, &rt_pl, "cs_main", gi_on), mk(&rt_m, &rt_pl, "cs_transparent", gi_on), mk(&rt_m, &rt_pl, "cs_compose", gi_on));
+        let (rtp_main, rtp_transp, rtp_compose) = (mk(&rt_m, &rt_pl, "cs_main", rtp), mk(&rt_m, &rt_pl, "cs_transparent", rtp), mk(&rt_m, &rt_pl, "cs_compose", rtp));
 
         // Foliage-heavy and terrain-overview cameras (occlusion cost differs a
         // lot: dense canopy AO/shadow rays vs open terrain).
@@ -4297,9 +4304,10 @@ mod gpu_render_tests {
             let sw_ms = run(&sw_main, &sw_transp, &sw_compose, false);
             let rt_ms = run(&rt_main, &rt_transp, &rt_compose, true);
             let gi_ms = run(&gi_main, &gi_transp, &gi_compose, true);
+            let rtp_ms = run(&rtp_main, &rtp_transp, &rtp_compose, true);
             eprintln!(
-                "rt_vs_software_timing [{name}] {w}x{h}: software {sw_ms:.2} ms  |  RT-occl {rt_ms:.2} ms ({:.2}x)  |  RT+1bounce-GI {gi_ms:.2} ms ({:.2}x sw)",
-                sw_ms / rt_ms, sw_ms / gi_ms
+                "rt_vs_software_timing [{name}] {w}x{h}: software {sw_ms:.2} ms  |  RT-occl {rt_ms:.2} ms ({:.2}x)  |  RT-primary {rtp_ms:.2} ms ({:.2}x sw)  |  RT+GI {gi_ms:.2} ms ({:.2}x sw)",
+                sw_ms / rt_ms, sw_ms / rtp_ms, sw_ms / gi_ms
             );
         }
     }

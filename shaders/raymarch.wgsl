@@ -540,14 +540,21 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // render an opaque wall in our face.
     let cam_in_water = camera_in_water();
     var hit: Hit;
-    if (cam_in_water) {
-        // Skip beam-skip when underwater — beam pre-pass doesn't know about
-        // the camera being inside water and may have advanced past real geo.
-        hit = trace_no_water(camera.origin, dir);
-    } else {
-        hit = trace(ray_origin, dir);
-        if (hit.hit) {
-            hit.t_hit = hit.t_hit + beam_skip;
+    // Hardware-RT primary (RT variant, RT_PRIMARY override): the RT core does
+    // the empty-space traversal. Off by default; falls through to the software
+    // beam + hierarchical DDA below.
+    var rt_done = false;
+    hit = rt_primary_or_none(camera.origin, dir, &rt_done);
+    if (!rt_done) {
+        if (cam_in_water) {
+            // Skip beam-skip when underwater — beam pre-pass doesn't know about
+            // the camera being inside water and may have advanced past real geo.
+            hit = trace_no_water(camera.origin, dir);
+        } else {
+            hit = trace(ray_origin, dir);
+            if (hit.hit) {
+                hit.t_hit = hit.t_hit + beam_skip;
+            }
         }
     }
     var col: vec3<f32>;
