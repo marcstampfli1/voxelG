@@ -2643,6 +2643,66 @@ mod gpu_render_tests {
         }
     }
 
+    /// Cloud-shadow feature guard: over a flat plain with the sun frozen,
+    /// patch-scale ground shade must DRIFT when only cloud time advances -
+    /// the one signal that separates real cloud shadows from static ground
+    /// texture (which cancels in the frame diff) and from god-ray jitter
+    /// (which block-averaging removes). The single-frame spatial std is
+    /// printed but NOT asserted: the grass texture's own patchiness makes
+    /// it non-discriminating (measured 0.027 with no shadow system at
+    /// all). Fail-first drift: 0.0000 without the system; with it: see the
+    /// measured value in the assert margin.
+    #[test]
+    fn cloud_shadows_present_and_drifting() {
+        use crate::voxel::MAT_GRASS;
+        let mut world = World::new();
+        for z in 156..356u32 {
+            for x in 156..356u32 {
+                world.set_voxel(x, 60, z, MAT_GRASS);
+            }
+        }
+        let mut cam = Camera::new();
+        cam.pos = glam::Vec3::new(256.0, 140.0, 256.0);
+        cam.yaw = 0.0;
+        cam.pitch = -1.5;
+        let (w, h) = (960usize, 540usize);
+        let Some(a) = render_rgba_time_sun(&world, &cam, w as u32, h as u32, 30.0, 30.0) else {
+            eprintln!("no GPU adapter — skipping cloud shadow test");
+            return;
+        };
+        let b = render_rgba_time_sun(&world, &cam, w as u32, h as u32, 32.0, 30.0).unwrap();
+        let luma = |f: &[u8], x: usize, y: usize| {
+            let i = (y * w + x) * 4;
+            (f[i] as f32 + f[i + 1] as f32 + f[i + 2] as f32) / (3.0 * 255.0)
+        };
+        let (bw, bh) = (w / 16, h / 16);
+        let spatial_std = |f: &dyn Fn(usize, usize) -> f32| {
+            let mut means = Vec::with_capacity(bw * bh);
+            for by in 0..bh {
+                for bx in 0..bw {
+                    let mut sum = 0.0f32;
+                    for y in by * 16..by * 16 + 16 {
+                        for x in bx * 16..bx * 16 + 16 {
+                            sum += f(x, y);
+                        }
+                    }
+                    means.push(sum / 256.0);
+                }
+            }
+            let n = means.len() as f32;
+            let g = means.iter().sum::<f32>() / n;
+            (means.iter().map(|m| (m - g) * (m - g)).sum::<f32>() / n).sqrt()
+        };
+        let shade = spatial_std(&|x, y| luma(&a, x, y));
+        let drift = spatial_std(&|x, y| luma(&b, x, y) - luma(&a, x, y));
+        eprintln!("cloud shadow spatial std {shade:.4}, drift std {drift:.4}");
+        assert!(
+            drift > 0.004,
+            "no drifting cloud shade on the ground (drift std {drift:.4} <= 0.004): \
+             either shadows are missing or they do not move with the clouds"
+        );
+    }
+
     /// Isolated material bench: a stone plain with a 4x4x4 cube of every
     /// textured material in two sunlit rows, for tuning the procedural
     /// block textures against one view.

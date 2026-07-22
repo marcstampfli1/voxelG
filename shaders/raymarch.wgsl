@@ -654,6 +654,32 @@ fn cs_compose(@builtin(global_invocation_id) gid: vec3<u32>) {
     let uv = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5) + camera.jitter) / camera.resolution;
     let dir = ray_dir_uv(uv);
 
+    // Density-driven cloud shadows: every ground pixel samples the SAME
+    // cloud_density field the sky pass renders, along the sun ray through
+    // the slab (one IGN-jittered sample; TAA averages the penumbra over
+    // frames). Denser cloud overhead = deeper shade, and the shadow field
+    // drifts with the clouds by construction - it can never disagree with
+    // what is visibly above. Per-frame full-screen only (mechanism rule):
+    // this term animates every frame and must never enter a tile-gated
+    // pass. Skipped for near-horizontal sun (shadows would race across
+    // the map) and scaled by sun intensity so night is untouched.
+    if (t_hit < 1.0e8) {
+        let s = sun_dir();
+        let s_int = sun_intensity(s);
+        if (s_int > 0.0 && s.y > 0.05) {
+            let p_ground = camera.origin + dir * t_hit;
+            let st_in = (CLOUD_BASE - p_ground.y) / s.y;
+            let st_out = (CLOUD_TOP - p_ground.y) / s.y;
+            if (st_in > 0.0) {
+                let jj = ign(f32(gid.x), f32(gid.y), camera.time * 60.0 + 17.0);
+                let ps = p_ground + s * mix(st_in, st_out, 0.15 + 0.7 * jj);
+                let d = cloud_density(ps, camera.time);
+                let occl = 1.0 - exp(-d * 3.0);
+                col = col * (1.0 - occl * 0.42 * s_int);
+            }
+        }
+    }
+
     let uv_cloud = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5)) / camera.resolution;
     let clouds = textureSampleLevel(cloud_in, cloud_samp, uv_cloud, 0.0);
     if (t_hit >= cloud_slab_near(dir)) {
