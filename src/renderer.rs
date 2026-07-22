@@ -1862,7 +1862,16 @@ mod gpu_render_tests {
     }
 
     fn render_rgba_at_time(world: &World, cam: &Camera, w: u32, h: u32, t: f32) -> Option<Vec<u8>> {
-        render_rgba_full(world, cam, w, h, &[], t)
+        render_rgba_full(world, cam, w, h, &[], t, t)
+    }
+
+    /// Animation time and sun time decoupled (the --freeze-time split):
+    /// temporal probes advance wind/waves while holding every sun-dependent
+    /// term (shadow edges, god rays, sky) bit-stable.
+    fn render_rgba_time_sun(
+        world: &World, cam: &Camera, w: u32, h: u32, t: f32, sun_t: f32,
+    ) -> Option<Vec<u8>> {
+        render_rgba_full(world, cam, w, h, &[], t, sun_t)
     }
 
     /// render_rgba plus injected falling-leaf instances, drawn by the real
@@ -1871,16 +1880,16 @@ mod gpu_render_tests {
     fn render_rgba_ext(
         world: &World, cam: &Camera, w: u32, h: u32, leaves: &[crate::leaffall::LeafInstance],
     ) -> Option<Vec<u8>> {
-        render_rgba_full(world, cam, w, h, leaves, 0.0)
+        render_rgba_full(world, cam, w, h, leaves, 0.0, 0.0)
     }
 
     fn render_rgba_full(
         world: &World, cam: &Camera, w: u32, h: u32, leaves: &[crate::leaffall::LeafInstance],
-        t: f32,
+        t: f32, sun_t: f32,
     ) -> Option<Vec<u8>> {
         let (device, queue) = headless_device()?;
         let wo = world.world_origin_voxel();
-        let cu = CameraUniform::from_camera(cam, w, h, t, t, wo, [0.0, 0.0], 0.0);
+        let cu = CameraUniform::from_camera(cam, w, h, t, sun_t, wo, [0.0, 0.0], 0.0);
 
         let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("camera"),
@@ -2526,6 +2535,67 @@ mod gpu_render_tests {
             enc.write_header().unwrap().write_image_data(&rgba).unwrap();
             eprintln!("wrote {path}");
         }
+    }
+
+    /// Guard for the "shadows flying over the ground" artifact class: on
+    /// RIGID geometry (bare grass-top plain, nothing that can move) the
+    /// image must be temporally STILL when only animation time advances
+    /// (sun frozen via the time/sun split, so shadow edges and god rays are
+    /// bit-stable). Two frames 2 s apart are diffed in luma and averaged
+    /// over 16x16 blocks; the spatial std-dev of block means over the
+    /// plain-only crop must sit at the noise floor - any patch-scale
+    /// brightness field traveling across rigid ground (the old
+    /// `base *= 1.0 + sway` modulation and its normal-flutter cousins) is
+    /// the bug. The canopy band is reported unguarded: leaves really move
+    /// (card gust shear is geometry, not a shading field).
+    /// Measured (sun frozen): pre-fix plain crop 0.0066, post-fix 0.0017
+    /// (the residual is the per-frame god-ray jitter noise floor); canopy
+    /// band 0.0052 -> 0.0031. Threshold 0.004 sits between.
+    #[test]
+    fn no_field_scale_luma_waves() {
+        let world = build_leaf_lab_world();
+        let mut cam = Camera::new();
+        cam.pos = glam::Vec3::new(118.0, 79.0, 82.0);
+        cam.yaw = 0.0;
+        cam.pitch = -0.5;
+        let (w, h) = (960usize, 540usize);
+        let Some(a) = render_rgba_time_sun(&world, &cam, w as u32, h as u32, 30.0, 30.0) else {
+            eprintln!("no GPU adapter — skipping luma-wave probe");
+            return;
+        };
+        let b = render_rgba_time_sun(&world, &cam, w as u32, h as u32, 32.0, 30.0).unwrap();
+        let luma = |f: &[u8], x: usize, y: usize| {
+            let i = (y * w + x) * 4;
+            (f[i] as f32 + f[i + 1] as f32 + f[i + 2] as f32) / (3.0 * 255.0)
+        };
+        let (bw, bh) = (w / 16, h / 16);
+        let block_std = |rows: std::ops::Range<usize>| {
+            let mut means = Vec::new();
+            for by in rows {
+                for bx in 0..bw {
+                    let mut sum = 0.0f32;
+                    for y in by * 16..by * 16 + 16 {
+                        for x in bx * 16..bx * 16 + 16 {
+                            sum += luma(&b, x, y) - luma(&a, x, y);
+                        }
+                    }
+                    means.push(sum / 256.0);
+                }
+            }
+            let n = means.len() as f32;
+            let global = means.iter().sum::<f32>() / n;
+            (means.iter().map(|m| (m - global) * (m - global)).sum::<f32>() / n).sqrt()
+        };
+        // Bottom 30% of the frame: nearby bare plain in front of the tree
+        // row - rigid ground only. Upper band contains the canopies.
+        let plain = block_std(bh * 7 / 10..bh);
+        let canopy = block_std(0..bh * 7 / 10);
+        eprintln!("luma-wave spatial std: plain {plain:.4}, canopy band {canopy:.4}");
+        assert!(
+            plain < 0.004,
+            "traveling luma waves on rigid ground (plain spatial std {plain:.4} >= 0.004): \
+             a patch-scale brightness field is moving across geometry that cannot move"
+        );
     }
 
     /// Isolated material bench: a stone plain with a 4x4x4 cube of every

@@ -2466,44 +2466,36 @@ fn shade(
     else { ao = select(compute_ao(hit, origin, dir), 1.0, skip_ao); }
 
     // ---- swaying foliage ----
-    // Leaves and grass-tops perturb their shading normal with a wind field
-    // so they look animated even though the underlying voxel is rigid.
+    // Leaves and grass-tops flutter their shading normal with a wind-advected
+    // field. TWO hard rules, each a former "cloud shadow" artifact class
+    // (guard test: no_field_scale_luma_waves):
+    //  - NEVER modulate brightness (base) with a spatial field: field-scale
+    //    luma waves read as shadows flying over the terrain.
+    //  - The flutter field must be HIGH-frequency (wavelength ~1 voxel, i.e.
+    //    leaf-sized) at CONSTANT amplitude. Long wavelengths, or scaling the
+    //    amplitude by the traveling wind_gust envelope, re-create patch-scale
+    //    luma waves through the nonlinear n.l response. Gust energy belongs
+    //    to GEOMETRY (wind_offset card/quad shear), which moves silhouettes,
+    //    not shading fields.
     var n = hit.normal;
     if (is_foliage_mat(hit.mat)) {
-        // Wind shimmer via wind-advected gradient noise. NEVER a separable
-        // sin(x)*cos(z) product here: that IS a checkerboard lattice in
-        // brightness, and traveling with time it reads as a diffused
-        // checkerboard shadow drifting across every field and canopy - the
-        // artifact repeatedly blamed on cloud shadows.
         let t = camera.time;
         let wd = wind_dir_now();
-        let sway = (gnoise3(vec3<f32>(
-            (p_hit.x - wd.x * t * 2.2) * 0.09,
-            (p_hit.z - wd.y * t * 2.2) * 0.09,
-            t * 0.30,
-        )) * 2.0 - 1.0) * 1.4;
-        let gust = 0.5 + 0.5 * wind_gust(p_hit.xz, wd);
-        let amp = select(0.60, 0.75, hit.mat == MAT_FLOWER || hit.mat == MAT_TALL_GRASS
-                                   || hit.mat == MAT_TALL_GRASS_DRY) * gust;
+        let sway = gnoise3(vec3<f32>(
+            (p_hit.x - wd.x * t * 2.2) * 0.9,
+            (p_hit.z - wd.y * t * 2.2) * 0.9,
+            t * 0.8,
+        )) * 2.0 - 1.0;
+        let amp = select(0.35, 0.45, hit.mat == MAT_FLOWER || hit.mat == MAT_TALL_GRASS
+                                   || hit.mat == MAT_TALL_GRASS_DRY);
         n.x += sway * amp;
         n.z += sway * amp * 0.7;
         n = normalize(n);
-        base *= 1.0 + sway * 0.20 * gust;
-    } else if (hit.mat == MAT_GRASS && hit.normal.y > 0.5) {
-        let t = camera.time;
-        let wd = wind_dir_now();
-        let gust = 0.5 + 0.5 * wind_gust(p_hit.xz, wd);
-        // Same rule: organic advected noise, not a sin*cos lattice.
-        let sway = gnoise3(vec3<f32>(
-            (p_hit.x - wd.x * t * 2.2) * 0.12,
-            (p_hit.z - wd.y * t * 2.2) * 0.12,
-            t * 0.35,
-        )) * 2.0 - 1.0;
-        n.x += sway * 0.26 * gust;
-        n.z += sway * 0.24 * gust;
-        n = normalize(n);
-        base *= 1.0 + sway * 0.07 * gust;
     }
+    // Rigid cube tops (MAT_GRASS included) get NO flutter at all: any
+    // time-varying shading on geometry that visibly cannot move reads as a
+    // shadow passing over it. Grass motion is carried by the tall-grass
+    // cross-quad geometry standing ON the block, never by the block face.
 
     let s = sun_dir();
     let s_int = sun_intensity(s);
