@@ -8,7 +8,7 @@
 // TLAS, resolve_brick, shadow_occluded) and alongside raymarch.wgsl (palette,
 // sun_color, ambient_color, brick_voxel_material, sky_color).
 
-const GI_RAYS: i32 = 2;
+const GI_RAYS: i32 = 1;      // one fresh sample/frame; reprojection accumulates it
 const GI_DIST: f32 = 40.0;   // bounce ray reach (voxels); near light dominates
 const GI_STRENGTH: f32 = 1.0;
 const GI_SKY: f32 = 0.32;    // soft skylight fill (NOT a hard overhead emitter)
@@ -100,12 +100,52 @@ fn rt_gather_indirect(p: vec3<f32>, n: vec3<f32>, seed: f32) -> vec3<f32> {
     return (acc / f32(GI_RAYS)) * GI_STRENGTH;
 }
 
+// Temporal GI accumulation buffers (group 1, RT variant only). gi_in = last
+// frame's accumulated indirect; gi_out = this frame's. Reprojected with the same
+// proven position match as the shadow/AO cache (light_in stores the G-buffer
+// position), so a single fresh sample per frame converges to clean, cheap
+// indirect over a few frames - and disocclusion resets to fresh (no ghosting),
+// exactly like the shadow cache.
+@group(1) @binding(3) var gi_in: texture_2d<f32>;
+@group(1) @binding(4) var gi_out: texture_storage_2d<rgba32float, write>;
+
 // Pipeline-override toggle (1 = on). The game leaves it on; the occlusion-parity
 // A/B and any perf comparison set it to 0 to render RT with shadows/AO but no
 // one-bounce indirect, so RT still matches the software frame there.
 override GI_ENABLE: f32 = 1.0;
 
-fn indirect_light(p: vec3<f32>, n: vec3<f32>, seed: f32) -> vec3<f32> {
-    if (GI_ENABLE < 0.5) { return vec3<f32>(0.0); }
-    return rt_gather_indirect(p, n, seed);
+// Accumulated one-bounce indirect at world point `p` (surface normal `n`) for
+// output pixel `px`, hit distance `t`. Traces ONE fresh bounce this frame and
+// blends it with the reprojected previous-frame value.
+fn indirect_light(p: vec3<f32>, n: vec3<f32>, seed: f32, px: vec2<i32>, t: f32) -> vec3<f32> {
+    if (GI_ENABLE < 0.5 || t >= GI_MAX_T) {
+        textureStore(gi_out, px, vec4<f32>(0.0));
+        return vec3<f32>(0.0);
+    }
+    let fade = 1.0 - smoothstep(GI_MAX_T * 0.6, GI_MAX_T, t);
+    var acc = rt_gather_indirect(p, n, seed) * fade;
+
+    // Reproject into last frame; reuse the accumulated GI on a position match.
+    if (camera.reproject_lighting > 0.5) {
+        let hitpos_rel = p - vec3<f32>(camera.world_origin);
+        let d = p - camera.prev_origin;
+        let pz = dot(d, camera.prev_forward);
+        if (pz > 0.01) {
+            let aspect = camera.resolution.x / camera.resolution.y;
+            let ndc = vec2<f32>(dot(d, camera.prev_right) / (pz * camera.tan_half_fov * aspect),
+                                dot(d, camera.prev_up) / (pz * camera.tan_half_fov));
+            let uvp = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+            if (uvp.x >= 0.0 && uvp.x < 1.0 && uvp.y >= 0.0 && uvp.y < 1.0) {
+                let pc = vec2<i32>(uvp * camera.resolution);
+                let g = textureLoad(light_in, pc, 0);
+                let dpos = g.xyz - hitpos_rel;
+                if (dot(dpos, dpos) < REPROJ_EPS2) {
+                    let prev = textureLoad(gi_in, pc, 0).rgb;
+                    acc = mix(acc, prev, 0.9); // 90% history: ~10-frame convergence
+                }
+            }
+        }
+    }
+    textureStore(gi_out, px, vec4<f32>(acc, 1.0));
+    return acc;
 }

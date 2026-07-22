@@ -608,7 +608,10 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     }
                 }
             }
-            col = shade(hit, camera.origin, dir, pix_jitter, reuse, &light);
+            let gi_p = camera.origin + dir * hit.t_hit;
+            let indirect = indirect_light(gi_p, hit.normal, pix_jitter,
+                                          vec2<i32>(i32(gid.x), i32(gid.y)), hit.t_hit);
+            col = shade(hit, camera.origin, dir, pix_jitter, reuse, &light, indirect);
             if (cacheable) {
                 gbuf = vec4<f32>(hitpos_rel, bitcast<f32>(pack2x16float(light)));
             }
@@ -2601,7 +2604,7 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     let refl_hit = trace_no_water(refl_origin, refl_dir);
     var refl_col: vec3<f32>;
     if (refl_hit.hit) {
-        refl_col = shade(refl_hit, refl_origin, refl_dir, jit, false, &no_cache);
+        refl_col = shade(refl_hit, refl_origin, refl_dir, jit, false, &no_cache, vec3<f32>(0.0));
     } else {
         refl_col = sky(refl_dir);
     }
@@ -2616,7 +2619,7 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     let under = trace_no_water(refr_origin, refr_dir);
     var under_col: vec3<f32>;
     if (under.hit) {
-        under_col = shade(under, refr_origin, refr_dir, jit, false, &no_cache);
+        under_col = shade(under, refr_origin, refr_dir, jit, false, &no_cache, vec3<f32>(0.0));
     } else {
         under_col = sky(refr_dir) * 0.6;
     }
@@ -2745,7 +2748,7 @@ const GI_MAX_T: f32 = 90.0;
 
 fn shade(
     hit: Hit, origin: vec3<f32>, dir: vec3<f32>, pix_jit: f32,
-    reuse_light: bool, light: ptr<function, vec2<f32>>,
+    reuse_light: bool, light: ptr<function, vec2<f32>>, indirect: vec3<f32>,
 ) -> vec3<f32> {
     let p_hit = origin + dir * hit.t_hit;
     // Terrain top faces near the camera cross-fade their palette colour into
@@ -2862,15 +2865,8 @@ fn shade(
 
     let direct = sun_color(s) * (n_dot_l * shadow_term);
     let ambient = ambient_color() * ao;
-    // One-bounce indirect (RT variant only; the software dispatcher returns 0).
-    // Near pixels only - far indirect is tiny and fog hides it, and this is the
-    // most expensive per-pixel term. Fade it out over the last 40% of the range
-    // so there is no hard ring where GI abruptly stops.
-    var indirect = vec3<f32>(0.0);
-    let gi_fade = 1.0 - smoothstep(GI_MAX_T * 0.6, GI_MAX_T, hit.t_hit);
-    if (gi_fade > 0.0) {
-        indirect = indirect_light(p_hit, n, pix_jit) * gi_fade;
-    }
+    // One-bounce indirect passed in by the caller (temporally accumulated in
+    // cs_main for the RT variant; 0 for software and for secondary rays).
     let lit = base * (direct + ambient + indirect);
 
     let fog_t = clamp(hit.t_hit / 280.0, 0.0, 0.85);
@@ -2894,7 +2890,7 @@ fn shade_glass(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     let refl_hit = trace(refl_origin, refl_dir);
     var refl_col: vec3<f32>;
     if (refl_hit.hit) {
-        refl_col = shade(refl_hit, refl_origin, refl_dir, jit, false, &no_cache);
+        refl_col = shade(refl_hit, refl_origin, refl_dir, jit, false, &no_cache, vec3<f32>(0.0));
     } else {
         refl_col = sky(refl_dir);
     }
@@ -2927,7 +2923,7 @@ fn shade_glass(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
         // Near head-on: dispersion invisible — single trace, save 2/3 cost.
         let under = trace_no_water(refr_origin, refr_dir_g);
         var under_col: vec3<f32>;
-        if (under.hit) { under_col = shade(under, refr_origin, refr_dir_g, jit, false, &no_cache); }
+        if (under.hit) { under_col = shade(under, refr_origin, refr_dir_g, jit, false, &no_cache, vec3<f32>(0.0)); }
         else { under_col = sky(refr_dir_g); }
         let depth = max(0.0, under.t_hit);
         let tint = vec3<f32>(0.05, 0.02, 0.02) * depth;
@@ -2936,9 +2932,9 @@ fn shade_glass(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
         let ur = trace_no_water(refr_origin, refr_dir_r);
         let ug = trace_no_water(refr_origin, refr_dir_g);
         let ub = trace_no_water(refr_origin, refr_dir_b);
-        var cr = select(sky(refr_dir_r).r, shade(ur, refr_origin, refr_dir_r, jit, false, &no_cache).r, ur.hit);
-        var cg = select(sky(refr_dir_g).g, shade(ug, refr_origin, refr_dir_g, jit, false, &no_cache).g, ug.hit);
-        var cb = select(sky(refr_dir_b).b, shade(ub, refr_origin, refr_dir_b, jit, false, &no_cache).b, ub.hit);
+        var cr = select(sky(refr_dir_r).r, shade(ur, refr_origin, refr_dir_r, jit, false, &no_cache, vec3<f32>(0.0)).r, ur.hit);
+        var cg = select(sky(refr_dir_g).g, shade(ug, refr_origin, refr_dir_g, jit, false, &no_cache, vec3<f32>(0.0)).g, ug.hit);
+        var cb = select(sky(refr_dir_b).b, shade(ub, refr_origin, refr_dir_b, jit, false, &no_cache, vec3<f32>(0.0)).b, ub.hit);
         let depth_g = max(0.0, ug.t_hit);
         let tint = vec3<f32>(0.05, 0.02, 0.02) * depth_g;
         glass_col = vec3<f32>(cr, cg, cb) * exp(-tint);

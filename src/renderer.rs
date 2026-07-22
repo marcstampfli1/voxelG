@@ -27,7 +27,7 @@ const RT_GI_WGSL: &str = include_str!("../shaders/rt_gi.wgsl");
 /// one-bounce indirect (returns 0, the ambient-only look).
 const SHADOW_SW_WGSL: &str = concat!(
     "fn shadow_occluded(o: vec3<f32>, d: vec3<f32>, m: f32) -> bool { return trace_any(o, d, m); }\n",
-    "fn indirect_light(p: vec3<f32>, n: vec3<f32>, seed: f32) -> vec3<f32> { return vec3<f32>(0.0); }\n",
+    "fn indirect_light(p: vec3<f32>, n: vec3<f32>, seed: f32, px: vec2<i32>, t: f32) -> vec3<f32> { return vec3<f32>(0.0); }\n",
 );
 
 /// Full raymarch shader source: world consts + common prelude + the sprite
@@ -298,6 +298,14 @@ pub struct Renderer {
     // Signature the current accel was built for; the accel is rebuilt only when
     // it changes (brick set or window origin), not on every voxel edit.
     rt_accel_sig: u64,
+    // Temporal GI accumulation buffers (RT only). The shader reads gi_in and
+    // writes gi_out; after each frame gi_out is copied into gi_in for the next.
+    #[allow(dead_code)] // kept alive for the views bound in rt_bg
+    gi_in_tex: Option<wgpu::Texture>,
+    gi_in_view: Option<wgpu::TextureView>,
+    #[allow(dead_code)]
+    gi_out_tex: Option<wgpu::Texture>,
+    gi_out_view: Option<wgpu::TextureView>,
     transp_buf: wgpu::Buffer,
     #[allow(dead_code)] // kept alive for the view; the leaf pass reads the view
     depth_tex: wgpu::Texture,
@@ -677,10 +685,16 @@ impl Renderer {
             compute_pipeline_rt,
             compose_pipeline_rt,
             transparent_pipeline_rt,
+            gi_in_tex,
+            gi_in_view,
+            gi_out_tex,
+            gi_out_view,
         ) = if rt_shadows {
             let accel = crate::accel::build_world_accel(&device, &queue, world);
             let rt_bgl = create_rt_bgl(&device);
-            let rt_bg = make_rt_bg(&device, &rt_bgl, &accel);
+            let (gi_in_tex, gi_in_view) = create_lighting_texture(&device, width, height);
+            let (gi_out_tex, gi_out_view) = create_lighting_texture(&device, width, height);
+            let rt_bg = make_rt_bg(&device, &rt_bgl, &accel, &gi_in_view, &gi_out_view);
             let rt_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("rt compute pl"),
                 bind_group_layouts: &[Some(&compute_bgl), Some(&rt_bgl)],
@@ -707,9 +721,13 @@ impl Renderer {
                 Some(mk("cs_main", "raymarch pipeline (RT)")),
                 Some(mk("cs_compose", "compose pipeline (RT)")),
                 Some(mk("cs_transparent", "transparent pipeline (RT)")),
+                Some(gi_in_tex),
+                Some(gi_in_view),
+                Some(gi_out_tex),
+                Some(gi_out_view),
             )
         } else {
-            (None, None, None, None, None, None)
+            (None, None, None, None, None, None, None, None, None, None)
         };
 
         // -- half-res cloud pipeline (cs_clouds, same shader module) --
@@ -892,6 +910,7 @@ impl Renderer {
             rt_shadows, world_accel,
             rt_bgl, rt_bg, compute_pipeline_rt, compose_pipeline_rt, transparent_pipeline_rt,
             rt_accel_sig: if rt_shadows { accel_signature(world) } else { 0 },
+            gi_in_tex, gi_in_view, gi_out_tex, gi_out_view,
             transparent_pipeline, transp_buf, depth_tex, depth_view,
             geom_tex, geom_view, dummy_depth_tex, dummy_depth_view,
             compose_pipeline, compose_bg,
@@ -980,6 +999,18 @@ impl Renderer {
             &self.light_out_view,
         );
         self.blit_bg = make_blit_bg(&self.device, &self.blit_bgl, &self.resolve_view, &self.sampler);
+        // Recreate the temporal-GI buffers at the new size and rebuild rt_bg.
+        if self.rt_shadows {
+            let (git, giv) = create_lighting_texture(&self.device, rw, rh);
+            let (got, gov) = create_lighting_texture(&self.device, rw, rh);
+            if let (Some(bgl), Some(accel)) = (&self.rt_bgl, &self.world_accel) {
+                self.rt_bg = Some(make_rt_bg(&self.device, bgl, accel, &giv, &gov));
+            }
+            self.gi_in_tex = Some(git);
+            self.gi_in_view = Some(giv);
+            self.gi_out_tex = Some(got);
+            self.gi_out_view = Some(gov);
+        }
         // History texture is newly (re)created and uninitialised — skip the TAA
         // blend next frame so it isn't read as garbage.
         self.taa_reset = true;
@@ -1004,8 +1035,10 @@ impl Renderer {
             let sig = accel_signature(world);
             if sig != self.rt_accel_sig {
                 let accel = crate::accel::build_world_accel(&self.device, &self.queue, world);
-                if let Some(bgl) = &self.rt_bgl {
-                    self.rt_bg = Some(make_rt_bg(&self.device, bgl, &accel));
+                if let (Some(bgl), Some(giv_in), Some(giv_out)) =
+                    (&self.rt_bgl, &self.gi_in_view, &self.gi_out_view)
+                {
+                    self.rt_bg = Some(make_rt_bg(&self.device, bgl, &accel, giv_in, giv_out));
                 }
                 self.world_accel = Some(accel);
                 self.rt_accel_sig = sig;
@@ -1285,6 +1318,16 @@ impl Renderer {
                 let gx = (self.size.0 + 7) / 8;
                 let gy = (self.size.1 + 7) / 8;
                 cp.dispatch_workgroups(gx, gy, 1);
+            }
+            // ---- temporal GI: this frame's gi_out becomes next frame's gi_in ----
+            if self.rt_shadows {
+                if let (Some(gout), Some(gin)) = (&self.gi_out_tex, &self.gi_in_tex) {
+                    encoder.copy_texture_to_texture(
+                        wgpu::TexelCopyTextureInfo { texture: gout, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                        wgpu::TexelCopyTextureInfo { texture: gin, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                        wgpu::Extent3d { width: self.size.0, height: self.size.1, depth_or_array_layers: 1 },
+                    );
+                }
             }
             // ---- TAA resolve: raymarch output + history -> resolve ----
             {
@@ -1896,6 +1939,9 @@ pub(crate) fn create_rt_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 },
                 count: None,
             },
+            // Temporal GI accumulation: gi_in (last frame) + gi_out (this frame).
+            bgl_tex(3, false),
+            bgl_storage_tex(4, wgpu::TextureFormat::Rgba32Float),
         ],
     })
 }
@@ -1923,6 +1969,8 @@ pub(crate) fn make_rt_bg(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     accel: &crate::accel::WorldAccel,
+    gi_in_view: &wgpu::TextureView,
+    gi_out_view: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("rt bg (group 1)"),
@@ -1934,6 +1982,8 @@ pub(crate) fn make_rt_bg(
             },
             wgpu::BindGroupEntry { binding: 1, resource: accel.brick_map.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 2, resource: accel.aabb_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(gi_in_view) },
+            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(gi_out_view) },
         ],
     })
 }
@@ -2532,7 +2582,9 @@ mod gpu_render_tests {
         // ---- group-1 (RT) bindings, built from the live world ----
         let accel = crate::accel::build_world_accel(device, queue, &world);
         let rt_bgl = create_rt_bgl(device);
-        let rt_bg = make_rt_bg(device, &rt_bgl, &accel);
+        let (_gi_i, gi_iv) = create_lighting_texture(device, w, h);
+        let (_gi_o, gi_ov) = create_lighting_texture(device, w, h);
+        let rt_bg = make_rt_bg(device, &rt_bgl, &accel, &gi_iv, &gi_ov);
 
         // ---- pipelines ----
         let sw_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -4189,7 +4241,9 @@ mod gpu_render_tests {
         // Group-1 (RT).
         let accel = crate::accel::build_world_accel(&device, &queue, &world);
         let rt_bgl = create_rt_bgl(&device);
-        let rt_bg = make_rt_bg(&device, &rt_bgl, &accel);
+        let (_gi_i, gi_iv) = create_lighting_texture(&device, w, h);
+        let (_gi_o, gi_ov) = create_lighting_texture(&device, w, h);
+        let rt_bg = make_rt_bg(&device, &rt_bgl, &accel, &gi_iv, &gi_ov);
 
         // Pipelines: software (one group) and RT (two groups).
         let sw_m = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(raymarch_source().into()) });
