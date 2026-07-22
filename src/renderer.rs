@@ -2434,30 +2434,47 @@ mod gpu_render_tests {
         Some((device, queue, gpu))
     }
 
-    /// End-to-end A/B: render one cs_main frame with software occlusion and with
-    /// RT occlusion on the SAME scene, camera and device. The frames must be
-    /// nearly identical (only grazing shadow/AO rays may differ), proving the RT
-    /// path is wired correctly through the render shader - group-1 bindings, the
-    /// world_origin rebase, and the accel built from the live world.
-    #[test]
-    fn rt_shadows_match_software() {
-        let Some((device, queue, _gpu)) = rt_headless_device() else {
-            eprintln!("rt_shadows_match_software: no RT adapter, skipping");
-            return;
-        };
-        let (w, h) = (320u32, 200u32);
-        let mut world = World::new();
-        world.fill_demo_terrain();
+    /// Camera above terrain, tilted at the horizon (terrain + sky + shadows).
+    fn ab_camera(world: &World) -> Camera {
         let wo = world.world_origin_voxel();
-
         let mut cam = Camera::new();
         cam.pos.x = wo.x as f32 + 256.0;
         cam.pos.z = wo.z as f32 + 256.0;
         let s = crate::voxel::sample_terrain(cam.pos.x, cam.pos.z, world.seed);
         cam.pos.y = s.h as f32 + 30.0;
         cam.pitch = -0.35;
+        cam
+    }
+
+    /// End-to-end A/B: render one cs_main frame with software occlusion and with
+    /// RT occlusion on the SAME scene/camera/device. The frames must be nearly
+    /// identical (only grazing shadow/AO rays differ), proving the RT path is
+    /// wired correctly through the render shader - group-1 bindings, the
+    /// world_origin rebase, and the accel from the live world. Run at origin 0
+    /// AND a streamed (shifted) origin so the rebase is exercised in a full
+    /// frame, not just the isolated accel mapping.
+    #[test]
+    fn rt_shadows_match_software() {
+        let Some((device, queue, _gpu)) = rt_headless_device() else {
+            eprintln!("rt_shadows_match_software: no RT adapter, skipping");
+            return;
+        };
+        let mut w0 = World::new();
+        w0.fill_demo_terrain();
+        rt_ab_check(&device, &queue, &w0, &ab_camera(&w0), "origin0");
+
+        let mut ws = World::new();
+        ws.fill_demo_terrain();
+        ws.shift_origin(glam::IVec2::new(3, 5));
+        ws.process_pending_gen_blocking();
+        rt_ab_check(&device, &queue, &ws, &ab_camera(&ws), "shifted");
+    }
+
+    fn rt_ab_check(device: &wgpu::Device, queue: &wgpu::Queue, world: &World, cam: &Camera, label: &str) {
+        let (w, h) = (320u32, 200u32);
+        let wo = world.world_origin_voxel();
         let t = 30.0;
-        let cu = CameraUniform::from_camera(&cam, w, h, t, t, wo, [0.0, 0.0], 0.0);
+        let cu = CameraUniform::from_camera(cam, w, h, t, t, wo, [0.0, 0.0], 0.0);
 
         // ---- group-0 bindings (mirrors render_rgba_full) ----
         let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -2465,12 +2482,12 @@ mod gpu_render_tests {
             contents: bytemuck::bytes_of(&cu),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-        let bricks_buf = storage(&device, "bricks", bytemuck::cast_slice(&world.bricks));
-        let tile_mask_buf = storage(&device, "tile_mask", bytemuck::cast_slice(&world.tile_mask));
-        let chunk_mask_buf = storage(&device, "chunk_mask", bytemuck::cast_slice(&world.chunk_mask));
-        let l4_mask_buf = storage(&device, "l4_mask", bytemuck::cast_slice(&world.l4_mask));
-        let brick_uniform_buf = storage(&device, "bu", bytemuck::cast_slice(&pack_u8_to_u32(&world.brick_uniform)));
-        let tile_uniform_buf = storage(&device, "tu", bytemuck::cast_slice(&pack_u8_to_u32(&world.tile_uniform)));
+        let bricks_buf = storage(device, "bricks", bytemuck::cast_slice(&world.bricks));
+        let tile_mask_buf = storage(device, "tile_mask", bytemuck::cast_slice(&world.tile_mask));
+        let chunk_mask_buf = storage(device, "chunk_mask", bytemuck::cast_slice(&world.chunk_mask));
+        let l4_mask_buf = storage(device, "l4_mask", bytemuck::cast_slice(&world.l4_mask));
+        let brick_uniform_buf = storage(device, "bu", bytemuck::cast_slice(&pack_u8_to_u32(&world.brick_uniform)));
+        let tile_uniform_buf = storage(device, "tu", bytemuck::cast_slice(&pack_u8_to_u32(&world.tile_uniform)));
         let palette = default_palette();
         let palette_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("palette"),
@@ -2480,27 +2497,27 @@ mod gpu_render_tests {
         let tiles_w = (w + 7) / 8;
         let tiles_h = (h + 7) / 8;
         let words = ((tiles_w * tiles_h) as usize + 31) / 32;
-        let tile_dirty_buf = storage(&device, "tile_dirty", bytemuck::cast_slice(&vec![u32::MAX; words]));
-        let players_buf = storage(&device, "players", &vec![0u8; 16 + MAX_REMOTE_PLAYERS * 16]);
-        let (out_tex, output_view) = create_output_texture(&device, w, h);
-        let (_btex, beam_view) = create_beam_texture(&device, w, h);
-        let (_ctex, cloud_sampled_view, _cloud_storage_view) = create_cloud_texture(&device, w, h);
+        let tile_dirty_buf = storage(device, "tile_dirty", bytemuck::cast_slice(&vec![u32::MAX; words]));
+        let players_buf = storage(device, "players", &vec![0u8; 16 + MAX_REMOTE_PLAYERS * 16]);
+        let (out_tex, output_view) = create_output_texture(device, w, h);
+        let (_btex, beam_view) = create_beam_texture(device, w, h);
+        let (_ctex, cloud_sampled_view, _cloud_storage_view) = create_cloud_texture(device, w, h);
         let cloud_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("cloud samp"),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        let (_ltex, light_in_view) = create_lighting_texture(&device, w, h);
-        let (_ltex2, light_out_view) = create_lighting_texture(&device, w, h);
-        let transp_buf = create_transp_buf(&device, w, h);
-        let sprites_buf = storage(&device, "sprites", bytemuck::cast_slice(&crate::sprites::encoded()));
-        let (_dtex, depth_view) = create_depth_texture(&device, w, h);
-        let (_gtex, geom_view) = create_output_texture(&device, w, h);
-        let (_ddtex, dummy_depth_view) = create_depth_texture(&device, 1, 1);
-        let bgl = create_compute_bgl(&device);
+        let (_ltex, light_in_view) = create_lighting_texture(device, w, h);
+        let (_ltex2, light_out_view) = create_lighting_texture(device, w, h);
+        let transp_buf = create_transp_buf(device, w, h);
+        let sprites_buf = storage(device, "sprites", bytemuck::cast_slice(&crate::sprites::encoded()));
+        let (_dtex, depth_view) = create_depth_texture(device, w, h);
+        let (_gtex, geom_view) = create_output_texture(device, w, h);
+        let (_ddtex, dummy_depth_view) = create_depth_texture(device, 1, 1);
+        let bgl = create_compute_bgl(device);
         let bg = make_compute_bg(
-            &device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
+            device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
             &palette_buf, &output_view, &beam_view, &tile_dirty_buf, &players_buf,
             &brick_uniform_buf, &tile_uniform_buf, &l4_mask_buf,
             &cloud_sampled_view, &cloud_sampler, &light_in_view, &light_out_view, &transp_buf,
@@ -2508,9 +2525,9 @@ mod gpu_render_tests {
         );
 
         // ---- group-1 (RT) bindings, built from the live world ----
-        let accel = crate::accel::build_world_accel(&device, &queue, &world);
-        let rt_bgl = create_rt_bgl(&device);
-        let rt_bg = make_rt_bg(&device, &rt_bgl, &accel);
+        let accel = crate::accel::build_world_accel(device, queue, &world);
+        let rt_bgl = create_rt_bgl(device);
+        let rt_bg = make_rt_bg(device, &rt_bgl, &accel);
 
         // ---- pipelines ----
         let sw_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -2610,14 +2627,14 @@ mod gpu_render_tests {
         }
         let mean_abs = sum_abs / (n as f64 * 3.0);
         eprintln!(
-            "rt_shadows_match_software: mean|dRGB|={mean_abs:.3} max={max_abs} big(>24)={big}/{} sw_luma[{sw_luma_min}..{sw_luma_max}]",
+            "rt_shadows_match_software[{label}]: mean|dRGB|={mean_abs:.3} max={max_abs} big(>24)={big}/{} sw_luma[{sw_luma_min}..{sw_luma_max}]",
             n * 3
         );
         // The scene must actually have shading contrast (not a flat frame), else
         // the comparison proves nothing.
-        assert!(sw_luma_max as i32 - sw_luma_min as i32 > 60, "software frame has no contrast; A/B meaningless");
-        assert!(mean_abs < 3.0, "RT vs software frame differs too much: mean |dRGB| = {mean_abs:.3}");
-        assert!(big < n / 12, "too many large-diff channels ({big}) between RT and software");
+        assert!(sw_luma_max as i32 - sw_luma_min as i32 > 60, "[{label}] software frame has no contrast; A/B meaningless");
+        assert!(mean_abs < 3.0, "[{label}] RT vs software frame differs too much: mean |dRGB| = {mean_abs:.3}");
+        assert!(big < n / 12, "[{label}] too many large-diff channels ({big}) between RT and software");
     }
 
     #[test]

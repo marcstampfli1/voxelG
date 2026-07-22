@@ -42,7 +42,10 @@ pub struct GpuAabb {
 pub struct WorldAccel {
     pub blas: wgpu::Blas,
     pub tlas: wgpu::Tlas,
-    /// primitive_index -> brick_idx (u32), one entry per non-empty brick.
+    /// primitive_index -> STORAGE brick index (u32), one entry per non-empty
+    /// brick. Storage is toroidal, so this is the wrapped slot the shader reads
+    /// occupancy/material from, NOT the window-local position (that comes from
+    /// the AABB min in `aabb_buf`).
     pub brick_map: wgpu::Buffer,
     /// The packed AABBs, kept so the ray-query shader can read a candidate
     /// brick's window-local min directly (no brick-index decode needed).
@@ -60,7 +63,8 @@ pub fn adapter_supports_rt(adapter: &wgpu::Adapter) -> bool {
 /// Enumerate non-empty bricks into AABBs + the primitive->brick map, then build
 /// the BLAS and a single-instance TLAS. The device MUST have been created with
 /// `EXPERIMENTAL_RAY_QUERY` + `ExperimentalFeatures::enabled()` and the
-/// acceleration-structure limits (see `rt_device_limits`).
+/// acceleration-structure limits raised (they default to 0; the renderer passes
+/// `adapter.limits()` for the RT device, see `Renderer::new`).
 pub fn build_world_accel(device: &wgpu::Device, queue: &wgpu::Queue, world: &World) -> WorldAccel {
     // World-origin in brick units. Chunk streaming shifts x/z by whole storage
     // chunks (32 voxels = 8 bricks) and never shifts y, so this is exact.
