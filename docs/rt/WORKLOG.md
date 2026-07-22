@@ -80,5 +80,18 @@ Architecture + rules: see the plan (scratchpad draft) and memory project-voxelg-
   software by rt_shadows_match_software, which exercises this exact recipe.
   PENDING (user checkpoint): launch the windowed game with VOXELG_RT=1 to eyeball
   RT shadows live and MEASURE fps vs software (RT cores should pay off on the
-  shadow/AO rays). Then decide the flag's default. Perf note: the per-edit full
-  accel rebuild will stutter under heavy editing until the incremental refit lands.
+  shadow/AO rays). Then decide the flag's default.
+- Optimization: the accel is no longer rebuilt every edit frame - `accel_signature`
+  (FNV-1a of tile_mask + origin) gates it, so content-only edits (brick stays
+  non-empty) skip the rebuild entirely; only a brick-set/origin change triggers one.
+  A World-only test pins the premise. (Full rebuild on a real change is still the
+  scalable follow-up = incremental AS refit.)
+- Verify-all-angles: the RT-vs-software A/B now also runs at a STREAMED (shifted)
+  origin, exercising the render shader's world_origin rebase in a full frame
+  (mean |dRGB| 0.000 there). Test infra: GPU tests hold the serialization guard for
+  their whole duration (the driver SIGSEGVs on concurrent multi-device submission,
+  not just creation).
+- wgpu contribution (see docs/rt/wgpu-prs/): PREPARED (not opened, per the mandate)
+  a Documentation PR fixing `BlasAabbGeometry`'s stale `size.stride` reference +
+  documenting the AABB buffer layout. Branch in ~/wgpu-contrib, patch + PR body in
+  the repo. A dead-variant-removal candidate is flagged there for a maintainer call.

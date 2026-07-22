@@ -1,0 +1,63 @@
+From 5beab0ee2cffc2fc3cafac9c5bfbff4f4178d7d3 Mon Sep 17 00:00:00 2001
+From: mstampfli <marc.kurt.stampfli@icloud.com>
+Date: Wed, 22 Jul 2026 11:03:42 +0200
+Subject: [PATCH] docs: correct BlasAabbGeometry stride reference and document
+ AABB layout
+
+The BlasAabbGeometry doc referred to a size.stride field, but
+BlasAABBGeometrySizeDescriptor has no stride; the stride lives on
+BlasAabbGeometry itself. Point the docs at the right field and, while
+there, document the packed AABB buffer layout (each primitive is a
+minimum then a maximum corner, two consecutive vec3<f32>, the 24-byte
+AABB_GEOMETRY_MIN_STRIDE) which was only implied before.
+---
+ CHANGELOG.md         | 6 ++++++
+ wgpu/src/api/blas.rs | 8 +++++---
+ 2 files changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 74fd2d520..205dda33e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -100,6 +100,12 @@ Bottom level categories:
+ 
+ - Fixed signed integer `%` (and `%=`) returning the wrong result for negative operands in the GLSL (OpenGL/GLES) backend, e.g. `-1 % 768` yielding `255` instead of `-1`. GLSL's `%` is undefined when either operand is negative, so signed remainder is now lowered as `a - b * (a / b)`, matching the SPIR-V, HLSL, and Metal backends. By @mstampfli in [#9687](https://github.com/gfx-rs/wgpu/pull/9687).
+ 
++### Documentation
++
++#### General
++
++- Fix the `BlasAabbGeometry` docs to refer to the `stride` field instead of a nonexistent `size.stride`, and document the packed AABB buffer layout (each primitive a minimum then a maximum corner, two consecutive `vec3<f32>`). By @mstampfli in [#9999](https://github.com/gfx-rs/wgpu/pull/9999).
++
+ ### Dependency Updates
+ 
+ #### General
+diff --git a/wgpu/src/api/blas.rs b/wgpu/src/api/blas.rs
+index b9b8b31e5..29d7f0cf0 100644
+--- a/wgpu/src/api/blas.rs
++++ b/wgpu/src/api/blas.rs
+@@ -132,8 +132,8 @@ static_assertions::assert_impl_all!(BlasTriangleGeometry<'_>: WasmNotSendSync);
+ 
+ /// Definition for an axis-aligned bounding box geometry group for a bottom level acceleration structure.
+ ///
+-/// Buffer data must contain `size.primitive_count` primitives at `primitive_offset`, each `size.stride` bytes,
+-/// with `stride` at least [`AABB_GEOMETRY_MIN_STRIDE`] and a multiple of 8.
++/// Buffer data must contain `size.primitive_count` primitives at `primitive_offset`, each `stride` bytes
++/// apart, with `stride` at least [`AABB_GEOMETRY_MIN_STRIDE`] and a multiple of 8.
+ #[derive(Debug)]
+ pub struct BlasAabbGeometry<'a> {
+     /// Sub descriptor for the size defining attributes of this geometry.
+@@ -141,7 +141,9 @@ pub struct BlasAabbGeometry<'a> {
+     /// Stride in bytes between consecutive AABB primitives in the buffer (at least
+     /// [`AABB_GEOMETRY_MIN_STRIDE`], and must be a multiple of 8).
+     pub stride: wgt::BufferAddress,
+-    /// Buffer containing packed AABB primitives (layout determined by `size.stride`).
++    /// Buffer containing packed AABB primitives. Each primitive is a minimum corner
++    /// then a maximum corner, two consecutive `vec3<f32>` (24 bytes, the
++    /// [`AABB_GEOMETRY_MIN_STRIDE`]); consecutive primitives are `stride` bytes apart.
+     pub aabb_buffer: &'a Buffer,
+     /// Byte offset to the first AABB primitive (must be a multiple of 8).
+     pub primitive_offset: u32,
+-- 
+2.47.3
+
