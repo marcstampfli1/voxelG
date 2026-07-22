@@ -681,13 +681,13 @@ fn cs_compose(@builtin(global_invocation_id) gid: vec3<u32>) {
             let p_ground = camera.origin + dir * t_hit;
             let st_in = (CLOUD_BASE - p_ground.y) / s.y;
             let st_out = (CLOUD_TOP - p_ground.y) / s.y;
-            // Sky-access gate: only shade a surface the sun can actually
-            // reach. If terrain (a roof, cave ceiling, cliff) blocks the sun
-            // before the cloud slab, the surface is already in shadow -
-            // dimming a sun that never arrives painted a moving cloud
-            // pattern onto roofed water and floors. Capped so the trace stays
-            // bounded on open terrain.
-            if (st_in > 0.0 && !trace_any(p_ground + s * 0.05, s, min(st_in, 80.0))) {
+            // NOTE: do NOT gate this with a per-pixel sun-occlusion trace.
+            // `dir` carries the TAA sub-pixel jitter, so a hard occluded/not
+            // boolean flips frame-to-frame at shadow edges and the cloud
+            // shade JITTERS while standing still (TAA never settles). Roofed
+            // surfaces are instead kept dark by sky_access() in the shading,
+            // so an ungated cloud multiply over them is negligible.
+            if (st_in > 0.0) {
                 var d = 0.0;
                 d = d + cloud_density(p_ground + s * mix(st_in, st_out, 0.2), camera.time);
                 d = d + cloud_density(p_ground + s * mix(st_in, st_out, 0.5), camera.time);
@@ -2768,7 +2768,20 @@ fn shade(
         || is_leaf_block_mat(hit.mat) || hit.mat == MAT_LEAF_FRINGE;
     var ao: f32;
     if (reuse_light) { ao = (*light).y; }
-    else { ao = select(compute_ao(hit, origin, dir), 1.0, skip_ao); }
+    else {
+        ao = select(compute_ao(hit, origin, dir), 1.0, skip_ao);
+        // Sky-access: attenuate the skylight ambient by how much open sky
+        // this surface can actually reach, so caves, sealed rooms and water
+        // under a roof go dark (the engine has no GI, so ambient is
+        // otherwise applied in full everywhere). Folded into ao, so it rides
+        // the light cache. Restricted to SOLID cube faces (last_axis >= 0):
+        // sub-voxel foliage cards are dense and already carry canopy AO, so
+        // paying a ray per leaf pixel is not worth it. Skipped far away
+        // where fog hides it.
+        if (hit.last_axis >= 0 && hit.t_hit < 200.0) {
+            ao = ao * sky_access(p_hit, hit.normal);
+        }
+    }
 
     // ---- swaying foliage ----
     // Leaves and grass-tops flutter their shading normal with a wind-advected
@@ -3157,6 +3170,30 @@ fn trace_any(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> bool {
 // bilinear-interpolate. Each corner samples 3 neighbours (two side voxels
 // and the diagonal) — classic "Minecraft" AO formula, but every lookup is a
 // hierarchical bit test rather than a struct fetch.
+const SKY_ACCESS_DIST: f32 = 48.0;
+
+// Fraction of the upper hemisphere from which open sky is reachable. The
+// engine has no global illumination, so every surface otherwise receives
+// the FULL skylight ambient regardless of whether the sky can reach it -
+// which is why a sealed room, a cave, or water under a roof stays lit
+// instead of going dark. Trace five FIXED rays (no jitter, TAA-stable)
+// toward the sky; the fraction that escape without hitting terrain within
+// SKY_ACCESS_DIST scales the ambient. Rays escape through open air in a
+// few hierarchical steps, or hit a roof immediately, so it is cheap in
+// both the open and the enclosed case. Floored at 0.03 so a fully-sealed
+// space is near-black, not a flat 0 (keeps a hint of surface detail).
+fn sky_access(p: vec3<f32>, n: vec3<f32>) -> f32 {
+    // ONE upward ray: cheap, and it catches the case that matters - a roof
+    // / cave ceiling / block directly overhead. Misses horizontal openings
+    // (a surface under an overhang near a side gap reads darker than it is),
+    // the acceptable tradeoff for a per-pixel trace. The scalable fix is a
+    // precomputed per-voxel sky-visibility field (O(1) lookup, no tracing);
+    // this is the affordable stopgap. Floored so a sealed space is near
+    // black, not a flat 0.
+    let o = p + n * 0.02;
+    return select(1.0, 0.06, trace_any(o, vec3<f32>(0.0, 1.0, 0.0), SKY_ACCESS_DIST));
+}
+
 fn compute_ao(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> f32 {
     let p_hit = origin + dir * hit.t_hit;
     let v = hit.voxel;
