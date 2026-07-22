@@ -19,12 +19,16 @@ const COMMON_WGSL: &str = include_str!("../shaders/common.wgsl");
 /// acceleration structure. Only assembled into the RT shader variant.
 const RT_VOXEL_QUERY_WGSL: &str = include_str!("../shaders/rt_voxel_query.wgsl");
 const RT_SHADOW_WGSL: &str = include_str!("../shaders/rt_shadow.wgsl");
+const RT_GI_WGSL: &str = include_str!("../shaders/rt_gi.wgsl");
 
-/// Software `shadow_occluded` dispatcher: forwards every occlusion ray to the
-/// DDA `trace_any`. Injected into the non-RT variant so the render body's
-/// `shadow_occluded(...)` calls resolve identically to the pre-RT `trace_any(...)`.
-const SHADOW_SW_WGSL: &str =
-    "fn shadow_occluded(o: vec3<f32>, d: vec3<f32>, m: f32) -> bool { return trace_any(o, d, m); }\n";
+/// Software dispatchers injected into the non-RT variant so the render body's
+/// `shadow_occluded(...)` and `indirect_light(...)` calls resolve to the
+/// pre-RT behaviour: occlusion forwards to the DDA `trace_any`, and there is no
+/// one-bounce indirect (returns 0, the ambient-only look).
+const SHADOW_SW_WGSL: &str = concat!(
+    "fn shadow_occluded(o: vec3<f32>, d: vec3<f32>, m: f32) -> bool { return trace_any(o, d, m); }\n",
+    "fn indirect_light(p: vec3<f32>, n: vec3<f32>, seed: f32) -> vec3<f32> { return vec3<f32>(0.0); }\n",
+);
 
 /// Full raymarch shader source: world consts + common prelude + the sprite
 /// atlas consts generated from `src/sprites.rs` + the shader body. The ONE
@@ -38,12 +42,13 @@ const SHADOW_SW_WGSL: &str =
 pub(crate) fn raymarch_source_variant(rt: bool) -> String {
     if rt {
         format!(
-            "enable wgpu_ray_query;\n{}\n{}\n{}\n{}\n{}\n{}",
+            "enable wgpu_ray_query;\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
             WORLD_CONSTS_WGSL,
             COMMON_WGSL,
             crate::sprites::wgsl_consts(),
             RT_VOXEL_QUERY_WGSL,
             RT_SHADOW_WGSL,
+            RT_GI_WGSL,
             include_str!("../shaders/raymarch.wgsl"),
         )
     } else {
@@ -2561,7 +2566,12 @@ mod gpu_render_tests {
             layout: Some(&rt_pl),
             module: &rt_module,
             entry_point: Some("cs_main"),
-            compilation_options: Default::default(),
+            // GI off: this A/B proves the OCCLUSION path matches software; the
+            // one-bounce indirect intentionally changes the look (see the game).
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &[("GI_ENABLE", 0.0)],
+                ..Default::default()
+            },
             cache: None,
         });
 
@@ -4186,9 +4196,11 @@ mod gpu_render_tests {
         let sw_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
         let rt_m = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(raymarch_source_variant(true).into()) });
         let rt_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&bgl), Some(&rt_bgl)], immediate_size: 0 });
-        let mk = |m: &wgpu::ShaderModule, pl: &wgpu::PipelineLayout, e: &'static str| device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: Some(pl), module: m, entry_point: Some(e), compilation_options: Default::default(), cache: None });
-        let (sw_main, sw_transp, sw_compose) = (mk(&sw_m, &sw_pl, "cs_main"), mk(&sw_m, &sw_pl, "cs_transparent"), mk(&sw_m, &sw_pl, "cs_compose"));
-        let (rt_main, rt_transp, rt_compose) = (mk(&rt_m, &rt_pl, "cs_main"), mk(&rt_m, &rt_pl, "cs_transparent"), mk(&rt_m, &rt_pl, "cs_compose"));
+        let mk = |m: &wgpu::ShaderModule, pl: &wgpu::PipelineLayout, e: &'static str, consts: &[(&'static str, f64)]| device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: Some(pl), module: m, entry_point: Some(e), compilation_options: wgpu::PipelineCompilationOptions { constants: consts, ..Default::default() }, cache: None });
+        let (sw_main, sw_transp, sw_compose) = (mk(&sw_m, &sw_pl, "cs_main", &[]), mk(&sw_m, &sw_pl, "cs_transparent", &[]), mk(&sw_m, &sw_pl, "cs_compose", &[]));
+        // RT with GI off: measure the OCCLUSION path against software apples-to-apples.
+        let gi_off: &[(&'static str, f64)] = &[("GI_ENABLE", 0.0)];
+        let (rt_main, rt_transp, rt_compose) = (mk(&rt_m, &rt_pl, "cs_main", gi_off), mk(&rt_m, &rt_pl, "cs_transparent", gi_off), mk(&rt_m, &rt_pl, "cs_compose", gi_off));
 
         // Foliage-heavy and terrain-overview cameras (occlusion cost differs a
         // lot: dense canopy AO/shadow rays vs open terrain).

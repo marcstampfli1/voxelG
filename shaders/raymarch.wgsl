@@ -2738,6 +2738,10 @@ fn blended_palette(p_hit: vec3<f32>, voxel: vec3<i32>, m: u32) -> vec3<f32> {
 }
 
 // written back into *light so the caller can store them for next frame.// written back into *light so the caller can store them for next frame.
+// Beyond this the one-bounce indirect (RT variant) is skipped: its contribution
+// is small at distance and fog covers it, and it is the priciest per-pixel term.
+const GI_MAX_T: f32 = 120.0;
+
 fn shade(
     hit: Hit, origin: vec3<f32>, dir: vec3<f32>, pix_jit: f32,
     reuse_light: bool, light: ptr<function, vec2<f32>>,
@@ -2857,7 +2861,14 @@ fn shade(
 
     let direct = sun_color(s) * (n_dot_l * shadow_term);
     let ambient = ambient_color() * ao;
-    let lit = base * (direct + ambient);
+    // One-bounce indirect (RT variant only; the software dispatcher returns 0).
+    // Near pixels only - far indirect is tiny and fog hides it, and this is the
+    // most expensive per-pixel term.
+    var indirect = vec3<f32>(0.0);
+    if (hit.t_hit < GI_MAX_T) {
+        indirect = indirect_light(p_hit, n, pix_jit);
+    }
+    let lit = base * (direct + ambient + indirect);
 
     let fog_t = clamp(hit.t_hit / 280.0, 0.0, 0.85);
     return mix(lit, fog_atmospheric(dir), fog_t);
