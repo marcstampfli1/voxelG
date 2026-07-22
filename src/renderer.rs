@@ -2034,8 +2034,12 @@ mod gpu_render_tests {
     use crate::voxel::World;
     use wgpu::util::DeviceExt;
 
-    fn headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
-        let _init = crate::gpu_init_serial();
+    fn headless_device() -> Option<(wgpu::Device, wgpu::Queue, std::sync::MutexGuard<'static, ()>)> {
+        // Hold the GPU lock for the CALLER's whole lifetime (not just creation):
+        // the NVIDIA/Vulkan driver crashes not only on concurrent device
+        // creation but on concurrent submission across devices, so GPU tests run
+        // one at a time. CPU-only tests still parallelize.
+        let gpu = crate::gpu_init_serial();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
             ..wgpu::InstanceDescriptor::new_without_display_handle_from_env()
@@ -2062,7 +2066,7 @@ mod gpu_render_tests {
             },
         ))
         .ok()?;
-        Some((device, queue))
+        Some((device, queue, gpu))
     }
 
     fn storage(device: &wgpu::Device, label: &str, bytes: &[u8]) -> wgpu::Buffer {
@@ -2146,7 +2150,7 @@ mod gpu_render_tests {
         world: &World, cam: &Camera, w: u32, h: u32, leaves: &[crate::leaffall::LeafInstance],
         t: f32, sun_t: f32,
     ) -> Option<Vec<u8>> {
-        let (device, queue) = headless_device()?;
+        let (device, queue, _gpu) = headless_device()?;
         let wo = world.world_origin_voxel();
         let cu = CameraUniform::from_camera(cam, w, h, t, sun_t, wo, [0.0, 0.0], 0.0);
 
@@ -2373,8 +2377,8 @@ mod gpu_render_tests {
     /// RT-capable headless device (enables wgpu_ray_query), or None so the test
     /// skips on non-RT machines. Both the software and RT pipelines run on this
     /// one device for an apples-to-apples A/B.
-    fn rt_headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
-        let _init = crate::gpu_init_serial();
+    fn rt_headless_device() -> Option<(wgpu::Device, wgpu::Queue, std::sync::MutexGuard<'static, ()>)> {
+        let gpu = crate::gpu_init_serial();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
             ..wgpu::InstanceDescriptor::new_without_display_handle_from_env()
@@ -2389,7 +2393,7 @@ mod gpu_render_tests {
         if !crate::accel::adapter_supports_rt(&adapter) {
             return None;
         }
-        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("rt render test device"),
             required_features: wgpu::Features::EXPERIMENTAL_RAY_QUERY,
             required_limits: adapter.limits(),
@@ -2397,7 +2401,8 @@ mod gpu_render_tests {
             experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
             trace: wgpu::Trace::Off,
         }))
-        .ok()
+        .ok()?;
+        Some((device, queue, gpu))
     }
 
     /// End-to-end A/B: render one cs_main frame with software occlusion and with
@@ -2407,7 +2412,7 @@ mod gpu_render_tests {
     /// world_origin rebase, and the accel built from the live world.
     #[test]
     fn rt_shadows_match_software() {
-        let Some((device, queue)) = rt_headless_device() else {
+        let Some((device, queue, _gpu)) = rt_headless_device() else {
             eprintln!("rt_shadows_match_software: no RT adapter, skipping");
             return;
         };
@@ -2761,7 +2766,7 @@ mod gpu_render_tests {
     fn render_checkerboard_probe(
         world: &World, cam: &Camera, w: u32, h: u32, t0: f32, t1: f32,
     ) -> Option<Vec<u8>> {
-        let (device, queue) = headless_device()?;
+        let (device, queue, _gpu) = headless_device()?;
         let wo = world.world_origin_voxel();
         let cu0 = CameraUniform::from_camera(cam, w, h, t0, t0, wo, [0.0, 0.0], 0.0);
         let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -4050,7 +4055,7 @@ mod gpu_render_tests {
     #[test]
     #[ignore]
     fn raymarch_timing() {
-        let Some((device, queue)) = headless_device() else {
+        let Some((device, queue, _gpu)) = headless_device() else {
             eprintln!("no GPU — skipping");
             return;
         };
@@ -4295,7 +4300,7 @@ mod gpu_render_tests {
     #[test]
     fn gpu_physics_sand_falls() {
         use crate::voxel::{brick_idx, brick_voxel_idx, Brick, MAT_SAND, WORLD_BRICKS_TOTAL};
-        let Some((device, queue)) = headless_device() else {
+        let Some((device, queue, _gpu)) = headless_device() else {
             eprintln!("no GPU adapter — skipping GPU physics test");
             return;
         };

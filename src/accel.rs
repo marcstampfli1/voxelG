@@ -225,8 +225,10 @@ mod tests {
     /// exact incantation proven in the rt-spike (`adapter.limits()` supplies the
     /// acceleration-structure limits, which default to 0). Returns None when the
     /// adapter can't ray-trace, so the suite stays green on non-RT machines.
-    fn rt_device() -> Option<(wgpu::Device, wgpu::Queue)> {
-        let _init = crate::gpu_init_serial();
+    fn rt_device() -> Option<(wgpu::Device, wgpu::Queue, std::sync::MutexGuard<'static, ()>)> {
+        // Hold the GPU lock for the caller's whole test (concurrent submissions
+        // across devices crash the NVIDIA/Vulkan driver, not just creation).
+        let gpu = crate::gpu_init_serial();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
             ..wgpu::InstanceDescriptor::new_without_display_handle_from_env()
@@ -241,7 +243,7 @@ mod tests {
         if !adapter_supports_rt(&adapter) {
             return None;
         }
-        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("rt accel test device"),
             required_features: wgpu::Features::EXPERIMENTAL_RAY_QUERY,
             required_limits: adapter.limits(),
@@ -249,7 +251,8 @@ mod tests {
             experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
             trace: wgpu::Trace::Off,
         }))
-        .ok()
+        .ok()?;
+        Some((device, queue, gpu))
     }
 
     /// Build the accel for `world`, cast `rays` through `accel_probe.wgsl`, and
@@ -364,7 +367,7 @@ mod tests {
 
     #[test]
     fn accel_flat_floor_surface_height() {
-        let Some((device, queue)) = rt_device() else {
+        let Some((device, queue, _gpu)) = rt_device() else {
             eprintln!("accel_flat_floor_surface_height: no RT adapter, skipping");
             return;
         };
@@ -555,7 +558,7 @@ mod tests {
 
     #[test]
     fn accel_matches_cpu_raycast() {
-        let Some((device, queue)) = rt_device() else {
+        let Some((device, queue, _gpu)) = rt_device() else {
             eprintln!("accel_matches_cpu_raycast: no RT adapter, skipping");
             return;
         };
@@ -573,7 +576,7 @@ mod tests {
         // storage diverge, so this proves the accel's local<->storage mapping
         // (and the ray-query caller's world_origin rebase) - the origin-0 test
         // never engages the wrap.
-        let Some((device, queue)) = rt_device() else {
+        let Some((device, queue, _gpu)) = rt_device() else {
             eprintln!("accel_matches_cpu_streaming: no RT adapter, skipping");
             return;
         };
@@ -592,7 +595,7 @@ mod tests {
         // iff the ray toward the sun hits ANY solid voxel. This validates that
         // semantic (the same RT primitive the render passes will use for
         // shadows) against the CPU raycaster, BEFORE wiring it into the shader.
-        let Some((device, queue)) = rt_device() else {
+        let Some((device, queue, _gpu)) = rt_device() else {
             eprintln!("accel_shadow_occlusion_matches_cpu: no RT adapter, skipping");
             return;
         };
