@@ -656,13 +656,15 @@ fn cs_compose(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Density-driven cloud shadows: every ground pixel samples the SAME
     // cloud_density field the sky pass renders, along the sun ray through
-    // the slab (one IGN-jittered sample; TAA averages the penumbra over
-    // frames). Denser cloud overhead = deeper shade, and the shadow field
-    // drifts with the clouds by construction - it can never disagree with
-    // what is visibly above. Per-frame full-screen only (mechanism rule):
-    // this term animates every frame and must never enter a tile-gated
-    // pass. Skipped for near-horizontal sun (shadows would race across
-    // the map) and scaled by sun intensity so night is untouched.
+    // the slab. Denser cloud overhead = deeper shade, and the shadow field
+    // drifts with the clouds by construction. THREE FIXED taps averaged -
+    // NOT a per-frame IGN-jittered tap: the jitter only vanished if TAA
+    // averaged it, which it cannot on fluttering canopy edges or the
+    // post-TAA falling-leaf pass, so leaves flickered under cloud shade.
+    // cloud_density is smooth, so fixed taps need no dither and are stable
+    // frame-to-frame (only the slow cloud drift moves them). Full-screen
+    // per-frame only (mechanism rule); skipped for near-horizontal sun and
+    // scaled by sun intensity so night is untouched.
     if (t_hit < 1.0e8) {
         let s = sun_dir();
         let s_int = sun_intensity(s);
@@ -671,10 +673,11 @@ fn cs_compose(@builtin(global_invocation_id) gid: vec3<u32>) {
             let st_in = (CLOUD_BASE - p_ground.y) / s.y;
             let st_out = (CLOUD_TOP - p_ground.y) / s.y;
             if (st_in > 0.0) {
-                let jj = ign(f32(gid.x), f32(gid.y), camera.time * 60.0 + 17.0);
-                let ps = p_ground + s * mix(st_in, st_out, 0.15 + 0.7 * jj);
-                let d = cloud_density(ps, camera.time);
-                let occl = 1.0 - exp(-d * 3.0);
+                var d = 0.0;
+                d = d + cloud_density(p_ground + s * mix(st_in, st_out, 0.2), camera.time);
+                d = d + cloud_density(p_ground + s * mix(st_in, st_out, 0.5), camera.time);
+                d = d + cloud_density(p_ground + s * mix(st_in, st_out, 0.8), camera.time);
+                let occl = 1.0 - exp(-d * 1.1);
                 col = col * (1.0 - occl * 0.42 * s_int);
             }
         }
