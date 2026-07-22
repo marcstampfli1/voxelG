@@ -2186,26 +2186,38 @@ fn water_subvoxel(
 
     let p0 = origin + dir * t_entry - vmin;
 
-    // ---- waterfall fold (step-down connection) ----
-    // Exactly one corner has a step-down column (a diagonally-lower water
-    // cell), and no up-pin: this is the UPPER ledge's tip cell over a lower
-    // pool. A single-corner bilinear pin sags the whole cell into an
-    // "inverse arch"; instead fold it as TWO PLANES - a flat top that stays
-    // attached to the ledge surface, and a straight-creased ramp that drops
-    // from the fold line down to the tip. The crease along the fold line is
-    // the clean "attach along the upper edges" the arch never gave.
-    let d00 = corner_has_dn(dn9, 0, 0);
-    let d10 = corner_has_dn(dn9, 1, 0);
-    let d01 = corner_has_dn(dn9, 0, 1);
-    let d11 = corner_has_dn(dn9, 1, 1);
-    let dncount = i32(d00) + i32(d10) + i32(d01) + i32(d11);
-    if (up9 == 0u && dncount == 1) {
-        // Pin corner (px,pz) in {0,1}^2.
-        let px = select(0.0, 1.0, d10 || d11);
-        let pz = select(0.0, 1.0, d01 || d11);
-        let h0 = (c00.x + c10.x + c01.x + c11.x) * 0.25;
-        let h0r = (c00.y + c10.y + c01.y + c11.y) * 0.25;
-        let hpin = WATER_MIN_H;
+    // ---- waterfall fold (single-corner step connection) ----
+    // Exactly one corner is pinned to an extreme - either UP to the cell top
+    // (a diagonally-higher pool: water rising to a step) or DOWN toward a
+    // lower pool (the upper ledge's tip). A single odd corner in the
+    // bilinear patch sags/bulges the whole cell into a "weird arch". Fold it
+    // as TWO PLANES instead: a flat plane at the other three corners' height,
+    // and a straight-creased ramp between the fold line and the pinned tip.
+    // The crease is a clean straight edge; no arch, either direction. Two
+    // adjacent pins (a wall) are already linear under the bilinear, and 3+
+    // pins are rare, so both fall through to it.
+    let up00 = c00.x >= 0.99; let up10 = c10.x >= 0.99;
+    let up01 = c01.x >= 0.99; let up11 = c11.x >= 0.99;
+    let d00 = corner_has_dn(dn9, 0, 0); let d10 = corner_has_dn(dn9, 1, 0);
+    let d01 = corner_has_dn(dn9, 0, 1); let d11 = corner_has_dn(dn9, 1, 1);
+    let pin00 = up00 || d00; let pin10 = up10 || d10;
+    let pin01 = up01 || d01; let pin11 = up11 || d11;
+    let pincount = i32(pin00) + i32(pin10) + i32(pin01) + i32(pin11);
+    if (pincount == 1) {
+        // Pin corner (px,pz) in {0,1}^2; its target is the cell top (up) or
+        // the cell floor (down).
+        let px = select(0.0, 1.0, pin10 || pin11);
+        let pz = select(0.0, 1.0, pin01 || pin11);
+        let is_up = up00 || up10 || up01 || up11;
+        let hpin = select(WATER_MIN_H, 1.0, is_up);
+        // h0 = mean of the THREE unpinned corners (the pinned one sits at an
+        // extreme and must not skew the flat height).
+        var pcx = c00.x; var pcy = c00.y;
+        if (pin10) { pcx = c10.x; pcy = c10.y; }
+        if (pin01) { pcx = c01.x; pcy = c01.y; }
+        if (pin11) { pcx = c11.x; pcy = c11.y; }
+        let h0 = (c00.x + c10.x + c01.x + c11.x - pcx) / 3.0;
+        let h0r = (c00.y + c10.y + c01.y + c11.y - pcy) / 3.0;
         let k = h0 - hpin;
         let kr = h0r - hpin;
         // Distance-to-pin coords: du,dv are 0 at the pinned corner, 1 at the
