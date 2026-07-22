@@ -2659,6 +2659,12 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     let caustic = 0.6 + 0.8 * pow(max(0.0, n.y), 18.0);
 
     var col = mix(refr_col * caustic, refl_col, fresnel) + sc * spec * shadow * 1.4;
+    // Deep-pit floor: at a grazing angle over a deep hole the reflection
+    // looks into the dark pit interior (high Fresnel) and the refraction is
+    // fully absorbed, so the surface would read near-black. Floor it with
+    // the ambient water-body blue so deep water is dark BLUE, not black.
+    // Negligible on bright sky-reflecting water (max keeps the brighter).
+    col = max(col, water_tint * 0.55);
     // Foam colour also dims at night — at dawn/dusk it picks up the warm
     // sun tint, at noon it's bright white, at night it fades into ambient.
     let foam_col = ambient_color() * 1.5 + sc * 0.50;
