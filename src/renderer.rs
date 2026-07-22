@@ -2598,6 +2598,51 @@ mod gpu_render_tests {
         );
     }
 
+    /// Sky lookdev: camera on open ground looking up at the cloud band at
+    /// three day phases. Prints the cloud / clear-sky split of the upper
+    /// half so cumulus tuning has a number next to the eyeball judgement
+    /// (target: distinct clumps with real clear sky between, not a veil).
+    #[test]
+    #[ignore]
+    fn dump_sky_views() {
+        let world = World::new();
+        let mut cam = Camera::new();
+        cam.pos = glam::Vec3::new(256.0, 70.0, 256.0);
+        cam.yaw = 0.0;
+        cam.pitch = 0.55;
+        std::fs::create_dir_all("target/lookdev").unwrap();
+        let views = [("sky_t20", 20.0f32, 0.55), ("sky_t30", 30.0, 0.55), ("sky_t44", 44.0, 0.55), ("sky_zenith_t30", 30.0, 1.25)];
+        for (name, t, pitch) in views {
+            cam.pitch = pitch;
+            let Some(rgba) = render_rgba_at_time(&world, &cam, 960, 540, t) else {
+                eprintln!("no GPU — skipping");
+                return;
+            };
+            let (w, h) = (960usize, 540usize);
+            let mut cloud = 0usize;
+            let mut total = 0usize;
+            for y in 0..h / 2 {
+                for x in 0..w {
+                    let i = (y * w + x) * 4;
+                    let (r, g, b) = (rgba[i] as f32, rgba[i + 1] as f32, rgba[i + 2] as f32);
+                    // Cloud = desaturated (blue not dominant); sky = blue-led.
+                    if b < g + 18.0 && r > 60.0 {
+                        cloud += 1;
+                    }
+                    total += 1;
+                }
+            }
+            eprintln!("{name}: cloud fraction {:.3}", cloud as f32 / total as f32);
+            let path = format!("target/lookdev/{name}.png");
+            let file = std::fs::File::create(&path).unwrap();
+            let mut enc = png::Encoder::new(std::io::BufWriter::new(file), 960, 540);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            enc.write_header().unwrap().write_image_data(&rgba).unwrap();
+            eprintln!("wrote {path}");
+        }
+    }
+
     /// Isolated material bench: a stone plain with a 4x4x4 cube of every
     /// textured material in two sunlit rows, for tuning the procedural
     /// block textures against one view.

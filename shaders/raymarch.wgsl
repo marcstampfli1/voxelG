@@ -1438,12 +1438,14 @@ fn vnoise3(p: vec3<f32>) -> f32 {
 // rounded tops, like real cumulus.
 fn cloud_density(p: vec3<f32>, t: f32) -> f32 {
     let pa = p * 0.0055 + vec3<f32>(t * 0.06, 0.0, t * 0.035);
-    // Coverage: very low-freq + secondary mid-freq — produces irregular
-    // clump outlines rather than uniformly-sized blobs.
-    let cov_lo = vnoise3(pa * 0.30);
-    let cov_mid = vnoise3(pa * 0.85);
-    let coverage = cov_lo * 0.7 + cov_mid * 0.3 - 0.50;
-    if (coverage < 0.0) { return 0.0; }
+    // Cumulus coverage: a low-freq clump field carved by a smoothstep
+    // threshold into DISTINCT clouds with genuinely clear sky between -
+    // never a linear coverage ramp, which spreads a translucent stratus
+    // veil everywhere. The mid-freq term keeps clump outlines irregular.
+    let cov_lo = vnoise3(pa * 0.70);
+    let cov_mid = vnoise3(pa * 2.1);
+    let cov = smoothstep(0.54, 0.66, cov_lo * 0.75 + cov_mid * 0.25);
+    if (cov <= 0.0) { return 0.0; }
     // Body: 4 octaves of fbm. Vertical noise is scaled finer so a horizontal
     // slice doesn't look like a flat layer when viewed sideways.
     let pb = vec3<f32>(pa.x, pa.y * 3.5, pa.z);
@@ -1452,13 +1454,14 @@ fn cloud_density(p: vec3<f32>, t: f32) -> f32 {
     let n3 = vnoise3(pb * 6.3);
     let n4 = vnoise3(pb * 13.1);
     let body = n1 * 0.50 + n2 * 0.28 + n3 * 0.15 + n4 * 0.07;
-    // Softer vertical envelope — flat bottoms / rounded tops without making
-    // the slab so thin it reads as a flat layer when viewed obliquely.
+    // Cumulus profile: sharp flat bottom, and a dome whose height rises
+    // with clump strength - weak edges stay low, cores tower to the slab
+    // top, which reads as rounded cauliflower heads instead of a layer.
     let h = clamp((p.y - CLOUD_BASE) / max(1.0, CLOUD_TOP - CLOUD_BASE), 0.0, 1.0);
-    let bottom_fade = smoothstep(0.0, 0.15, h);
-    let top_fade = 1.0 - smoothstep(0.85, 1.0, h);
-    let envelope = min(bottom_fade, top_fade);
-    let d = (body - 0.38) * coverage * 4.5 * envelope;
+    let bottom_fade = smoothstep(0.0, 0.08, h);
+    let dome = 1.0 - smoothstep(0.30 + 0.60 * cov, 1.0, h);
+    let envelope = bottom_fade * dome;
+    let d = (body - 0.32) * cov * 5.0 * envelope;
     return clamp(d, 0.0, 1.0);
 }
 
@@ -2648,8 +2651,8 @@ fn shade_glass(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
 // 200-250) so clouds sit inside the world Y = 192 — view rays past
 // mountains can actually reach the cloud band instead of stopping at the
 // world ceiling.
-const CLOUD_BASE: f32 = 145.0;
-const CLOUD_TOP:  f32 = 180.0;
+const CLOUD_BASE: f32 = 165.0;
+const CLOUD_TOP:  f32 = 192.0;
 
 fn render_clouds(origin: vec3<f32>, dir: vec3<f32>, t_terrain: f32, pix: vec2<f32>) -> vec4<f32> {
     // Slab intersection. A horizontal ray (|dir.y| ~ 0) gets nothing because
@@ -2697,7 +2700,7 @@ fn render_clouds(origin: vec3<f32>, dir: vec3<f32>, t_terrain: f32, pix: vec2<f3
     var scattered: vec3<f32> = vec3<f32>(0.0);
     // Day/night-aware ambient (was hardcoded blue — clouds glowed at night).
     // Scale ambient_color a bit so daytime clouds still read as bright.
-    let ambient = ambient_color() * 1.6 + sc * 0.10;
+    let ambient = ambient_color() * 1.05 + sc * 0.06;
 
     for (var i: i32 = 0; i < N; i = i + 1) {
         let t = t_start + (f32(i) + h) * step_t;
@@ -2711,7 +2714,7 @@ fn render_clouds(origin: vec3<f32>, dir: vec3<f32>, t_terrain: f32, pix: vec2<f3
             let pj = p + s * f32(j) * 9.0;
             sun_dens = sun_dens + cloud_density(pj, camera.time);
         }
-        let sun_t = exp(-sun_dens * 0.62);
+        let sun_t = exp(-sun_dens * 0.85);
         let local_col = ambient + sc * sun_t * phase;
 
         let sample_t = exp(-d * step_t * 0.14);
