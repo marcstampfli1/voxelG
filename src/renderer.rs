@@ -2631,6 +2631,104 @@ mod gpu_render_tests {
         world
     }
 
+    /// Renders a floating wall (or slab top) of `mat` twice: once as built,
+    /// once shifted one voxel along the face normal WITH the camera shifted
+    /// identically. Camera-relative geometry, lighting, fog and jitter are
+    /// then identical - the only degree of freedom left is the texture
+    /// pattern's dependence on the depth coordinate. Returns the mean
+    /// absolute luma-normalized difference over the face interior crop
+    /// (normalization cancels legitimate per-face constants like the
+    /// strata level on terrace tops).
+    fn normal_shift_diff(mat: u8, top_face: bool) -> Option<f32> {
+        let (w, h) = (640u32, 400u32);
+        let mut render = |shift: u32| -> Option<Vec<u8>> {
+            let mut world = World::new();
+            if top_face {
+                for y in 56..64 + shift {
+                    for z in 96..120u32 {
+                        for x in 96..120u32 {
+                            world.set_voxel(x, y, z, mat);
+                        }
+                    }
+                }
+            } else {
+                for z in 96 + shift..100 + shift {
+                    for y in 56..76u32 {
+                        for x in 96..120u32 {
+                            world.set_voxel(x, y, z, mat);
+                        }
+                    }
+                }
+            }
+            let mut cam = Camera::new();
+            if top_face {
+                cam.pos = glam::Vec3::new(108.0, 72.0 + shift as f32, 108.0);
+                cam.yaw = 0.0;
+                cam.pitch = -1.5;
+            } else {
+                cam.pos = glam::Vec3::new(108.0, 66.0, 88.0 + shift as f32);
+                cam.yaw = 0.0;
+                cam.pitch = 0.0;
+            }
+            render_rgba_at_time(&world, &cam, w, h, 30.0)
+        };
+        let a = render(0)?;
+        let b = render(1)?;
+        let (w, h) = (w as usize, h as usize);
+        let crop = |f: &[u8]| {
+            let mut v = Vec::new();
+            for y in h / 4..h * 3 / 4 {
+                for x in w / 4..w * 3 / 4 {
+                    let i = (y * w + x) * 4;
+                    v.push((f[i] as f32 + f[i + 1] as f32 + f[i + 2] as f32) / (3.0 * 255.0));
+                }
+            }
+            v
+        };
+        let (ca, cb) = (crop(&a), crop(&b));
+        let ma = ca.iter().sum::<f32>() / ca.len() as f32;
+        let mb = cb.iter().sum::<f32>() / cb.len() as f32;
+        assert!(ma > 0.03 && mb > 0.03, "face crop unexpectedly dark - scene/camera bug");
+        let diff = ca
+            .iter()
+            .zip(&cb)
+            .map(|(x, y)| (x / ma - y / mb).abs())
+            .sum::<f32>()
+            / ca.len() as f32;
+        Some(diff)
+    }
+
+    /// The user's stone acceptance criterion, encoded: pattern lines must
+    /// line up 100% across faces at different depths (wall steps, terraces).
+    /// With planar tex_uv projection the pattern is a pure function of the
+    /// face-plane coordinates, so a 1-voxel shift along the normal must
+    /// leave the rendered face PIXEL-IDENTICAL. 3D fields (worley3-era
+    /// stone/ice/micro-grain) show a different slice instead.
+    /// Measured pre-fix (3D worley/grain): stone side 0.148, stone top
+    /// 0.180, ice side 0.137; post-fix (planar): 0.0000 / 0.0012 / 0.0000
+    /// (the top-face residual is the strata level constant vs the crop's
+    /// perspective AO gradient, far under the gate).
+    #[test]
+    fn texture_pattern_is_depth_invariant() {
+        use crate::voxel::{MAT_ICE, MAT_STONE};
+        let Some(stone_side) = normal_shift_diff(MAT_STONE, false) else {
+            eprintln!("no GPU adapter — skipping depth-invariance test");
+            return;
+        };
+        let stone_top = normal_shift_diff(MAT_STONE, true).unwrap();
+        let ice_side = normal_shift_diff(MAT_ICE, false).unwrap();
+        eprintln!(
+            "normal-shift pattern diff: stone side {stone_side:.4}, stone top {stone_top:.4}, ice side {ice_side:.4}"
+        );
+        for (name, d) in [("stone side", stone_side), ("stone top", stone_top), ("ice side", ice_side)] {
+            assert!(
+                d < 0.005,
+                "{name}: texture pattern changes with depth along the normal (diff {d:.4} >= 0.005) - \
+                 lines cannot line up across steps/terraces"
+            );
+        }
+    }
+
     fn material_lab_cams() -> [(&'static str, Camera); 3] {
         let mut front = Camera::new();
         front.pos = glam::Vec3::new(124.0, 68.5, 76.0);

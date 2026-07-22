@@ -654,25 +654,6 @@ fn cs_compose(@builtin(global_invocation_id) gid: vec3<u32>) {
     let uv = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5) + camera.jitter) / camera.resolution;
     let dir = ray_dir_uv(uv);
 
-    // Depth-edge crevice shading: where the primary depth jumps between
-    // neighbouring pixels, darken the FARTHER side slightly. Adjacent
-    // parallel faces at different depths carry different slices of the 3D
-    // texture fields (correctly - they are different surfaces), but without
-    // a depth cue the step reads as a texture misalignment. The crevice
-    // line makes the geometry legible. Skips sky and distant pixels.
-    if (t_hit < 1.0e8) {
-        let d_r = textureLoad(depth_in, pix + vec2<i32>(1, 0), 0).r;
-        let d_l = textureLoad(depth_in, pix + vec2<i32>(-1, 0), 0).r;
-        let d_u = textureLoad(depth_in, pix + vec2<i32>(0, -1), 0).r;
-        let d_d = textureLoad(depth_in, pix + vec2<i32>(0, 1), 0).r;
-        let nearest = min(min(d_r, d_l), min(d_u, d_d));
-        // Farther than a neighbour by 0.4..3 voxels (scaled with distance
-        // so far geometry is not outlined into a toon look).
-        let jump = (t_hit - nearest) / max(t_hit * 0.02, 0.35);
-        let crevice = clamp(jump - 1.0, 0.0, 1.5) * 0.12;
-        col = col * (1.0 - min(crevice, 0.22));
-    }
-
     let uv_cloud = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5)) / camera.resolution;
     let clouds = textureSampleLevel(cloud_in, cloud_samp, uv_cloud, 0.0);
     if (t_hit >= cloud_slab_near(dir)) {
@@ -1568,38 +1549,42 @@ fn ridge_line(v: f32, w: f32) -> f32 {
     return 1.0 - smoothstep(0.0, w, abs(v - 0.5));
 }
 
-// 3D cellular (Worley) noise over WORLD position: f2 - f1 is ~0 on the
-// border between two cells, giving angular plate borders. 3D (not a 2D
-// slice per face projection) so the fracture network is one world-space
-// structure - crack lines continue seamlessly across face orientations
-// and block boundaries, which per-face 2D cells cannot do.
+// 2D cellular (Worley) noise over PLANAR face coordinates (tex_uv): f2 - f1
+// is ~0 on the border between two cells, giving angular plate borders -
+// fractured rock facets and ice panes.
+// PLANAR, deliberately, and never a 3D world-space field: line features
+// sampled from a 3D field show a different SLICE on parallel faces at
+// different depths, so crack lines stop lining up at every 1-voxel wall
+// step or terrace - the exact "stone does not line up" report. A pattern
+// that is a pure function of the face-plane coordinates is identical on
+// all faces of the same axis BY CONSTRUCTION (guard test:
+// texture_pattern_is_depth_invariant). Corner (orientation) continuity is
+// explicitly NOT a goal - lighting already breaks at corners.
 struct CellNoise {
     f1: f32,
     f2: f32,
     id: f32,
 }
 
-fn worley3(p: vec3<f32>) -> CellNoise {
+fn worley2(p: vec2<f32>) -> CellNoise {
     let ip = floor(p);
     let fp = fract(p);
     var out: CellNoise;
     out.f1 = 8.0;
     out.f2 = 8.0;
     out.id = 0.0;
-    for (var dz: i32 = -1; dz <= 1; dz = dz + 1) {
-        for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
-            for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
-                let g = vec3<f32>(f32(dx), f32(dy), f32(dz));
-                let h = hash3f(ip + g);
-                let o = vec3<f32>(fract(h * 7.13), fract(h * 13.71), fract(h * 5.39));
-                let d = length(g + o - fp);
-                if (d < out.f1) {
-                    out.f2 = out.f1;
-                    out.f1 = d;
-                    out.id = h;
-                } else if (d < out.f2) {
-                    out.f2 = d;
-                }
+    for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
+        for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
+            let g = vec2<f32>(f32(dx), f32(dy));
+            let h = hash3f(vec3<f32>(ip + g, 17.0));
+            let o = vec2<f32>(fract(h * 7.13), fract(h * 13.71));
+            let d = length(g + o - fp);
+            if (d < out.f1) {
+                out.f2 = out.f1;
+                out.f1 = d;
+                out.id = h;
+            } else if (d < out.f2) {
+                out.f2 = d;
             }
         }
     }
@@ -1646,12 +1631,12 @@ fn bark_pattern(p: vec3<f32>, n: vec3<f32>, mat: u32) -> vec3<f32> {
 // shifts stay gentle - recolouring a whole material reads as a palette
 // swap, which is not the job of this function.
 // High-frequency micro-grain shared by every textured material: without it
-// the smooth noise reads as soft low-res blobs. Sampled in 3D WORLD space -
-// a per-face 2D projection makes the sub-voxel detail jump at face
-// orientation changes, which reads as texture misalignment at edges even
-// when the large-scale pattern (3D fracture network) continues correctly.
-fn micro_grain(p: vec3<f32>) -> f32 {
-    return 0.93 + vnoise3(p * 13.0) * 0.10 + vnoise3(p * 27.0) * 0.05;
+// the smooth noise reads as soft low-res blobs. Sampled in the PLANAR
+// tex_uv domain like every line-producing field, so it too is identical on
+// parallel faces at different depths (depth-invariance rule, see worley2).
+fn micro_grain(uv: vec2<f32>) -> f32 {
+    return 0.93 + vnoise3(vec3<f32>(uv * 13.0, 7.0)) * 0.10
+                + vnoise3(vec3<f32>(uv * 27.0, 19.0)) * 0.05;
 }
 
 fn material_texture(p: vec3<f32>, n: vec3<f32>, mat: u32) -> vec3<f32> {
@@ -1660,7 +1645,7 @@ fn material_texture(p: vec3<f32>, n: vec3<f32>, mat: u32) -> vec3<f32> {
     if (mat == 18u || (base.x == 1.0 && base.y == 1.0 && base.z == 1.0)) {
         return base;
     }
-    return base * micro_grain(p);
+    return base * micro_grain(tex_uv(p, n));
 }
 
 fn material_texture_base(p: vec3<f32>, n: vec3<f32>, mat: u32) -> vec3<f32> {
@@ -1669,11 +1654,21 @@ fn material_texture_base(p: vec3<f32>, n: vec3<f32>, mat: u32) -> vec3<f32> {
     // (flat-ish grey per plate, thin dark borders as cracks), a hint of
     // strata. Smooth ridge/wave lines are exactly what stone must NOT be.
     if (mat == 4u) {
-        let jig = fbm3g(p * 0.4) * 0.7;
-        let w = worley3(p * 1.5 + vec3<f32>(jig));
+        // Planar-domain warp and cells (depth-invariance rule, see worley2).
+        // Strata phase comes from the smooth jig field, NEVER from w.id: a
+        // per-cell constant phase makes the banding jump at every cell
+        // border ("weird edges even within one block", the original planar
+        // stone bug that got misread as a projection problem).
+        let jig = fbm3g(vec3<f32>(uv * 0.4, 3.0)) * 0.7;
+        let w = worley2(uv * 1.5 + vec2<f32>(jig));
         let facet = 0.82 + fract(w.id * 9.7) * 0.24;
         let border = smoothstep(0.10, 0.02, w.f2 - w.f1);
-        let strata = 0.95 + 0.05 * sin(p.y * 1.9 + jig * 3.0);
+        // Side faces: wavy horizontal bands (p.y is in-plane there, jig
+        // bends the band lines). Horizontal faces: the exposed layer is one
+        // constant level - no jig, or the per-face constant would leak
+        // spatial variation and break depth invariance on terraces.
+        let sphase = select(jig * 3.0, 0.0, abs(n.y) > 0.5);
+        let strata = 0.95 + 0.05 * sin(p.y * 1.9 + sphase);
         return vec3<f32>(facet * strata * (1.0 - border * 0.38));
     }
     // Bark - per species.
@@ -1728,7 +1723,7 @@ fn material_texture_base(p: vec3<f32>, n: vec3<f32>, mat: u32) -> vec3<f32> {
     // Ice - large clear panes with sparse bright fracture borders and a
     // subtle per-pane clarity difference.
     if (mat == 17u) {
-        let w = worley3(p * 0.8);
+        let w = worley2(uv * 0.8);
         let body = 0.90 + fract(w.id * 7.3) * 0.10;
         let border = smoothstep(0.14, 0.03, w.f2 - w.f1);
         return vec3<f32>(body + border * 0.28, body + border * 0.32, body + border * 0.42);
