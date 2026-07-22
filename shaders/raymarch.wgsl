@@ -987,13 +987,19 @@ fn leaf_card_sprite(mat: u32) -> u32 {
 // trig in the loop: orientation variety comes entirely from the 3D normal
 // scatter (in-plane rotation would cost 2 trig per card per ray and adds
 // little once normals are scattered).
-fn leaf_cloud_hit(cell_min: vec3<f32>, origin: vec3<f32>, dir: vec3<f32>, t_lo: f32, t_hi: f32, mat: u32, outward: vec3<f32>) -> SubHit {
+fn leaf_cloud_hit(cell_min: vec3<f32>, origin: vec3<f32>, dir: vec3<f32>, t_lo: f32, t_hi: f32, mat: u32, outward: vec3<f32>, block_vh: f32) -> SubHit {
     var out: SubHit;
     out.hit = false;
     out.color_tint = vec3<f32>(1.0);
     let sprite = leaf_card_sprite(mat);
     let base_h = hash3f(cell_min + vec3<f32>(0.11, 0.53, 0.29));
-    let species = leaf_species_tint(mat, base_h);
+    // Colour comes from the ADJACENT LEAF BLOCK's voxel hash (block_vh) -
+    // the same hash its cube faces and cap tufts shade with - so cards sit
+    // on a matching block: dark-green leaves on dark-green blocks, gold on
+    // gold in an autumn mottle. base_h (the fringe-cell hash) drives only
+    // GEOMETRY (placement, orientation, wind phase).
+    let species = leaf_species_tint(mat, block_vh);
+    let block_shade = 0.90 + fract(block_vh * 32.0) * 0.20;
     let wind = wind_offset(cell_min, base_h * 6.28, 0.15);
     var best_t: f32 = 1e30;
     for (var k: i32 = 0; k < 12; k = k + 1) {
@@ -1048,15 +1054,18 @@ fn leaf_cloud_hit(cell_min: vec3<f32>, origin: vec3<f32>, dir: vec3<f32>, t_lo: 
         var tone = 0.95;
         if (val == 2u) { tone = 0.62; }
         if (val == 3u) { tone = 1.30; }
-        // Wide per-leaf shade spread plus a subtle hue wobble: the
-        // separation that makes leaves read as individuals.
-        let leaf_shade = 0.78 + hk * 0.47;
-        let hue = vec3<f32>(1.0 + (h1 - 0.5) * 0.18, 1.0, 1.0 - (h1 - 0.5) * 0.18);
+        // Narrow per-leaf spread AROUND the block's own shade: individuals
+        // still separate (sprite tone tiers + this spread), but the
+        // ensemble average equals the block face's brightness, so cards
+        // never read brighter or yellower than the canopy they sit on
+        // (the old 0.78..1.25 spread + 18% hue wobble did exactly that).
+        let leaf_shade = 0.88 + hk * 0.24;
+        let hue = vec3<f32>(1.0 + (h1 - 0.5) * 0.08, 1.0, 1.0 - (h1 - 0.5) * 0.08);
         best_t = t;
         out.hit = true;
         out.t_hit = t;
         out.normal = select(n, -n, denom > 0.0);
-        out.color_tint = vec3<f32>(tone * leaf_shade) * species * hue;
+        out.color_tint = vec3<f32>(tone * block_shade * leaf_shade) * species * hue;
     }
     return out;
 }
@@ -1081,6 +1090,7 @@ fn leaf_fringe_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>) -> SubHi
 
     var best_t: f32 = 1e30;
     var cloud_mat: u32 = 0u;
+    var cloud_vh: f32 = 0.5;
     var outward = vec3<f32>(0.0, 1.0, 0.0);
     for (var i: i32 = 0; i < 6; i = i + 1) {
         var off = vec3<i32>(0);
@@ -1092,6 +1102,9 @@ fn leaf_fringe_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>) -> SubHi
         if (!is_leaf_block_mat(nb_mat)) { continue; }
         if (cloud_mat == 0u) {
             cloud_mat = nb_mat;
+            // The first contributing leaf block's voxel hash: the cloud
+            // cards colour-match THIS block (species mottle + shade).
+            cloud_vh = hash3f(vec3<f32>(f32(nb.x), f32(nb.y), f32(nb.z)));
             outward = vec3<f32>(0.0);
         }
         // Accumulate ALL adjacent leaf directions: for a flat canopy face
@@ -1130,7 +1143,7 @@ fn leaf_fringe_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>) -> SubHi
     outward = normalize(outward + vec3<f32>(0.0, 1e-4, 0.0));
     if (cloud_mat != 0u && t_enter < LEAF_CLOUD_T) {
         var lh = leaf_cloud_hit(voxel_min, origin, dir,
-                                max(t_enter - 0.05, 0.0), min(t_exit + 0.05, best_t), cloud_mat, outward);
+                                max(t_enter - 0.05, 0.0), min(t_exit + 0.05, best_t), cloud_mat, outward, cloud_vh);
         if (lh.hit) {
             lh.color_tint = lh.color_tint * palette[cloud_mat].rgb
                 / max(palette[MAT_LEAF_FRINGE].rgb, vec3<f32>(1e-3));

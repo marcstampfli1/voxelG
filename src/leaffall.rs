@@ -255,12 +255,24 @@ impl LeafSim {
             };
             let c = crate::renderer::palette_color(base_mat);
             let shade = 0.85 + 0.30 * self.rng.next_f32();
-            // Autumn leaves mottle toward warm orange like the canopy tint.
-            let warm = if base_mat == MAT_LEAVES_AUTUMN { self.rng.next_f32() * 0.35 } else { 0.0 };
+            // Species tint sampled from the SAME mottle ramp the canopy
+            // shader uses (leaf_species_tint: warm red-orange to gold-green)
+            // so a fallen autumn leaf matches the tree it left; other
+            // species are untinted there, and stay untinted here.
+            let species = if base_mat == MAT_LEAVES_AUTUMN {
+                let t = self.rng.next_f32();
+                [
+                    1.20 + (0.95 - 1.20) * t,
+                    0.72 + (1.25 - 0.72) * t,
+                    0.45 + (0.75 - 0.45) * t,
+                ]
+            } else {
+                [1.0, 1.0, 1.0]
+            };
             let tint = [
-                ((c[0] * shade * (1.0 + warm)).clamp(0.0, 1.0) * 255.0) as u32,
-                ((c[1] * shade * (1.0 - 0.3 * warm)).clamp(0.0, 1.0) * 255.0) as u32,
-                ((c[2] * shade * (1.0 - warm)).clamp(0.0, 1.0) * 255.0) as u32,
+                ((c[0] * shade * species[0]).clamp(0.0, 1.0) * 255.0) as u32,
+                ((c[1] * shade * species[1]).clamp(0.0, 1.0) * 255.0) as u32,
+                ((c[2] * shade * species[2]).clamp(0.0, 1.0) * 255.0) as u32,
             ];
             let ang = self.rng.next_f32() * std::f32::consts::TAU;
             self.leaves.push(Leaf {
