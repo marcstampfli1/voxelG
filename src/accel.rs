@@ -6,17 +6,26 @@
 // shader) resolves the exact voxel inside a candidate brick. This is the voxel
 // mechanism proven in the rt-spike, now driven by real world data.
 //
-// AABBs are in WINDOW-LOCAL voxel space (brick array coords * BRICK_DIM), the
-// same space the software DDA marches after rebasing by camera.world_origin, so
-// ray-query callers transform the ray by world_origin exactly as trace() does.
+// AABBs are in WINDOW-LOCAL voxel space: local = world_voxel - world_origin, a
+// CONTIGUOUS [0, WORLD_VOXELS) box, which is the single linear space the BVH
+// lives in. A ray-query caller rebases its world-space ray by world_origin
+// (`o_local = origin - world_origin`) exactly as the software DDA marches world
+// coords and folds them to the window.
 //
-// primitive_index (0..aabb_count over the packed non-empty bricks) is NOT the
-// brick index (empty bricks are skipped), so `brick_map[primitive_index]` maps
-// back to the brick index for the in-shader occupancy/material lookup.
+// The voxel STORAGE, however, is toroidal: world brick (wob + local) lives in
+// storage slot (wob + local) mod WORLD_BRICKS (see world_to_slot_voxel in the
+// shader). So the AABB is placed at the local position while its occupancy is
+// read from the wrapped slot, and `brick_map[primitive_index]` holds that
+// STORAGE brick index for the in-shader occupancy/material lookup (primitive
+// index is NOT the brick index - empty bricks are skipped). world_origin is
+// always brick-aligned (chunk streaming shifts by 32 voxels, y is never
+// streamed), so window-local and storage share within-brick voxel offsets.
 
 use wgpu::util::DeviceExt;
 
-use crate::voxel::{brick_idx, World, BRICK_DIM, WORLD_BRICKS_X, WORLD_BRICKS_Y, WORLD_BRICKS_Z};
+use crate::voxel::{
+    brick_idx, World, BRICK_DIM, WORLD_BRICKS_X, WORLD_BRICKS_Y, WORLD_BRICKS_Z,
+};
 
 /// One packed AABB primitive: min then max (two `vec3<f32>`), padded to 32 bytes
 /// (stride must be a multiple of 8 and at least 24; 32 keeps it 16-byte aligned
@@ -53,17 +62,33 @@ pub fn adapter_supports_rt(adapter: &wgpu::Adapter) -> bool {
 /// `EXPERIMENTAL_RAY_QUERY` + `ExperimentalFeatures::enabled()` and the
 /// acceleration-structure limits (see `rt_device_limits`).
 pub fn build_world_accel(device: &wgpu::Device, queue: &wgpu::Queue, world: &World) -> WorldAccel {
+    // World-origin in brick units. Chunk streaming shifts x/z by whole storage
+    // chunks (32 voxels = 8 bricks) and never shifts y, so this is exact.
+    let wo = world.world_origin_voxel();
+    let (wob_x, wob_z) = (wo.x / BRICK_DIM as i32, wo.z / BRICK_DIM as i32);
+    let (nbx, nby, nbz) = (
+        WORLD_BRICKS_X as i32,
+        WORLD_BRICKS_Y as i32,
+        WORLD_BRICKS_Z as i32,
+    );
+
     let mut aabbs: Vec<GpuAabb> = Vec::new();
     let mut brick_map: Vec<u32> = Vec::new();
-    for bz in 0..WORLD_BRICKS_Z {
-        for by in 0..WORLD_BRICKS_Y {
-            for bx in 0..WORLD_BRICKS_X {
-                let bi = brick_idx(bx, by, bz);
+    // Enumerate WINDOW-LOCAL bricks; read occupancy from the wrapped storage
+    // slot. AABB sits at the local position (contiguous BVH space); brick_map
+    // records the storage index for the in-shader occupancy/material read.
+    for lbz in 0..nbz {
+        let sbz = (wob_z + lbz).rem_euclid(nbz) as u32;
+        for lby in 0..nby {
+            let sby = lby as u32; // y is never streamed
+            for lbx in 0..nbx {
+                let sbx = (wob_x + lbx).rem_euclid(nbx) as u32;
+                let bi = brick_idx(sbx, sby, sbz);
                 if world.bricks[bi as usize].occupancy != 0 {
                     let mn = [
-                        (bx * BRICK_DIM) as f32,
-                        (by * BRICK_DIM) as f32,
-                        (bz * BRICK_DIM) as f32,
+                        (lbx * BRICK_DIM as i32) as f32,
+                        (lby * BRICK_DIM as i32) as f32,
+                        (lbz * BRICK_DIM as i32) as f32,
                     ];
                     let e = BRICK_DIM as f32;
                     aabbs.push(GpuAabb {
@@ -400,29 +425,48 @@ mod tests {
         near_int(p.x, eps) as u32 + near_int(p.y, eps) as u32 + near_int(p.z, eps) as u32
     }
 
-    #[test]
-    fn accel_matches_cpu_raycast() {
-        let Some((device, queue)) = rt_device() else {
-            eprintln!("accel_matches_cpu_raycast: no RT adapter, skipping");
-            return;
-        };
+    /// Build a clean floor + 4 stone pillars at world coords inside the window
+    /// for `origin_chunk`, cast a fan of clean and grazing rays at it, and check
+    /// the RT-resolved voxel against the CPU raycaster. Returns
+    /// (clean_assert, clean_floor, clean_pillar, grazing, total). A shifted
+    /// origin engages the toroidal storage mapping (window-local != storage).
+    fn check_floor_pillars(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        origin_chunk: glam::IVec2,
+    ) -> (usize, usize, usize, usize, usize) {
+        let mut world = World::new();
+        // Set the origin WITHOUT regenerating (keeps the world empty so the only
+        // geometry is what we craft); apply_edit then places voxels at world
+        // coords via the same toroidal slot mapping the shader uses.
+        world.world_origin_chunk = origin_chunk;
+        let wo = world.world_origin_voxel();
+        let base = Vec3::new(wo.x as f32, wo.y as f32, wo.z as f32);
+        let (ox, oy, oz) = (wo.x, wo.y, wo.z);
 
-        // Floor plus 3x3 stone pillars of varying height: downward, lateral and
-        // grazing rays exercise multi-brick traversal and in-brick resolution.
-        let mut world = flat_floor(8, 8, 56); // x,z in [8,64)
-        let pillars = [(20u32, 24u32, 90u32), (40, 40, 100), (52, 18, 76), (30, 50, 84)];
+        // Floor: top solid layer at window-local y=60 (world oy+60), x,z local
+        // in [8,64). Pillars: 3x3, local footprints.
+        for z in 8..64 {
+            for x in 8..64 {
+                for y in 57..=60 {
+                    world.apply_edit(ox + x, oy + y, oz + z, MAT_STONE);
+                }
+            }
+        }
+        let pillars = [(20i32, 24i32, 90i32), (40, 40, 100), (52, 18, 76), (30, 50, 84)];
         for &(px, pz, top) in &pillars {
             for y in 61..top {
                 for dz in 0..3 {
                     for dx in 0..3 {
-                        world.set_voxel(px + dx, y, pz + dz, MAT_STONE);
+                        world.apply_edit(ox + px + dx, oy + y, oz + pz + dz, MAT_STONE);
                     }
                 }
             }
         }
 
-        let mut rays = Vec::new();
-        // Downward fans from high eyes onto the floor and pillar tops.
+        // Rays are built in window-local coords then translated to world; the
+        // probe gets the local ray, the CPU oracle gets the world ray.
+        let mut local_dirs: Vec<(Vec3, Vec3)> = Vec::new(); // (local_eye, dir)
         let high_eyes = [
             Vec3::new(6.0, 96.0, 6.0),
             Vec3::new(70.0, 110.0, 12.0),
@@ -433,12 +477,10 @@ mod tests {
             for gz in 0..8 {
                 for gx in 0..8 {
                     let target = Vec3::new(12.0 + gx as f32 * 6.0, 62.0, 12.0 + gz as f32 * 6.0);
-                    rays.push(GpuRay::new(eye, target - eye));
+                    local_dirs.push((eye, (target - eye).normalize()));
                 }
             }
         }
-        // Near-horizontal fans into each pillar's -x side face (lateral,
-        // multi-brick), aimed across the 3-wide face at mid heights.
         for &(px, pz, top) in &pillars {
             let eye = Vec3::new(px as f32 - 16.0, (61 + top) as f32 * 0.5, pz as f32 + 1.5);
             for gy in 0..3 {
@@ -448,75 +490,91 @@ mod tests {
                         61.0 + (top - 61) as f32 * (0.25 + gy as f32 * 0.25),
                         pz as f32 + 0.5 + gz as f32,
                     );
-                    rays.push(GpuRay::new(eye, target - eye));
+                    local_dirs.push((eye, (target - eye).normalize()));
                 }
             }
         }
 
-        let hits = probe(&device, &queue, &world, &rays);
+        let rays: Vec<GpuRay> = local_dirs.iter().map(|&(e, d)| GpuRay::new(e, d)).collect();
+        let hits = probe(device, queue, &world, &rays);
 
         const EPS: f32 = 0.02;
-        let mut clean_assert = 0usize; // clean face hits where RT equals CPU
+        let mut clean_assert = 0usize;
         let mut clean_floor = 0usize;
         let mut clean_pillar = 0usize;
-        let mut grazing = 0usize; // inherently ambiguous edge/corner rays
+        let mut grazing = 0usize;
         for (i, h) in hits.iter().enumerate() {
-            let eye = Vec3::new(rays[i].o[0], rays[i].o[1], rays[i].o[2]);
-            let dir = Vec3::new(rays[i].d[0], rays[i].d[1], rays[i].d[2]).normalize();
-            let oracle = raycast(eye, dir, &world, IVec3::ZERO);
-            let rt_v = [h.vx, h.vy, h.vz];
-            // Hit points on each side (None where that side missed).
+            let (local_eye, dir) = local_dirs[i];
+            let eye_world = local_eye + base;
+            let oracle = raycast(eye_world, dir, &world, wo);
+            let rt_world = [h.vx + wo.x, h.vy + wo.y, h.vz + wo.z];
             let cpu_p = oracle
                 .as_ref()
-                .map(|pick| eye + ray_box_entry(eye, dir, pick.voxel) * dir);
-            let rt_p = (h.hit == 1).then(|| eye + h.t * dir);
+                .map(|pk| eye_world + ray_box_entry(eye_world, dir, pk.voxel) * dir);
+            let rt_p = (h.hit == 1).then(|| eye_world + h.t * dir);
             let cpu_graze = cpu_p.is_some_and(|p| lattice_touch(p, EPS) >= 2);
             let rt_graze = rt_p.is_some_and(|p| lattice_touch(p, EPS) >= 2);
 
-            // Both missing is agreement (ray left the world / hit nothing).
             if h.hit == 0 && oracle.is_none() {
                 continue;
             }
-            let agree = h.hit == 1 && oracle.as_ref().is_some_and(|pk| pk.voxel == rt_v);
+            let agree = h.hit == 1 && oracle.as_ref().is_some_and(|pk| pk.voxel == rt_world);
             if agree {
-                // Only count as validated coverage when the shared hit is a
-                // clean face (unambiguous); grazing agreements don't prove much.
                 if cpu_graze {
                     grazing += 1;
                 } else {
                     clean_assert += 1;
-                    if rt_v[1] <= 60 { clean_floor += 1; } else { clean_pillar += 1; }
+                    // window-local y<=60 is the floor (rt_world.y == wo.y + local).
+                    if h.vy <= 60 { clean_floor += 1; } else { clean_pillar += 1; }
                 }
                 continue;
             }
-            // Disagreement: tolerable ONLY if the ray grazes a voxel edge/corner
-            // on either side (two independent float DDAs split such rays, as does
-            // the software renderer). A disagreement where BOTH hit points are
-            // clean faces is a real resolve bug.
             if cpu_graze || rt_graze {
                 grazing += 1;
                 continue;
             }
             panic!(
-                "ray {i}: clean-face disagreement RT {}{:?} vs CPU {}{:?} (dir {:?}, cpu_p {:?}, rt_p {:?})",
-                if h.hit == 1 { "hit " } else { "MISS " }, rt_v,
+                "origin ({},{}) ray {i}: clean-face disagreement RT {}{:?} vs CPU {}{:?} (dir {:?})",
+                wo.x, wo.z,
+                if h.hit == 1 { "hit " } else { "MISS " }, rt_world,
                 if oracle.is_some() { "hit " } else { "MISS " },
-                oracle.as_ref().map(|p| p.voxel).unwrap_or_default(),
-                dir, cpu_p, rt_p
+                oracle.as_ref().map(|p| p.voxel).unwrap_or_default(), dir
             );
         }
+        (clean_assert, clean_floor, clean_pillar, grazing, rays.len())
+    }
 
-        // The resolve is only validated if plenty of CLEAN hits were checked,
-        // covering both the floor and pillar side faces; and grazing splits must
-        // stay a minority (a systematic half-voxel offset would make everything
-        // look grazing).
-        assert!(clean_assert > rays.len() / 3, "too few clean hits checked: {clean_assert}/{}", rays.len());
-        assert!(clean_floor > 0 && clean_pillar > 0, "clean hits must cover floor ({clean_floor}) and pillars ({clean_pillar})");
-        assert!(grazing < clean_assert, "grazing majority ({grazing} >= {clean_assert}) - suspect a systematic offset");
-        eprintln!(
-            "accel_matches_cpu_raycast: {clean_assert} clean hits match CPU exactly (floor {clean_floor}, pillar {clean_pillar}); {grazing} grazing rays tolerated over {} total",
-            rays.len()
-        );
+    #[test]
+    fn accel_matches_cpu_raycast() {
+        let Some((device, queue)) = rt_device() else {
+            eprintln!("accel_matches_cpu_raycast: no RT adapter, skipping");
+            return;
+        };
+        let (clean, floor, pillar, grazing, total) =
+            check_floor_pillars(&device, &queue, glam::IVec2::ZERO);
+        assert!(clean > total / 3, "too few clean hits checked: {clean}/{total}");
+        assert!(floor > 0 && pillar > 0, "clean hits must cover floor ({floor}) and pillars ({pillar})");
+        assert!(grazing < clean, "grazing majority ({grazing} >= {clean}) - suspect a systematic offset");
+        eprintln!("accel_matches_cpu_raycast: {clean} clean hits match CPU exactly (floor {floor}, pillar {pillar}); {grazing} grazing over {total}");
+    }
+
+    #[test]
+    fn accel_matches_cpu_streaming() {
+        // Same clean scene at a SHIFTED origin: window-local space and toroidal
+        // storage diverge, so this proves the accel's local<->storage mapping
+        // (and the ray-query caller's world_origin rebase) - the origin-0 test
+        // never engages the wrap.
+        let Some((device, queue)) = rt_device() else {
+            eprintln!("accel_matches_cpu_streaming: no RT adapter, skipping");
+            return;
+        };
+        let origin = glam::IVec2::new(3, 5);
+        let (clean, floor, pillar, grazing, total) =
+            check_floor_pillars(&device, &queue, origin);
+        assert!(clean > total / 3, "too few clean streamed hits: {clean}/{total}");
+        assert!(floor > 0 && pillar > 0, "clean streamed hits must cover floor ({floor}) and pillars ({pillar})");
+        assert!(grazing < clean, "grazing majority under streaming ({grazing} >= {clean})");
+        eprintln!("accel_matches_cpu_streaming: origin (96,160) - {clean} clean hits match CPU exactly (floor {floor}, pillar {pillar}); {grazing} grazing over {total}");
     }
 
     #[test]
