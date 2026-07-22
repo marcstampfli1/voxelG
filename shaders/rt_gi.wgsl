@@ -8,10 +8,10 @@
 // TLAS, resolve_brick, shadow_occluded) and alongside raymarch.wgsl (palette,
 // sun_color, ambient_color, brick_voxel_material, sky_color).
 
-const GI_RAYS: i32 = 3;
+const GI_RAYS: i32 = 2;
 const GI_DIST: f32 = 40.0;   // bounce ray reach (voxels); near light dominates
-const GI_STRENGTH: f32 = 1.15;
-const GI_SKY: f32 = 0.55;    // skylight weight for rays that escape to sky
+const GI_STRENGTH: f32 = 1.0;
+const GI_SKY: f32 = 0.32;    // soft skylight fill (NOT a hard overhead emitter)
 
 // Nearest RT hit of `dir` from window-local origin `o`, within GI_DIST. Returns
 // t (or -1). On a hit, `hv`=hit voxel (window-local), `hn`=face normal,
