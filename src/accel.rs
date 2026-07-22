@@ -675,4 +675,29 @@ mod tests {
             "accel_shadow_occlusion_matches_cpu: {decisive} decisive samples agree ({occluded_ok} shadowed, {lit_ok} lit); 0 disagreements"
         );
     }
+
+    #[test]
+    fn accel_empty_world_all_miss() {
+        // Edge case: a world with no solid bricks. build_world_accel still needs
+        // a valid (>=1 primitive) BLAS, so it emits one degenerate AABB far out;
+        // every ray must MISS it. Guards against a panic on the empty-world build
+        // and against the placeholder ever being hit by an in-window ray.
+        let Some((device, queue, _gpu)) = rt_device() else {
+            eprintln!("accel_empty_world_all_miss: no RT adapter, skipping");
+            return;
+        };
+        let world = World::new(); // all bricks empty
+        let mut rays = Vec::new();
+        for gz in 0..8 {
+            for gx in 0..8 {
+                let eye = Vec3::new(20.0 + gx as f32 * 30.0, 200.0, 20.0 + gz as f32 * 30.0);
+                rays.push(GpuRay::new(eye, Vec3::new(0.05, -1.0, 0.03)));
+            }
+        }
+        let hits = probe(&device, &queue, &world, &rays);
+        for (i, h) in hits.iter().enumerate() {
+            assert_eq!(h.hit, 0, "ray {i} hit something in an empty world: {h:?}");
+        }
+        eprintln!("accel_empty_world_all_miss: {} rays, all miss", rays.len());
+    }
 }
