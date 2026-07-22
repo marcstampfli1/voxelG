@@ -24,7 +24,10 @@ opt-level = 1
 
 [dependencies]
 winit = "0.30"
-wgpu = "23"
+# wgpu from GitHub trunk (pinned): procedural-AABB acceleration structures +
+# ray_query, needed for the hardware ray-tracing rework, are not in any crates.io
+# release yet. Pinned to a commit for reproducibility.
+wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "c97d22fff4411228546f37bc7c532c158a61dc6e" }
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
 glam = { version = "0.29", features = ["bytemuck"] }
@@ -38,9 +41,9 @@ bincode = "1.3"
 flate2 = "1"
 
 [dev-dependencies]
-# Headless WGSL parse + validation (same major as wgpu) so shader changes are
+# Headless WGSL parse + validation (same rev as wgpu) so shader changes are
 # caught by `cargo test` without opening a window or needing a GPU.
-naga = { version = "23", features = ["wgsl-in"] }
+naga = { git = "https://github.com/gfx-rs/wgpu", rev = "c97d22fff4411228546f37bc7c532c158a61dc6e", features = ["wgsl-in"] }
 # Microbenchmarks for the CPU hot paths (worldgen + picking raycast).
 criterion = "0.5"
 # PNG dump for the headless look-dev screenshots (visual iteration without

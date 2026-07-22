@@ -563,21 +563,18 @@ impl App {
         match renderer.render(any_dirty) {
             Ok(()) => {}
             // Transient surface states: reconfigure and try again next frame.
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+            Err(wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated) => {
                 let (w, h) = renderer.surface_size;
                 renderer.resize(w.max(1), h.max(1));
             }
-            // The frame simply timed out acquiring the swapchain image; skip it.
-            Err(wgpu::SurfaceError::Timeout) => {}
-            // Out of GPU memory is unrecoverable — log and bail cleanly.
-            Err(wgpu::SurfaceError::OutOfMemory) => {
-                log::error!("GPU out of memory — exiting");
-                if let Some(w) = &self.window {
-                    // Best-effort: ask the loop to exit on the next pump.
-                    w.request_redraw();
-                }
-                self.renderer = None;
-            }
+            // Timed out / occluded / validation-erred while acquiring the swapchain
+            // image; skip this frame and try again next pump.
+            Err(wgpu::CurrentSurfaceTexture::Timeout
+                | wgpu::CurrentSurfaceTexture::Occluded
+                | wgpu::CurrentSurfaceTexture::Validation) => {}
+            // Success/Suboptimal are consumed inside render() and never returned as Err.
+            Err(wgpu::CurrentSurfaceTexture::Success(_)
+                | wgpu::CurrentSurfaceTexture::Suboptimal(_)) => {}
         }
         self.last_camera_pose = Some(cur_pose);
         self.first_frame = false;

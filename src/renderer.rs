@@ -309,7 +309,7 @@ impl Renderer {
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle_from_env()
         });
 
         let surface = instance
@@ -320,8 +320,9 @@ impl Renderer {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         }))
-        .ok_or_else(|| "no compatible GPU adapter found".to_string())?;
+        .map_err(|e| format!("no compatible GPU adapter found: {e}"))?;
 
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
@@ -335,8 +336,10 @@ impl Renderer {
                     ..wgpu::Limits::default()
                 },
                 memory_hints: wgpu::MemoryHints::Performance,
+                // Game does not use ray tracing yet (Phase 0 migration only).
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                trace: wgpu::Trace::Off,
             },
-            None,
         ))
         .map_err(|e| format!("request_device failed: {e}"))?;
 
@@ -345,11 +348,13 @@ impl Renderer {
             .formats
             .iter()
             .copied()
-            .find(|f| !f.is_srgb())
+            .find(|f| !f.has_srgb_suffix())
             .unwrap_or(caps.formats[0]);
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
+            // `Auto` reproduces wgpu's historical (pre-30) sRGB color-space behavior.
+            color_space: wgpu::SurfaceColorSpace::Auto,
             width: surface_w,
             height: surface_h,
             // Explicit present policy: prefer Mailbox (low-latency, tear-free,
@@ -475,7 +480,7 @@ impl Renderer {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
 
@@ -508,8 +513,8 @@ impl Renderer {
 
         let compute_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("compute pl"),
-            bind_group_layouts: &[&compute_bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&compute_bgl)],
+            immediate_size: 0,
         });
         let raymarch_src = raymarch_source();
         let compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -569,8 +574,8 @@ impl Renderer {
         let cloud_bgl = create_cloud_bgl(&device);
         let cloud_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("cloud pl"),
-            bind_group_layouts: &[&cloud_bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&cloud_bgl)],
+            immediate_size: 0,
         });
         let cloud_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("cloud pipeline"),
@@ -592,8 +597,8 @@ impl Renderer {
         });
         let physics_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("physics pl"),
-            bind_group_layouts: &[&physics_bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&physics_bgl)],
+            immediate_size: 0,
         });
         let physics_src = format!("{}\n{}", WORLD_CONSTS_WGSL, include_str!("../shaders/physics.wgsl"));
         let physics_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -625,8 +630,8 @@ impl Renderer {
         let beam_bgl = create_beam_bgl(&device);
         let beam_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("beam pl"),
-            bind_group_layouts: &[&beam_bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&beam_bgl)],
+            immediate_size: 0,
         });
         let beam_src = format!(
             "{}\n{}\n{}",
@@ -672,8 +677,8 @@ impl Renderer {
         });
         let blit_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("blit pl"),
-            bind_group_layouts: &[&blit_bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&blit_bgl)],
+            immediate_size: 0,
         });
         let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("blit shader"),
@@ -701,7 +706,7 @@ impl Renderer {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -712,8 +717,8 @@ impl Renderer {
         let taa_bgl = create_taa_bgl(&device);
         let taa_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("taa pl"),
-            bind_group_layouts: &[&taa_bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&taa_bgl)],
+            immediate_size: 0,
         });
         let taa_src = format!("{}\n{}\n{}", WORLD_CONSTS_WGSL, COMMON_WGSL, include_str!("../shaders/taa.wgsl"));
         let taa_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1014,8 +1019,16 @@ impl Renderer {
         self.leaf_count = n as u32;
     }
 
-    pub fn render(&mut self, any_dirty: bool) -> Result<(), wgpu::SurfaceError> {
-        let frame = self.surface.get_current_texture()?;
+    pub fn render(&mut self, any_dirty: bool) -> Result<(), wgpu::CurrentSurfaceTexture> {
+        // wgpu 30 replaced the `Result<SurfaceTexture, SurfaceError>` return with the
+        // `CurrentSurfaceTexture` enum. `Suboptimal` still yields a usable frame (historical
+        // behavior rendered it), so it is folded into success; every other status is handed
+        // back to the caller to drive the reconfigure/skip logic in `App`.
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(f)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            other => return Err(other),
+        };
         let frame_view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -1104,13 +1117,13 @@ impl Renderer {
             }
             // Feed this frame's resolved image back as next frame's history.
             encoder.copy_texture_to_texture(
-                wgpu::ImageCopyTexture {
+                wgpu::TexelCopyTextureInfo {
                     texture: &self.resolve_tex,
                     mip_level: 0,
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
                 },
-                wgpu::ImageCopyTexture {
+                wgpu::TexelCopyTextureInfo {
                     texture: &self.history_tex,
                     mip_level: 0,
                     origin: wgpu::Origin3d::ZERO,
@@ -1121,13 +1134,13 @@ impl Renderer {
             // Ping-pong the lighting G-buffer: this frame's output becomes next
             // frame's reprojection source.
             encoder.copy_texture_to_texture(
-                wgpu::ImageCopyTexture {
+                wgpu::TexelCopyTextureInfo {
                     texture: &self.light_out_tex,
                     mip_level: 0,
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
                 },
-                wgpu::ImageCopyTexture {
+                wgpu::TexelCopyTextureInfo {
                     texture: &self.light_hist_tex,
                     mip_level: 0,
                     origin: wgpu::Origin3d::ZERO,
@@ -1145,6 +1158,7 @@ impl Renderer {
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &self.resolve_view,
                         resolve_target: None,
+                        depth_slice: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Load,
                             store: wgpu::StoreOp::Store,
@@ -1153,6 +1167,7 @@ impl Renderer {
                     depth_stencil_attachment: None,
                     timestamp_writes: None,
                     occlusion_query_set: None,
+                    multiview_mask: None,
                 });
                 rp.set_pipeline(&self.leaf_pipeline);
                 rp.set_bind_group(0, &self.leaf_bg, &[]);
@@ -1166,6 +1181,7 @@ impl Renderer {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &frame_view,
                     resolve_target: None,
+                    depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             r: 0.0, g: 0.0, b: 0.0, a: 1.0,
@@ -1176,6 +1192,7 @@ impl Renderer {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             rp.set_pipeline(&self.blit_pipeline);
             rp.set_bind_group(0, &self.blit_bg, &[]);
@@ -1183,7 +1200,8 @@ impl Renderer {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
-        frame.present();
+        // wgpu 30 moved presentation from `SurfaceTexture::present()` to `Queue::present()`.
+        self.queue.present(frame);
         Ok(())
     }
 }
@@ -1369,8 +1387,8 @@ fn create_leaf_pipeline(device: &wgpu::Device, bgl: &wgpu::BindGroupLayout) -> w
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("leaf pl"),
-        bind_group_layouts: &[bgl],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(bgl)],
+        immediate_size: 0,
     });
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("leaf pipeline"),
@@ -1397,7 +1415,7 @@ fn create_leaf_pipeline(device: &wgpu::Device, bgl: &wgpu::BindGroupLayout) -> w
         },
         depth_stencil: None, // manual depth test against the exported ray depth
         multisample: wgpu::MultisampleState::default(),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     })
 }
@@ -1782,13 +1800,15 @@ mod gpu_render_tests {
     fn headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle_from_env()
         });
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
             force_fallback_adapter: false,
-        }))?;
+            apply_limit_buckets: false,
+        }))
+        .ok()?;
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("headless test device"),
@@ -1799,8 +1819,9 @@ mod gpu_render_tests {
                     ..wgpu::Limits::default()
                 },
                 memory_hints: wgpu::MemoryHints::Performance,
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                trace: wgpu::Trace::Off,
             },
-            None,
         ))
         .ok()?;
         Some((device, queue))
@@ -1950,8 +1971,8 @@ mod gpu_render_tests {
         );
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("test pl"),
-            bind_group_layouts: &[&bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
         });
         let src = raymarch_source();
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1987,8 +2008,8 @@ mod gpu_render_tests {
         let cloud_bgl = create_cloud_bgl(&device);
         let cloud_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("test cloud pl"),
-            bind_group_layouts: &[&cloud_bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&cloud_bgl)],
+            immediate_size: 0,
         });
         let cloud_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("test cloud pipeline"),
@@ -2026,8 +2047,8 @@ mod gpu_render_tests {
         }
         // Ping-pong: frame 1's G-buffer (light_out) becomes frame 2's light_in.
         enc.copy_texture_to_texture(
-            wgpu::ImageCopyTexture { texture: &_ltex2, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            wgpu::ImageCopyTexture { texture: &_ltex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo { texture: &_ltex2, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo { texture: &_ltex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
         );
         queue.submit(std::iter::once(enc.finish()));
@@ -2073,26 +2094,28 @@ mod gpu_render_tests {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &output_view,
                     resolve_target: None,
+                    depth_slice: None,
                     ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             rp.set_pipeline(&leaf_pipeline);
             rp.set_bind_group(0, &leaf_bg, &[]);
             rp.draw(0..6, 0..leaves.len() as u32);
         }
         enc.copy_texture_to_buffer(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &output_tex,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            wgpu::ImageCopyBuffer {
+            wgpu::TexelCopyBufferInfo {
                 buffer: &readback,
-                layout: wgpu::ImageDataLayout {
+                layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(bpr),
                     rows_per_image: Some(h),
@@ -2104,8 +2127,8 @@ mod gpu_render_tests {
 
         let slice = readback.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
-        device.poll(wgpu::Maintain::Wait);
-        let data = slice.get_mapped_range();
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        let data = slice.get_mapped_range().unwrap();
         Some(data.to_vec())
     }
 
@@ -2336,7 +2359,7 @@ mod gpu_render_tests {
             &l4_mask_buf, &csv, &csamp, &liv, &lov, &tpb, &spr, &ddv, &gv, &dv,
         );
         let pll = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None, bind_group_layouts: &[&bgl], push_constant_ranges: &[],
+            label: None, bind_group_layouts: &[Some(&bgl)], immediate_size: 0,
         });
         let m = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None, source: wgpu::ShaderSource::Wgsl(raymarch_source().into()),
@@ -2350,7 +2373,7 @@ mod gpu_render_tests {
         let p_compose = mk("cs_compose");
         let cloud_bgl = create_cloud_bgl(&device);
         let cloud_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None, bind_group_layouts: &[&cloud_bgl], push_constant_ranges: &[],
+            label: None, bind_group_layouts: &[Some(&cloud_bgl)], immediate_size: 0,
         });
         let p_clouds_full = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: None, layout: Some(&cloud_pl), module: &m, entry_point: Some("cs_clouds"),
@@ -2411,13 +2434,13 @@ mod gpu_render_tests {
         });
         let mut e = device.create_command_encoder(&Default::default());
         e.copy_texture_to_buffer(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &_o, mip_level: 0, origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            wgpu::ImageCopyBuffer {
+            wgpu::TexelCopyBufferInfo {
                 buffer: &readback,
-                layout: wgpu::ImageDataLayout {
+                layout: wgpu::TexelCopyBufferLayout {
                     offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(h),
                 },
             },
@@ -2426,8 +2449,8 @@ mod gpu_render_tests {
         queue.submit(std::iter::once(e.finish()));
         let slice = readback.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
-        device.poll(wgpu::Maintain::Wait);
-        let data = slice.get_mapped_range();
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        let data = slice.get_mapped_range().unwrap();
         Some(data.to_vec())
     }
 
@@ -3714,7 +3737,7 @@ mod gpu_render_tests {
         let (_dd2, ddv2) = create_depth_texture(&device, 1, 1);
         let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &gv2, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &dv, &ov, &bv);
         let bg_compose = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &ov, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &ddv2, &gv2, &dv);
-        let pll = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[&bgl], push_constant_ranges: &[] });
+        let pll = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
         let src = raymarch_source();
         let m = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(src.into()) });
         let pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: Some(&pll), module: &m, entry_point: Some("cs_main"), compilation_options: Default::default(), cache: None });
@@ -3757,11 +3780,13 @@ mod gpu_render_tests {
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                             view: &ov,
                             resolve_target: None,
+                            depth_slice: None,
                             ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
                         })],
                         depth_stencil_attachment: None,
                         timestamp_writes: None,
                         occlusion_query_set: None,
+                        multiview_mask: None,
                     });
                     rp.set_pipeline(lp);
                     rp.set_bind_group(0, lbg, &[]);
@@ -3773,13 +3798,13 @@ mod gpu_render_tests {
             for _ in 0..5 {
                 queue.submit(std::iter::once(encode_frame()));
             }
-            device.poll(wgpu::Maintain::Wait);
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
             let n = 60;
             let t0 = std::time::Instant::now();
             for _ in 0..n {
                 queue.submit(std::iter::once(encode_frame()));
             }
-            device.poll(wgpu::Maintain::Wait);
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
             let ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
             eprintln!("raymarch+transp [{name}] {w}x{h}: {ms:.2} ms/frame  (~{:.0} fps GPU-bound)", 1000.0 / ms);
         }
@@ -3861,7 +3886,7 @@ mod gpu_render_tests {
             ],
         });
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("phys pl"), bind_group_layouts: &[&bgl], push_constant_ranges: &[],
+            label: Some("phys pl"), bind_group_layouts: &[Some(&bgl)], immediate_size: 0,
         });
         let src = format!("{}\n{}", WORLD_CONSTS_WGSL, include_str!("../shaders/physics.wgsl"));
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -3889,8 +3914,8 @@ mod gpu_render_tests {
 
         let slice = readback.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
-        device.poll(wgpu::Maintain::Wait);
-        let data = slice.get_mapped_range();
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        let data = slice.get_mapped_range().unwrap();
         let out: Brick = *bytemuck::from_bytes(&data);
 
         // After one pull step the sand fell exactly one cell: top→air, mid→sand,
