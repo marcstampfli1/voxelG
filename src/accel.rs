@@ -518,4 +518,87 @@ mod tests {
             rays.len()
         );
     }
+
+    #[test]
+    fn accel_shadow_occlusion_matches_cpu() {
+        // Shadow rays are any-hit occlusion tests: a surface point is in shadow
+        // iff the ray toward the sun hits ANY solid voxel. This validates that
+        // semantic (the same RT primitive the render passes will use for
+        // shadows) against the CPU raycaster, BEFORE wiring it into the shader.
+        let Some((device, queue)) = rt_device() else {
+            eprintln!("accel_shadow_occlusion_matches_cpu: no RT adapter, skipping");
+            return;
+        };
+
+        // Floor with a raised roof slab over a central patch: floor points under
+        // the roof are shadowed from an overhead sun, open points are lit.
+        let mut world = flat_floor(8, 8, 56); // x,z in [8,64), top y=60
+        let (rx0, rx1, rz0, rz1) = (24u32, 44u32, 24u32, 44u32);
+        for z in rz0..rz1 {
+            for x in rx0..rx1 {
+                world.set_voxel(x, 80, z, MAT_STONE);
+            }
+        }
+
+        // Sun mostly overhead so the roof's shadow footprint ~= its own extent
+        // (a steep-ish tilt keeps the rays off the pure +Y axis).
+        let sun = Vec3::new(0.16, 0.95, 0.11).normalize();
+
+        // Sample floor-cell centres; shadow ray starts just above the top face.
+        let mut samples = Vec::new(); // (origin, under_roof_interior, open_clear)
+        let mut rays = Vec::new();
+        for z in 10..62 {
+            for x in 10..62 {
+                let o = Vec3::new(x as f32 + 0.5, 61.02, z as f32 + 0.5);
+                // Where the sun ray crosses the roof plane (y=80), to classify
+                // decisive samples with a margin from the roof footprint edge.
+                let s = (80.0 - o.y) / sun.y;
+                let hx = o.x + sun.x * s;
+                let hz = o.z + sun.z * s;
+                let m = 1.5;
+                let under = hx > rx0 as f32 + m && hx < rx1 as f32 - m && hz > rz0 as f32 + m && hz < rz1 as f32 - m;
+                let open = hx < rx0 as f32 - m || hx > rx1 as f32 + m || hz < rz0 as f32 - m || hz > rz1 as f32 + m;
+                samples.push((o, under, open));
+                rays.push(GpuRay::new(o, sun));
+            }
+        }
+
+        let hits = probe(&device, &queue, &world, &rays);
+
+        let mut decisive = 0usize;
+        let mut occluded_ok = 0usize;
+        let mut lit_ok = 0usize;
+        let mut disagree = 0usize;
+        for (i, h) in hits.iter().enumerate() {
+            let (o, under, open) = samples[i];
+            let rt_occ = h.hit == 1;
+            let cpu_occ = raycast(o, sun, &world, IVec3::ZERO).is_some();
+            // Agreement between the two occlusion oracles is required everywhere;
+            // the under/open flags additionally prove the scene really casts a
+            // shadow (not "all lit" or "all dark").
+            if rt_occ != cpu_occ {
+                if under || open {
+                    disagree += 1;
+                    if disagree <= 8 {
+                        eprintln!("sample {i} at {o:?}: RT occ={rt_occ} CPU occ={cpu_occ} (under={under} open={open})");
+                    }
+                }
+                continue;
+            }
+            if under && rt_occ {
+                decisive += 1;
+                occluded_ok += 1;
+            } else if open && !rt_occ {
+                decisive += 1;
+                lit_ok += 1;
+            }
+        }
+
+        assert_eq!(disagree, 0, "{disagree} decisive shadow samples disagree between RT and CPU");
+        assert!(occluded_ok > 20, "too few shadowed samples under the roof: {occluded_ok}");
+        assert!(lit_ok > 20, "too few lit samples in the open: {lit_ok}");
+        eprintln!(
+            "accel_shadow_occlusion_matches_cpu: {decisive} decisive samples agree ({occluded_ok} shadowed, {lit_ok} lit); 0 disagreements"
+        );
+    }
 }
