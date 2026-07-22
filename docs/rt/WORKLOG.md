@@ -67,3 +67,18 @@ Architecture + rules: see the plan (scratchpad draft) and memory project-voxelg-
   NEXT Phase 1b-iv: wire the same group-1 recipe into the windowed Renderer::new
   behind a default-OFF capability flag (env VOXELG_RT), rebuild the accel on world
   upload/edits, select RT vs software pipelines per frame. Software stays default.
+- Phase 1b-iv DONE (wiring): Renderer::new now opts into RT when `VOXELG_RT` is
+  set AND the adapter supports it - requests the ray-query device (adapter limits
+  for the AS caps), builds the world accel + group-1 bind group, and compiles RT
+  variants of cs_main / cs_compose / cs_transparent (the three occlusion entry
+  points; cs_clouds needs none). render() selects the RT pipeline + binds group 1
+  per pass when the flag is on; upload_world rebuilds the accel whenever bricks
+  change (FULL rebuild for now - incremental AS refit is the scalable follow-up).
+  When VOXELG_RT is unset the device, pipelines and bind groups are byte-identical
+  to before, so the software renderer (the default) is completely unaffected -
+  full suite still 44 pass, binary builds. The RT render output is proven equal to
+  software by rt_shadows_match_software, which exercises this exact recipe.
+  PENDING (user checkpoint): launch the windowed game with VOXELG_RT=1 to eyeball
+  RT shadows live and MEASURE fps vs software (RT cores should pay off on the
+  shadow/AO rays). Then decide the flag's default. Perf note: the per-edit full
+  accel rebuild will stutter under heavy editing until the incremental refit lands.

@@ -277,6 +277,19 @@ pub struct Renderer {
     compute_bg: wgpu::BindGroup,
     // Deferred transparent pass (#16): shares compute_bgl/compute_bg.
     transparent_pipeline: wgpu::ComputePipeline,
+
+    // Hardware ray-tracing occlusion (opt-in via VOXELG_RT). All None when RT is
+    // off, so the software path above is untouched. The RT pipelines share the
+    // group-0 render bind group and add group 1 (`rt_bg`) = the world
+    // acceleration structure, rebuilt from `world_accel` when the world changes.
+    rt_shadows: bool,
+    #[allow(dead_code)] // owns the BLAS/TLAS/buffers that rt_bg binds; kept alive
+    world_accel: Option<crate::accel::WorldAccel>,
+    rt_bgl: Option<wgpu::BindGroupLayout>,
+    rt_bg: Option<wgpu::BindGroup>,
+    compute_pipeline_rt: Option<wgpu::ComputePipeline>,
+    compose_pipeline_rt: Option<wgpu::ComputePipeline>,
+    transparent_pipeline_rt: Option<wgpu::ComputePipeline>,
     transp_buf: wgpu::Buffer,
     #[allow(dead_code)] // kept alive for the view; the leaf pass reads the view
     depth_tex: wgpu::Texture,
@@ -360,24 +373,60 @@ impl Renderer {
         }))
         .map_err(|e| format!("no compatible GPU adapter found: {e}"))?;
 
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
+        let base_limits = wgpu::Limits {
+            max_storage_buffer_binding_size: 256 << 20, // 256 MB headroom
+            // Compute pass binds 9 storage buffers (default cap is 8); the
+            // deferred-transparent record buffer pushed it over.
+            max_storage_buffers_per_shader_stage: 12,
+            ..wgpu::Limits::default()
+        };
+        // Hardware ray tracing is OPT-IN via VOXELG_RT and only when the adapter
+        // supports it. When off, the device is byte-identical to the pre-RT one,
+        // so the software renderer (the default) is entirely unaffected. When on,
+        // enable the ray-query feature + acceleration-structure limits so the RT
+        // occlusion pipelines can run.
+        let want_rt = std::env::var("VOXELG_RT").is_ok() && crate::accel::adapter_supports_rt(&adapter);
+        let (device, queue, rt_shadows) = if want_rt {
+            match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                label: Some("voxel device (RT)"),
+                required_features: wgpu::Features::EXPERIMENTAL_RAY_QUERY,
+                // adapter.limits() supplies the acceleration-structure limits
+                // (which default to 0) and is a superset of base_limits.
+                required_limits: adapter.limits(),
+                memory_hints: wgpu::MemoryHints::Performance,
+                experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
+                trace: wgpu::Trace::Off,
+            })) {
+                Ok((d, q)) => {
+                    log::info!("hardware ray tracing ENABLED (VOXELG_RT)");
+                    (d, q, true)
+                }
+                Err(e) => {
+                    log::warn!("VOXELG_RT set but RT device request failed ({e}); using software renderer");
+                    let (d, q) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                        label: Some("voxel device"),
+                        required_features: wgpu::Features::empty(),
+                        required_limits: base_limits.clone(),
+                        memory_hints: wgpu::MemoryHints::Performance,
+                        experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                        trace: wgpu::Trace::Off,
+                    }))
+                    .map_err(|e| format!("request_device failed: {e}"))?;
+                    (d, q, false)
+                }
+            }
+        } else {
+            let (d, q) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("voxel device"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits {
-                    max_storage_buffer_binding_size: 256 << 20, // 256 MB headroom
-                    // Compute pass binds 9 storage buffers (default cap is 8);
-                    // the deferred-transparent record buffer pushed it over.
-                    max_storage_buffers_per_shader_stage: 12,
-                    ..wgpu::Limits::default()
-                },
+                required_limits: base_limits.clone(),
                 memory_hints: wgpu::MemoryHints::Performance,
-                // Game does not use ray tracing yet (Phase 0 migration only).
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
                 trace: wgpu::Trace::Off,
-            },
-        ))
-        .map_err(|e| format!("request_device failed: {e}"))?;
+            }))
+            .map_err(|e| format!("request_device failed: {e}"))?;
+            (d, q, false)
+        };
 
         let caps = surface.get_capabilities(&adapter);
         let surface_format = caps
@@ -606,6 +655,55 @@ impl Renderer {
             cache: None,
         });
 
+        // -- hardware-RT occlusion variants (opt-in via VOXELG_RT) --
+        // The three occlusion-using entry points (cs_main / cs_compose /
+        // cs_transparent) recompiled from the RT shader source with a two-group
+        // layout: group 0 is the unchanged render layout, group 1 is the world
+        // acceleration structure. cs_clouds needs no occlusion and stays
+        // software. The accel + its group-1 bind group are built from the world
+        // now and rebuilt when the world changes (see `world_accel_dirty`).
+        let (
+            world_accel,
+            rt_bgl,
+            rt_bg,
+            compute_pipeline_rt,
+            compose_pipeline_rt,
+            transparent_pipeline_rt,
+        ) = if rt_shadows {
+            let accel = crate::accel::build_world_accel(&device, &queue, world);
+            let rt_bgl = create_rt_bgl(&device);
+            let rt_bg = make_rt_bg(&device, &rt_bgl, &accel);
+            let rt_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("rt compute pl"),
+                bind_group_layouts: &[Some(&compute_bgl), Some(&rt_bgl)],
+                immediate_size: 0,
+            });
+            let rt_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("raymarch shader (RT)"),
+                source: wgpu::ShaderSource::Wgsl(raymarch_source_variant(true).into()),
+            });
+            let mk = |entry: &'static str, label: &'static str| {
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(&rt_pl),
+                    module: &rt_shader,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    cache: None,
+                })
+            };
+            (
+                Some(accel),
+                Some(rt_bgl),
+                Some(rt_bg),
+                Some(mk("cs_main", "raymarch pipeline (RT)")),
+                Some(mk("cs_compose", "compose pipeline (RT)")),
+                Some(mk("cs_transparent", "transparent pipeline (RT)")),
+            )
+        } else {
+            (None, None, None, None, None, None)
+        };
+
         // -- half-res cloud pipeline (cs_clouds, same shader module) --
         let cloud_bgl = create_cloud_bgl(&device);
         let cloud_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -783,6 +881,8 @@ impl Renderer {
             history_tex, history_view, resolve_tex, resolve_view, sampler,
             beam_bgl, beam_pipeline, beam_bg,
             compute_bgl, compute_pipeline, compute_bg,
+            rt_shadows, world_accel,
+            rt_bgl, rt_bg, compute_pipeline_rt, compose_pipeline_rt, transparent_pipeline_rt,
             transparent_pipeline, transp_buf, depth_tex, depth_view,
             geom_tex, geom_view, dummy_depth_tex, dummy_depth_view,
             compose_pipeline, compose_bg,
@@ -883,6 +983,20 @@ impl Renderer {
     }
 
     pub fn upload_world(&mut self, world: &mut World) {
+        // Keep the RT acceleration structure in sync with the world. Any brick
+        // change (edit, physics, chunk stream) invalidates the BLAS. This is a
+        // full rebuild for now (correctness first; RT is opt-in) - the scalable
+        // upgrade is an incremental AS refit of only the touched bricks, noted
+        // in docs/rt. build_world_accel reads world.bricks CPU-side, so it is
+        // valid before or after the GPU DMA below.
+        if self.rt_shadows && (world.all_dirty || !world.dirty_bricks.is_empty()) {
+            let accel = crate::accel::build_world_accel(&self.device, &self.queue, world);
+            if let Some(bgl) = &self.rt_bgl {
+                self.rt_bg = Some(make_rt_bg(&self.device, bgl, &accel));
+            }
+            self.world_accel = Some(accel);
+        }
+
         // Whole-world refresh (first frame / explicit invalidate only). A chunk
         // cross must NEVER reach this path — it goes through the incremental
         // path below, which is why crossing a boundary no longer re-DMAs ~75 MB.
@@ -1107,8 +1221,14 @@ impl Renderer {
                     label: Some("raymarch"),
                     timestamp_writes: None,
                 });
-                cp.set_pipeline(&self.compute_pipeline);
-                cp.set_bind_group(0, &self.compute_bg, &[]);
+                if self.rt_shadows {
+                    cp.set_pipeline(self.compute_pipeline_rt.as_ref().unwrap());
+                    cp.set_bind_group(0, &self.compute_bg, &[]);
+                    cp.set_bind_group(1, self.rt_bg.as_ref().unwrap(), &[]);
+                } else {
+                    cp.set_pipeline(&self.compute_pipeline);
+                    cp.set_bind_group(0, &self.compute_bg, &[]);
+                }
                 let gx = (self.size.0 + 7) / 8;
                 let gy = (self.size.1 + 7) / 8;
                 cp.dispatch_workgroups(gx, gy, 1);
@@ -1119,8 +1239,14 @@ impl Renderer {
                     label: Some("transparent"),
                     timestamp_writes: None,
                 });
-                cp.set_pipeline(&self.transparent_pipeline);
-                cp.set_bind_group(0, &self.compute_bg, &[]);
+                if self.rt_shadows {
+                    cp.set_pipeline(self.transparent_pipeline_rt.as_ref().unwrap());
+                    cp.set_bind_group(0, &self.compute_bg, &[]);
+                    cp.set_bind_group(1, self.rt_bg.as_ref().unwrap(), &[]);
+                } else {
+                    cp.set_pipeline(&self.transparent_pipeline);
+                    cp.set_bind_group(0, &self.compute_bg, &[]);
+                }
                 let gx = (self.size.0 + 7) / 8;
                 let gy = (self.size.1 + 7) / 8;
                 cp.dispatch_workgroups(gx, gy, 1);
@@ -1133,8 +1259,14 @@ impl Renderer {
                     label: Some("compose"),
                     timestamp_writes: None,
                 });
-                cp.set_pipeline(&self.compose_pipeline);
-                cp.set_bind_group(0, &self.compose_bg, &[]);
+                if self.rt_shadows {
+                    cp.set_pipeline(self.compose_pipeline_rt.as_ref().unwrap());
+                    cp.set_bind_group(0, &self.compose_bg, &[]);
+                    cp.set_bind_group(1, self.rt_bg.as_ref().unwrap(), &[]);
+                } else {
+                    cp.set_pipeline(&self.compose_pipeline);
+                    cp.set_bind_group(0, &self.compose_bg, &[]);
+                }
                 let gx = (self.size.0 + 7) / 8;
                 let gy = (self.size.1 + 7) / 8;
                 cp.dispatch_workgroups(gx, gy, 1);
