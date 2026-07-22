@@ -1493,12 +1493,15 @@ fn cloud_density(p: vec3<f32>, t: f32) -> f32 {
     let n3 = vnoise3(pb * 6.3);
     let n4 = vnoise3(pb * 13.1);
     let body = n1 * 0.50 + n2 * 0.28 + n3 * 0.15 + n4 * 0.07;
-    // Cumulus profile: sharp flat bottom, and a dome whose height rises
-    // with clump strength - weak edges stay low, cores tower to the slab
-    // top, which reads as rounded cauliflower heads instead of a layer.
+    // Cumulus profile: sharp flat bottom, and TOWERS - a second noise field
+    // picks where each clump billows upward, so cores rise as rounded
+    // cauliflower heads (weak coverage stays a low base layer near the
+    // slab bottom, strong tower spots climb toward CLOUD_TOP). Vertical
+    // development, not just wider clumps.
     let h = clamp((p.y - CLOUD_BASE) / max(1.0, CLOUD_TOP - CLOUD_BASE), 0.0, 1.0);
-    let bottom_fade = smoothstep(0.0, 0.08, h);
-    let dome = 1.0 - smoothstep(0.30 + 0.60 * cov, 1.0, h);
+    let bottom_fade = smoothstep(0.0, 0.06, h);
+    let tower = cov * (0.40 + 0.60 * vnoise3(pa * 1.6 + vec3<f32>(31.0, 0.0, 17.0)));
+    let dome = 1.0 - smoothstep(0.10 + 0.80 * tower, 1.0, h);
     let envelope = bottom_fade * dome;
     let d = (body - 0.32) * cov * 5.0 * envelope;
     return clamp(d, 0.0, 1.0);
@@ -2690,8 +2693,11 @@ fn shade_glass(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
 // 200-250) so clouds sit inside the world Y = 192 — view rays past
 // mountains can actually reach the cloud band instead of stopping at the
 // world ceiling.
+// Slab must stay inside the world's vertical extent (Y = 256, 64 bricks
+// of 4) so rays under a cloud that also cross terrain keep a consistent
+// depth story; 165..235 leaves headroom for the tower tops.
 const CLOUD_BASE: f32 = 165.0;
-const CLOUD_TOP:  f32 = 192.0;
+const CLOUD_TOP:  f32 = 235.0;
 
 fn render_clouds(origin: vec3<f32>, dir: vec3<f32>, t_terrain: f32, pix: vec2<f32>) -> vec4<f32> {
     // Slab intersection. A horizontal ray (|dir.y| ~ 0) gets nothing because
@@ -2714,7 +2720,8 @@ fn render_clouds(origin: vec3<f32>, dir: vec3<f32>, t_terrain: f32, pix: vec2<f3
     // temporally accumulates the result on a static camera, so the lower
     // per-frame sample count is upsampled over time instead of in one frame
     // (checklist: clouds at reduced res + temporal upsample).
-    let N: i32 = 6;
+    // 8 steps: the tower-height slab (70 units) at 6 was visibly banded.
+    let N: i32 = 8;
     let step_t = (t_far_clamp - t_start) / f32(N);
     // Per-frame time-varying jitter, averaged by TAA into a smooth march.
     // History: this was once time-varying, then made spatial-only because
