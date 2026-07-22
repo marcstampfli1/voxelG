@@ -3183,15 +3183,23 @@ const SKY_ACCESS_DIST: f32 = 48.0;
 // both the open and the enclosed case. Floored at 0.03 so a fully-sealed
 // space is near-black, not a flat 0 (keeps a hint of surface detail).
 fn sky_access(p: vec3<f32>, n: vec3<f32>) -> f32 {
-    // ONE upward ray: cheap, and it catches the case that matters - a roof
-    // / cave ceiling / block directly overhead. Misses horizontal openings
-    // (a surface under an overhang near a side gap reads darker than it is),
-    // the acceptable tradeoff for a per-pixel trace. The scalable fix is a
-    // precomputed per-voxel sky-visibility field (O(1) lookup, no tracing);
-    // this is the affordable stopgap. Floored so a sealed space is near
-    // black, not a flat 0.
+    // How open the upper hemisphere is. Open sky directly overhead ->
+    // outdoors, fully lit (the common case, ONE ray via the early-out).
+    // If a roof blocks straight up, sample four upper-side rays: a covered
+    // spot with open SIDES still gets indirect skylight and reads DIM, not
+    // black - only a space sealed on every side goes near-black. (This
+    // still misses light bouncing in through a LOW opening; the correct
+    // mechanism is a propagated per-voxel sky-light field, O(1) and
+    // bounce-aware - noted as the scalable upgrade.)
     let o = p + n * 0.02;
-    return select(1.0, 0.06, trace_any(o, vec3<f32>(0.0, 1.0, 0.0), SKY_ACCESS_DIST));
+    if (!trace_any(o, vec3<f32>(0.0, 1.0, 0.0), SKY_ACCESS_DIST)) { return 1.0; }
+    var open = 0.0;
+    let c = 0.643; let e = 0.766;
+    if (!trace_any(o, vec3<f32>( e, c, 0.0), SKY_ACCESS_DIST)) { open += c; }
+    if (!trace_any(o, vec3<f32>(-e, c, 0.0), SKY_ACCESS_DIST)) { open += c; }
+    if (!trace_any(o, vec3<f32>(0.0, c,  e), SKY_ACCESS_DIST)) { open += c; }
+    if (!trace_any(o, vec3<f32>(0.0, c, -e), SKY_ACCESS_DIST)) { open += c; }
+    return max(open / (1.0 + 4.0 * c), 0.04);
 }
 
 fn compute_ao(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> f32 {
