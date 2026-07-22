@@ -290,6 +290,9 @@ pub struct Renderer {
     compute_pipeline_rt: Option<wgpu::ComputePipeline>,
     compose_pipeline_rt: Option<wgpu::ComputePipeline>,
     transparent_pipeline_rt: Option<wgpu::ComputePipeline>,
+    // Signature the current accel was built for; the accel is rebuilt only when
+    // it changes (brick set or window origin), not on every voxel edit.
+    rt_accel_sig: u64,
     transp_buf: wgpu::Buffer,
     #[allow(dead_code)] // kept alive for the view; the leaf pass reads the view
     depth_tex: wgpu::Texture,
@@ -883,6 +886,7 @@ impl Renderer {
             compute_bgl, compute_pipeline, compute_bg,
             rt_shadows, world_accel,
             rt_bgl, rt_bg, compute_pipeline_rt, compose_pipeline_rt, transparent_pipeline_rt,
+            rt_accel_sig: if rt_shadows { accel_signature(world) } else { 0 },
             transparent_pipeline, transp_buf, depth_tex, depth_view,
             geom_tex, geom_view, dummy_depth_tex, dummy_depth_view,
             compose_pipeline, compose_bg,
@@ -983,18 +987,24 @@ impl Renderer {
     }
 
     pub fn upload_world(&mut self, world: &mut World) {
-        // Keep the RT acceleration structure in sync with the world. Any brick
-        // change (edit, physics, chunk stream) invalidates the BLAS. This is a
-        // full rebuild for now (correctness first; RT is opt-in) - the scalable
-        // upgrade is an incremental AS refit of only the touched bricks, noted
-        // in docs/rt. build_world_accel reads world.bricks CPU-side, so it is
-        // valid before or after the GPU DMA below.
-        if self.rt_shadows && (world.all_dirty || !world.dirty_bricks.is_empty()) {
-            let accel = crate::accel::build_world_accel(&self.device, &self.queue, world);
-            if let Some(bgl) = &self.rt_bgl {
-                self.rt_bg = Some(make_rt_bg(&self.device, bgl, &accel));
+        // Keep the RT acceleration structure in sync with the world, but ONLY
+        // when the BLAS-relevant state actually changed: the set of non-empty
+        // bricks or the window origin (see accel_signature). A content-only edit
+        // that keeps a brick non-empty leaves the BLAS valid, so the common
+        // editing case skips the rebuild entirely - the in-brick DDA reads the
+        // updated voxels from the `bricks` buffer, not from the BLAS. When a
+        // rebuild IS needed it is currently a full rebuild; the scalable upgrade
+        // is an incremental AS refit of only the changed bricks (see docs/rt).
+        if self.rt_shadows {
+            let sig = accel_signature(world);
+            if sig != self.rt_accel_sig {
+                let accel = crate::accel::build_world_accel(&self.device, &self.queue, world);
+                if let Some(bgl) = &self.rt_bgl {
+                    self.rt_bg = Some(make_rt_bg(&self.device, bgl, &accel));
+                }
+                self.world_accel = Some(accel);
+                self.rt_accel_sig = sig;
             }
-            self.world_accel = Some(accel);
         }
 
         // Whole-world refresh (first frame / explicit invalidate only). A chunk
@@ -1885,6 +1895,25 @@ pub(crate) fn create_rt_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     })
 }
 
+/// Signature of everything the world acceleration structure depends on: the
+/// tile occupancy mask (which changes iff the SET of non-empty bricks changes -
+/// a content-only edit that keeps a brick non-empty leaves it untouched) plus
+/// the window origin. An unchanged signature means the BLAS is still valid, so
+/// the renderer can skip the rebuild - the common editing case pays nothing.
+pub(crate) fn accel_signature(world: &World) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
+    for &w in &world.tile_mask {
+        h ^= w;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let o = world.world_origin_voxel();
+    for v in [o.x as u64, o.z as u64] {
+        h ^= v;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 pub(crate) fn make_rt_bg(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
@@ -2589,6 +2618,31 @@ mod gpu_render_tests {
         assert!(sw_luma_max as i32 - sw_luma_min as i32 > 60, "software frame has no contrast; A/B meaningless");
         assert!(mean_abs < 3.0, "RT vs software frame differs too much: mean |dRGB| = {mean_abs:.3}");
         assert!(big < n / 12, "too many large-diff channels ({big}) between RT and software");
+    }
+
+    #[test]
+    fn accel_signature_tracks_brick_set_not_content() {
+        use crate::voxel::{MAT_AIR, MAT_STONE};
+        let mut w = World::new();
+        // Fill one brick (empty -> non-empty): the BLAS set changed.
+        w.set_voxel(40, 60, 40, MAT_STONE);
+        let sig1 = accel_signature(&w);
+        // Content-only edit in the SAME, still-non-empty brick: BLAS unchanged,
+        // so the signature must be identical (this is the rebuild we skip).
+        w.set_voxel(41, 60, 40, MAT_STONE);
+        assert_eq!(accel_signature(&w), sig1, "content-only edit must not change the accel signature");
+        // A different empty brick becomes non-empty: signature must change.
+        w.set_voxel(80, 60, 80, MAT_STONE);
+        let sig2 = accel_signature(&w);
+        assert_ne!(sig2, sig1, "a new non-empty brick must change the signature");
+        // Emptying a brick (non-empty -> empty): signature must change.
+        w.set_voxel(40, 60, 40, MAT_AIR);
+        w.set_voxel(41, 60, 40, MAT_AIR);
+        assert_ne!(accel_signature(&w), sig2, "emptying a brick must change the signature");
+        // Window origin is part of the signature (streaming rebuilds the accel).
+        let before = accel_signature(&w);
+        w.world_origin_chunk = glam::IVec2::new(2, 3);
+        assert_ne!(accel_signature(&w), before, "a window-origin shift must change the signature");
     }
 
     fn assert_sane(label: &str, min: f32, max: f32, mean: f32) {
