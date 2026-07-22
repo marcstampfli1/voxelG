@@ -3049,6 +3049,31 @@ mod gpu_render_tests {
         (world, cam)
     }
 
+    /// Terrace corner from a raised, side-shifted angle - a second look at
+    /// the waterfall fold from off the diagonal.
+    #[test]
+    #[ignore]
+    fn dump_terrace_angles() {
+        let (world, _) = build_water_terrace_world();
+        // Higher (y 66.8 -> 72) and pushed to the -x side + a touch back, so
+        // the fold is seen three-quarter instead of straight down the diagonal.
+        let mut cam = Camera::new();
+        cam.pos = glam::Vec3::new(98.0, 72.0, 104.0);
+        cam.yaw = 0.62;
+        cam.pitch = -0.55;
+        let Some(rgba) = render_rgba(&world, &cam, 960, 540) else {
+            eprintln!("no GPU — skipping");
+            return;
+        };
+        std::fs::create_dir_all("target/lookdev").unwrap();
+        let file = std::fs::File::create("target/lookdev/water_terrace_angle.png").unwrap();
+        let mut enc = png::Encoder::new(std::io::BufWriter::new(file), 960, 540);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header().unwrap().write_image_data(&rgba).unwrap();
+        eprintln!("wrote target/lookdev/water_terrace_angle.png");
+    }
+
     /// Fraction of pixels matching a colour class inside a crop window.
     fn crop_fraction(
         rgba: &[u8], w: usize, x0: usize, y0: usize, cw: usize, ch: usize,

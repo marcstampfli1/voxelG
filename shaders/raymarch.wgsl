@@ -2048,9 +2048,8 @@ fn water_subvoxel_far(
 // The k-loop enumerates the corner's 4 sharing columns in increasing z then
 // x WORLD order - keep it that way, bitwise cross-cell equality depends on
 // the accumulation order.
-fn water_corner_h(lf9: ptr<function, array<f32, 9>>, up9: u32, dn9: u32, voxel: vec3<i32>, cx: i32, cz: i32) -> vec2<f32> {
+fn water_corner_h(lf9: ptr<function, array<f32, 9>>, up9: u32, voxel: vec3<i32>, cx: i32, cz: i32) -> vec2<f32> {
     var pinned_up = false;
-    var pinned_dn = false;
     var sum = 0.0;
     var cnt = 0.0;
     for (var k: i32 = 0; k < 4; k = k + 1) {
@@ -2058,7 +2057,6 @@ fn water_corner_h(lf9: ptr<function, array<f32, 9>>, up9: u32, dn9: u32, voxel: 
         let oz = cz - 1 + (k >> 1);
         let idx = (ox + 1) + (oz + 1) * 3;
         if (((up9 >> u32(idx)) & 1u) == 1u) { pinned_up = true; }
-        if (((dn9 >> u32(idx)) & 1u) == 1u) { pinned_dn = true; }
         let lf = (*lf9)[idx];
         if (lf > 0.0) {
             sum = sum + lf;
@@ -2066,18 +2064,27 @@ fn water_corner_h(lf9: ptr<function, array<f32, 9>>, up9: u32, dn9: u32, voxel: 
         }
     }
     if (pinned_up) { return vec2<f32>(1.0, 1.0); }
-    // Step-down pin (mirror of the step-up pin): a corner-sharing column
-    // whose water sits one level BELOW pulls this corner to the cell floor,
-    // so the upper surface sweeps down to its floor exactly where the lower
-    // cell's pinned corner sweeps up to its ceiling - together a continuous
-    // two-piece ramp connecting the lower surface to the TOP of the upper
-    // one, one voxel of reach only. Up-pin wins when both apply.
-    if (pinned_dn) { return vec2<f32>(WATER_MIN_H, WATER_MIN_H); }
+    // The step-down (waterfall) case is NOT a corner pin - a single pinned
+    // corner sagged the whole cell into a bilinear arch. It is handled as a
+    // clean two-plane fold in water_subvoxel instead, so this returns the
+    // unpinned height even for a step-down corner.
     let avg = sum / cnt; // own column always counts: cnt >= 1
     let f = water_field(vec2<f32>(f32(voxel.x + cx), f32(voxel.z + cz)), camera.time);
     let h_rest = clamp(WATER_BASE * avg, WATER_MIN_H, 1.0);
     let h = clamp((WATER_BASE + f.x) * avg, WATER_MIN_H, 1.0);
     return vec2<f32>(h, h_rest);
+}
+
+// True if corner (cx,cz) of this cell has any step-down column (water one
+// level below in a corner-sharing column). Same 4-column enumeration as
+// water_corner_h, so the classification is identical across cells.
+fn corner_has_dn(dn9: u32, cx: i32, cz: i32) -> bool {
+    for (var k: i32 = 0; k < 4; k = k + 1) {
+        let ox = cx - 1 + (k & 1);
+        let oz = cz - 1 + (k >> 1);
+        if (((dn9 >> u32((ox + 1) + (oz + 1) * 3)) & 1u) == 1u) { return true; }
+    }
+    return false;
 }
 
 // Sub-voxel water surface for one cell the DDA landed in. `entry_n`/`t_entry`
@@ -2156,10 +2163,83 @@ fn water_subvoxel(
 
     // The four corner heights (h, h_rest) and the bilinear coefficients
     // S(x,z) = h00 + a1 x + a2 z + a3 xz over the unit cell.
-    let c00 = water_corner_h(&lf9, up9, dn9, voxel, 0, 0);
-    let c10 = water_corner_h(&lf9, up9, dn9, voxel, 1, 0);
-    let c01 = water_corner_h(&lf9, up9, dn9, voxel, 0, 1);
-    let c11 = water_corner_h(&lf9, up9, dn9, voxel, 1, 1);
+    let c00 = water_corner_h(&lf9, up9, voxel, 0, 0);
+    let c10 = water_corner_h(&lf9, up9, voxel, 1, 0);
+    let c01 = water_corner_h(&lf9, up9, voxel, 0, 1);
+    let c11 = water_corner_h(&lf9, up9, voxel, 1, 1);
+
+    let p0 = origin + dir * t_entry - vmin;
+
+    // ---- waterfall fold (step-down connection) ----
+    // Exactly one corner has a step-down column (a diagonally-lower water
+    // cell), and no up-pin: this is the UPPER ledge's tip cell over a lower
+    // pool. A single-corner bilinear pin sags the whole cell into an
+    // "inverse arch"; instead fold it as TWO PLANES - a flat top that stays
+    // attached to the ledge surface, and a straight-creased ramp that drops
+    // from the fold line down to the tip. The crease along the fold line is
+    // the clean "attach along the upper edges" the arch never gave.
+    let d00 = corner_has_dn(dn9, 0, 0);
+    let d10 = corner_has_dn(dn9, 1, 0);
+    let d01 = corner_has_dn(dn9, 0, 1);
+    let d11 = corner_has_dn(dn9, 1, 1);
+    let dncount = i32(d00) + i32(d10) + i32(d01) + i32(d11);
+    if (up9 == 0u && dncount == 1) {
+        // Pin corner (px,pz) in {0,1}^2.
+        let px = select(0.0, 1.0, d10 || d11);
+        let pz = select(0.0, 1.0, d01 || d11);
+        let h0 = (c00.x + c10.x + c01.x + c11.x) * 0.25;
+        let h0r = (c00.y + c10.y + c01.y + c11.y) * 0.25;
+        let hpin = WATER_MIN_H;
+        let k = h0 - hpin;
+        let kr = h0r - hpin;
+        // Distance-to-pin coords: du,dv are 0 at the pinned corner, 1 at the
+        // far edges. dd = du+dv; ramp where dd<1, flat where dd>=1.
+        let sx = select(1.0, -1.0, px > 0.5);
+        let sz = select(1.0, -1.0, pz > 0.5);
+        let du0 = select(p0.x, 1.0 - p0.x, px > 0.5);
+        let dv0 = select(p0.z, 1.0 - p0.z, pz > 0.5);
+        let ddu = dir.x * sx;
+        let ddv = dir.z * sz;
+        let dd0 = du0 + dv0;
+        // Entry-below test against the folded surface at p0.
+        let s_entry = select(h0, h0 - k * (1.0 - dd0), dd0 < 1.0);
+        if (p0.y <= s_entry + 1e-4) {
+            out.hit = true;
+            out.t_hit = t_entry;
+            out.normal = entry_n;
+            out.grad_rest = select(vec2<f32>(0.0), vec2<f32>(kr * sx, kr * sz), dd0 < 1.0);
+            return out;
+        }
+        let s_max = t_exit - t_entry;
+        var best = 1e30;
+        var best_ramp = false;
+        // Flat plane y = h0, valid where dd >= 1.
+        if (abs(dir.y) > 1e-7) {
+            let sf = (h0 - p0.y) / dir.y;
+            if (sf > 0.0 && sf < s_max) {
+                let ddh = dd0 + (ddu + ddv) * sf;
+                if (ddh >= 1.0 - 1e-4) { best = sf; best_ramp = false; }
+            }
+        }
+        // Ramp plane y = h0 - k + k*dd, valid where dd < 1.
+        let denom = dir.y - k * (ddu + ddv);
+        if (abs(denom) > 1e-7) {
+            let sr = (h0 - k + k * dd0 - p0.y) / denom;
+            if (sr > 0.0 && sr < s_max && sr < best) {
+                let ddh = dd0 + (ddu + ddv) * sr;
+                if (ddh <= 1.0 + 1e-4) { best = sr; best_ramp = true; }
+            }
+        }
+        if (best < 1e29) {
+            out.hit = true;
+            out.t_hit = t_entry + best;
+            out.normal = select(vec3<f32>(0.0, 1.0, 0.0),
+                                normalize(vec3<f32>(-k * sx, 1.0, -k * sz)), best_ramp);
+            out.grad_rest = select(vec2<f32>(0.0), vec2<f32>(kr * sx, kr * sz), best_ramp);
+        }
+        return out;
+    }
+
     let a1 = c10.x - c00.x;
     let a2 = c01.x - c00.x;
     let a3 = c00.x - c10.x - c01.x + c11.x;
@@ -2167,7 +2247,6 @@ fn water_subvoxel(
     let r2 = c01.y - c00.y;
     let r3 = c00.y - c10.y - c01.y + c11.y;
 
-    let p0 = origin + dir * t_entry - vmin;
     let s0 = c00.x + a1 * p0.x + a2 * p0.z + a3 * p0.x * p0.z;
     if (p0.y <= s0 + 1e-4) {
         // Entered below the waterline: the entry face IS the water surface -
