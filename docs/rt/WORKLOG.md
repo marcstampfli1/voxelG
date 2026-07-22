@@ -49,3 +49,21 @@ Architecture + rules: see the plan (scratchpad draft) and memory project-voxelg-
   NEXT Phase 1b-iii: build the RT compute pipeline + bind group (TLAS + brick_map
   + aabbs) in the HEADLESS harness and A/B render software-vs-RT occlusion (must
   match within tolerance) before touching the windowed Renderer::new.
+- Phase 1b-iii DONE: RT occlusion runs end-to-end through the render shader and
+  MATCHES software pixel-for-pixel. RT resources bind at their own group 1
+  (create_rt_bgl / make_rt_bg) so the software group-0 layout + bind group are
+  byte-identical - RT is purely additive. The A/B test (rt_shadows_match_software)
+  renders one cs_main frame with each occlusion path on the same demo-terrain
+  scene: mean |dRGB| = 0.003 over 320x200, only 10/192000 channels differ (>24),
+  i.e. grazing shadow edges. First cut was WAY off (mean 16, canopies black)
+  because the software occluder is material-aware (fringe never blocks; leaves /
+  decorations use foliage_subvoxel near/far cutout) while raw RT blocked every
+  occupied voxel. Fixed by extracting the ONE occluder rule into
+  `shadow_voxel_occludes` (raymarch.wgsl), called by BOTH trace_any and the new
+  `rt_brick_occludes` (marches a candidate brick's voxels, passing THROUGH
+  non-occluders like the software DDA). Test-suite parallelism: RT + render
+  devices created concurrently crashed the driver, fixed with a GPU-init
+  serialization lock (gpu_init_serial); RUST_TEST_THREADS=4 is stable again.
+  NEXT Phase 1b-iv: wire the same group-1 recipe into the windowed Renderer::new
+  behind a default-OFF capability flag (env VOXELG_RT), rebuild the accel on world
+  upload/edits, select RT vs software pipelines per frame. Software stays default.

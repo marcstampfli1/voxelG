@@ -14,16 +14,70 @@ struct RtAabb {
     _p0: f32, _p1: f32,
 };
 
-@group(0) @binding(22) var world_tlas: acceleration_structure;
+// RT resources live in their OWN bind group (group 1) so the software pipeline's
+// group-0 layout and bind group stay byte-identical - RT is strictly additive.
+@group(1) @binding(0) var world_tlas: acceleration_structure;
 // primitive_index -> STORAGE brick index (for occupancy); the AABB min gives the
 // primitive's WINDOW-LOCAL brick min for the in-brick DDA (see src/accel.rs).
-@group(0) @binding(23) var<storage, read> rt_brick_map: array<u32>;
-@group(0) @binding(24) var<storage, read> rt_aabbs: array<RtAabb>;
+@group(1) @binding(1) var<storage, read> rt_brick_map: array<u32>;
+@group(1) @binding(2) var<storage, read> rt_aabbs: array<RtAabb>;
+
+// March a candidate brick's 4^3 voxels (window-local o/dir) and return true if
+// any solid voxel actually occludes per `shadow_voxel_occludes`. Unlike
+// resolve_brick (first solid wins, for primary hits) this visits EVERY solid
+// voxel so the ray passes THROUGH non-occluders - invisible fringe, far
+// decorations, leaf-cutout misses - exactly as the software DDA does.
+// `origin_world`/`dir` are the WORLD-space shadow ray (for the foliage cutout);
+// world voxel = window-local brick min + brick-local coord + world_origin.
+fn rt_brick_occludes(bi: i32, bmin: vec3<f32>, o: vec3<f32>, origin_world: vec3<f32>,
+                     dir: vec3<f32>, t_hi: f32) -> bool {
+    let inv = vec3<f32>(rt_safe_inv(dir.x), rt_safe_inv(dir.y), rt_safe_inv(dir.z));
+    let tb0 = (bmin - o) * inv;
+    let tb1 = (bmin + vec3<f32>(4.0) - o) * inv;
+    let tnear = max(max(min(tb0.x, tb1.x), min(tb0.y, tb1.y)), min(tb0.z, tb1.z));
+    let tfar = min(min(max(tb0.x, tb1.x), max(tb0.y, tb1.y)), max(tb0.z, tb1.z));
+    var t = max(tnear, 0.0);
+    let t_end = min(tfar, t_hi);
+    if (t > t_end) { return false; }
+
+    let p = o + dir * (t + 1e-4) - bmin;
+    var v = clamp(vec3<i32>(floor(p)), vec3<i32>(0), vec3<i32>(3));
+    let step = vec3<i32>(select(-1, 1, dir.x >= 0.0), select(-1, 1, dir.y >= 0.0), select(-1, 1, dir.z >= 0.0));
+    let next = vec3<f32>(
+        bmin.x + f32(v.x + select(0, 1, dir.x >= 0.0)),
+        bmin.y + f32(v.y + select(0, 1, dir.y >= 0.0)),
+        bmin.z + f32(v.z + select(0, 1, dir.z >= 0.0)),
+    );
+    var t_max = (next - o) * inv;
+    let t_delta = abs(inv);
+    let world_base = vec3<i32>(bmin) + camera.world_origin;
+
+    var t_cur = t;
+    for (var i: i32 = 0; i < 16; i = i + 1) {
+        if (v.x < 0 || v.x > 3 || v.y < 0 || v.y > 3 || v.z < 0 || v.z > 3) { return false; }
+        if (t_cur > t_end) { return false; }
+        let vi = brick_voxel_idx(v.x, v.y, v.z);
+        if (brick_voxel_solid(bi, vi)) {
+            let m = brick_voxel_material(bi, vi);
+            if (shadow_voxel_occludes(world_base + v, m, t_cur, origin_world, dir)) {
+                return true;
+            }
+        }
+        if (t_max.x <= t_max.y && t_max.x <= t_max.z) {
+            v.x = v.x + step.x; t_cur = t_max.x; t_max.x = t_max.x + t_delta.x;
+        } else if (t_max.y <= t_max.z) {
+            v.y = v.y + step.y; t_cur = t_max.y; t_max.y = t_max.y + t_delta.y;
+        } else {
+            v.z = v.z + step.z; t_cur = t_max.z; t_max.z = t_max.z + t_delta.z;
+        }
+    }
+    return false;
+}
 
 // Any-hit occlusion: true iff the ray from `origin` (WORLD space) toward `dir`
-// meets any solid voxel within `max_dist`. The BLAS is in window-local space, so
-// the origin is rebased by world_origin exactly as the software DDA folds world
-// coords into the window.
+// meets any OCCLUDING voxel within `max_dist`. The BLAS is in window-local
+// space, so the origin is rebased by world_origin exactly as the software DDA
+// folds world coords into the window.
 fn rt_occluded(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> bool {
     let o = origin - vec3<f32>(camera.world_origin);
     var rq: ray_query;
@@ -34,10 +88,7 @@ fn rt_occluded(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> bool {
             let bi = i32(rt_brick_map[c.primitive_index]);
             let a = rt_aabbs[c.primitive_index];
             let bmin = vec3<f32>(a.min_x, a.min_y, a.min_z);
-            var fv = vec3<i32>(0);
-            let t = resolve_brick(bi, bmin, o, dir, 0.0, max_dist, &fv);
-            if (t >= 0.0) {
-                // Any occluder within range is enough; stop the traversal.
+            if (rt_brick_occludes(bi, bmin, o, origin, dir, max_dist)) {
                 return true;
             }
         }

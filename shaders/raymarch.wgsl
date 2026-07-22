@@ -3080,6 +3080,35 @@ fn god_rays(origin: vec3<f32>, dir: vec3<f32>, t_far: f32, pix: vec2<f32>) -> ve
 
 // Stripped-down DDA — same hierarchy as `trace()` but returns the moment we
 // know the ray is occluded. No normal / material work.
+// Does a solid voxel actually block a shadow / sky-access ray? Invisible canopy
+// fringe never does; ground decoration (tufts, flowers) and leaves use the same
+// near/far cutout rules the primary DDA applies, so the software DDA and the RT
+// occlusion path agree pixel-for-pixel. `voxel` is the WORLD voxel; `t_cur` its
+// distance along the ray. Shared by trace_any (software) and rt_brick_occludes
+// (hardware RT) - the ONE source of the shadow occluder rule.
+fn shadow_voxel_occludes(voxel: vec3<i32>, m: u32, t_cur: f32, origin: vec3<f32>, dir: vec3<f32>) -> bool {
+    if (m == MAT_LEAF_FRINGE) {
+        // Invisible canopy fringe never occludes shadow rays.
+        return false;
+    }
+    if (is_decoration_mat(m)) {
+        // Ground decoration: near, the cutout gives dappled micro-shadow; far, a
+        // tuft is 90% air and blocking it as a solid cube stamps a square shadow
+        // per tuft across every meadow, so far decorations don't block.
+        if (t_cur <= FOLIAGE_NEAR_T) {
+            return foliage_subvoxel(voxel, origin, dir, m).hit;
+        }
+        return false;
+    }
+    if (is_foliage_mat(m)) {
+        // Leaves: far canopies block as solid cubes (they really are dense);
+        // near ones pay the cutout test.
+        if (t_cur > FOLIAGE_NEAR_T) { return true; }
+        return foliage_subvoxel(voxel, origin, dir, m).hit;
+    }
+    return true;
+}
+
 fn trace_any(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> bool {
     let init = dda_init(origin, dir);
     if (!init.valid) { return false; }
@@ -3138,26 +3167,7 @@ fn trace_any(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> bool {
         let vi = brick_voxel_idx(local.x, local.y, local.z);
         if (brick_voxel_solid(bi, vi)) {
             let m = brick_voxel_material(bi, vi);
-            if (m == MAT_LEAF_FRINGE) {
-                // Invisible canopy fringe never occludes shadow rays.
-            } else if (is_decoration_mat(m)) {
-                // Ground decoration (grass tufts, flowers, straw): the near
-                // cutout gives dappled micro-shadow; far away a tuft is 90%
-                // air, and blocking as a solid cube stamped a square shadow
-                // per tuft across every meadow. Far decorations don't block.
-                if (t_cur <= FOLIAGE_NEAR_T) {
-                    let fh = foliage_subvoxel(voxel, origin, dir, m);
-                    if (fh.hit) { return true; }
-                }
-            } else if (is_foliage_mat(m)) {
-                // Leaves: far canopies block as solid cubes (they really are
-                // dense); near ones pay the cutout test.
-                if (t_cur > FOLIAGE_NEAR_T) { return true; }
-                let fh = foliage_subvoxel(voxel, origin, dir, m);
-                if (fh.hit) { return true; }
-            } else {
-                return true;
-            }
+            if (shadow_voxel_occludes(voxel, m, t_cur, origin, dir)) { return true; }
         }
 
         dda_step(&voxel, &slot_v, &t_max, &t_cur, &last_axis, step, t_delta);

@@ -1714,6 +1714,64 @@ fn make_compute_bg(
     })
 }
 
+/// Group-1 layout for the RT occlusion path (world TLAS + the primitive->brick
+/// map + the packed AABB mins). Kept separate from the group-0 render layout so
+/// the software pipeline is entirely unaffected; only RT pipelines bind it.
+pub(crate) fn create_rt_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("rt bgl (group 1)"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::AccelerationStructure {
+                    vertex_return: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+pub(crate) fn make_rt_bg(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    accel: &crate::accel::WorldAccel,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("rt bg (group 1)"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::AccelerationStructure(&accel.tlas),
+            },
+            wgpu::BindGroupEntry { binding: 1, resource: accel.brick_map.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: accel.aabb_buf.as_entire_binding() },
+        ],
+    })
+}
+
 fn make_cloud_bg(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
@@ -2178,6 +2236,222 @@ mod gpu_render_tests {
         device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
         let data = slice.get_mapped_range().unwrap();
         Some(data.to_vec())
+    }
+
+    /// RT-capable headless device (enables wgpu_ray_query), or None so the test
+    /// skips on non-RT machines. Both the software and RT pipelines run on this
+    /// one device for an apples-to-apples A/B.
+    fn rt_headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let _init = crate::gpu_init_serial();
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::PRIMARY,
+            ..wgpu::InstanceDescriptor::new_without_display_handle_from_env()
+        });
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+        }))
+        .ok()?;
+        if !crate::accel::adapter_supports_rt(&adapter) {
+            return None;
+        }
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("rt render test device"),
+            required_features: wgpu::Features::EXPERIMENTAL_RAY_QUERY,
+            required_limits: adapter.limits(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
+            trace: wgpu::Trace::Off,
+        }))
+        .ok()
+    }
+
+    /// End-to-end A/B: render one cs_main frame with software occlusion and with
+    /// RT occlusion on the SAME scene, camera and device. The frames must be
+    /// nearly identical (only grazing shadow/AO rays may differ), proving the RT
+    /// path is wired correctly through the render shader - group-1 bindings, the
+    /// world_origin rebase, and the accel built from the live world.
+    #[test]
+    fn rt_shadows_match_software() {
+        let Some((device, queue)) = rt_headless_device() else {
+            eprintln!("rt_shadows_match_software: no RT adapter, skipping");
+            return;
+        };
+        let (w, h) = (320u32, 200u32);
+        let mut world = World::new();
+        world.fill_demo_terrain();
+        let wo = world.world_origin_voxel();
+
+        let mut cam = Camera::new();
+        cam.pos.x = wo.x as f32 + 256.0;
+        cam.pos.z = wo.z as f32 + 256.0;
+        let s = crate::voxel::sample_terrain(cam.pos.x, cam.pos.z, world.seed);
+        cam.pos.y = s.h as f32 + 30.0;
+        cam.pitch = -0.35;
+        let t = 30.0;
+        let cu = CameraUniform::from_camera(&cam, w, h, t, t, wo, [0.0, 0.0], 0.0);
+
+        // ---- group-0 bindings (mirrors render_rgba_full) ----
+        let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("camera"),
+            contents: bytemuck::bytes_of(&cu),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let bricks_buf = storage(&device, "bricks", bytemuck::cast_slice(&world.bricks));
+        let tile_mask_buf = storage(&device, "tile_mask", bytemuck::cast_slice(&world.tile_mask));
+        let chunk_mask_buf = storage(&device, "chunk_mask", bytemuck::cast_slice(&world.chunk_mask));
+        let l4_mask_buf = storage(&device, "l4_mask", bytemuck::cast_slice(&world.l4_mask));
+        let brick_uniform_buf = storage(&device, "bu", bytemuck::cast_slice(&pack_u8_to_u32(&world.brick_uniform)));
+        let tile_uniform_buf = storage(&device, "tu", bytemuck::cast_slice(&pack_u8_to_u32(&world.tile_uniform)));
+        let palette = default_palette();
+        let palette_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("palette"),
+            contents: bytemuck::cast_slice(&palette),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let tiles_w = (w + 7) / 8;
+        let tiles_h = (h + 7) / 8;
+        let words = ((tiles_w * tiles_h) as usize + 31) / 32;
+        let tile_dirty_buf = storage(&device, "tile_dirty", bytemuck::cast_slice(&vec![u32::MAX; words]));
+        let players_buf = storage(&device, "players", &vec![0u8; 16 + MAX_REMOTE_PLAYERS * 16]);
+        let (out_tex, output_view) = create_output_texture(&device, w, h);
+        let (_btex, beam_view) = create_beam_texture(&device, w, h);
+        let (_ctex, cloud_sampled_view, _cloud_storage_view) = create_cloud_texture(&device, w, h);
+        let cloud_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("cloud samp"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let (_ltex, light_in_view) = create_lighting_texture(&device, w, h);
+        let (_ltex2, light_out_view) = create_lighting_texture(&device, w, h);
+        let transp_buf = create_transp_buf(&device, w, h);
+        let sprites_buf = storage(&device, "sprites", bytemuck::cast_slice(&crate::sprites::encoded()));
+        let (_dtex, depth_view) = create_depth_texture(&device, w, h);
+        let (_gtex, geom_view) = create_output_texture(&device, w, h);
+        let (_ddtex, dummy_depth_view) = create_depth_texture(&device, 1, 1);
+        let bgl = create_compute_bgl(&device);
+        let bg = make_compute_bg(
+            &device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
+            &palette_buf, &output_view, &beam_view, &tile_dirty_buf, &players_buf,
+            &brick_uniform_buf, &tile_uniform_buf, &l4_mask_buf,
+            &cloud_sampled_view, &cloud_sampler, &light_in_view, &light_out_view, &transp_buf,
+            &sprites_buf, &dummy_depth_view, &geom_view, &depth_view,
+        );
+
+        // ---- group-1 (RT) bindings, built from the live world ----
+        let accel = crate::accel::build_world_accel(&device, &queue, &world);
+        let rt_bgl = create_rt_bgl(&device);
+        let rt_bg = make_rt_bg(&device, &rt_bgl, &accel);
+
+        // ---- pipelines ----
+        let sw_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("sw raymarch"),
+            source: wgpu::ShaderSource::Wgsl(raymarch_source().into()),
+        });
+        let sw_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("sw pl"),
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
+        });
+        let sw_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("sw cs_main"),
+            layout: Some(&sw_pl),
+            module: &sw_module,
+            entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let rt_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("rt raymarch"),
+            source: wgpu::ShaderSource::Wgsl(raymarch_source_variant(true).into()),
+        });
+        let rt_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("rt pl"),
+            bind_group_layouts: &[Some(&bgl), Some(&rt_bgl)],
+            immediate_size: 0,
+        });
+        let rt_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("rt cs_main"),
+            layout: Some(&rt_pl),
+            module: &rt_module,
+            entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        let bpr = w * 4;
+        let render = |pipeline: &wgpu::ComputePipeline, rt: bool| -> Vec<u8> {
+            let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("readback"),
+                size: (bpr * h) as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut enc = device.create_command_encoder(&Default::default());
+            {
+                let mut cp = enc.begin_compute_pass(&Default::default());
+                cp.set_pipeline(pipeline);
+                cp.set_bind_group(0, &bg, &[]);
+                if rt {
+                    cp.set_bind_group(1, &rt_bg, &[]);
+                }
+                cp.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
+            }
+            enc.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &out_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &readback,
+                    layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(h) },
+                },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+            queue.submit(std::iter::once(enc.finish()));
+            let slice = readback.slice(..);
+            slice.map_async(wgpu::MapMode::Read, |_| {});
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            slice.get_mapped_range().unwrap().to_vec()
+        };
+
+        let sw = render(&sw_pipeline, false);
+        let rt = render(&rt_pipeline, true);
+
+        // Compare RGB channels. Nearly all pixels must match; a small tail of
+        // grazing shadow/AO edge pixels may differ by a little.
+        let n = (w * h) as usize;
+        let mut sum_abs = 0.0f64;
+        let mut max_abs = 0u32;
+        let mut big = 0usize;
+        let mut sw_luma_min = 255u8;
+        let mut sw_luma_max = 0u8;
+        for i in 0..n {
+            let l = ((sw[i * 4] as u32 + sw[i * 4 + 1] as u32 + sw[i * 4 + 2] as u32) / 3) as u8;
+            sw_luma_min = sw_luma_min.min(l);
+            sw_luma_max = sw_luma_max.max(l);
+            for c in 0..3 {
+                let d = (sw[i * 4 + c] as i32 - rt[i * 4 + c] as i32).unsigned_abs();
+                sum_abs += d as f64;
+                max_abs = max_abs.max(d);
+                if d > 24 {
+                    big += 1;
+                }
+            }
+        }
+        let mean_abs = sum_abs / (n as f64 * 3.0);
+        eprintln!(
+            "rt_shadows_match_software: mean|dRGB|={mean_abs:.3} max={max_abs} big(>24)={big}/{} sw_luma[{sw_luma_min}..{sw_luma_max}]",
+            n * 3
+        );
+        // The scene must actually have shading contrast (not a flat frame), else
+        // the comparison proves nothing.
+        assert!(sw_luma_max as i32 - sw_luma_min as i32 > 60, "software frame has no contrast; A/B meaningless");
+        assert!(mean_abs < 3.0, "RT vs software frame differs too much: mean |dRGB| = {mean_abs:.3}");
+        assert!(big < n / 12, "too many large-diff channels ({big}) between RT and software");
     }
 
     fn assert_sane(label: &str, min: f32, max: f32, mean: f32) {
