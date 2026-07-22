@@ -681,7 +681,13 @@ fn cs_compose(@builtin(global_invocation_id) gid: vec3<u32>) {
             let p_ground = camera.origin + dir * t_hit;
             let st_in = (CLOUD_BASE - p_ground.y) / s.y;
             let st_out = (CLOUD_TOP - p_ground.y) / s.y;
-            if (st_in > 0.0) {
+            // Sky-access gate: only shade a surface the sun can actually
+            // reach. If terrain (a roof, cave ceiling, cliff) blocks the sun
+            // before the cloud slab, the surface is already in shadow -
+            // dimming a sun that never arrives painted a moving cloud
+            // pattern onto roofed water and floors. Capped so the trace stays
+            // bounded on open terrain.
+            if (st_in > 0.0 && !trace_any(p_ground + s * 0.05, s, min(st_in, 80.0))) {
                 var d = 0.0;
                 d = d + cloud_density(p_ground + s * mix(st_in, st_out, 0.2), camera.time);
                 d = d + cloud_density(p_ground + s * mix(st_in, st_out, 0.5), camera.time);
@@ -2646,11 +2652,15 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     // The closer the underwater hit, the brighter the white foam contribution.
     // Wave-crest noise modulates so foam looks like spray, not a flat ring.
     var foam = 0.0;
-    if (under.hit && under.t_hit < 2.5) {
-        let shore = 1.0 - clamp(under.t_hit / 2.5, 0.0, 1.0);
-        // Field heights are in voxels (±~0.11), so scale the crest gate up.
-        let crest = clamp(water_field(p_hit.xz, camera.time).x * 9.0 + 0.5, 0.0, 1.0);
-        foam = shore * crest * 0.85;
+    if (under.hit && under.t_hit < 1.6) {
+        let shore = 1.0 - clamp(under.t_hit / 1.6, 0.0, 1.0);
+        // Crest-driven ONLY (no constant term): calm shallow water - a
+        // filling pool, a thin lake - must NOT foam. Froth appears only
+        // where a positive wave crest breaks over the shallow bottom, so
+        // it reads as spray at the shoreline, not a white sheet over every
+        // shallow patch. Field heights are ±~0.11 voxels, hence the *14.
+        let crest = clamp(water_field(p_hit.xz, camera.time).x * 14.0, 0.0, 1.0);
+        foam = shore * crest * 0.7;
     }
 
     // ---- caustics: brighten the underwater colour where the surface wave

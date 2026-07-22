@@ -2736,6 +2736,191 @@ mod gpu_render_tests {
         world
     }
 
+    /// Shallow pool with a water-LEVEL gradient (L2..L8), the case that
+    /// makes each cell's surface patch bulge and crease into "arches" - a
+    /// static stand-in for flowing water draining toward the centre.
+    /// Water fully roofed by a stone slab a few blocks above - the
+    /// reflection off the water must show the dark roof underside, never the
+    /// sky. Camera sits under the overhang looking at the pool.
+    #[test]
+    #[ignore]
+    fn dump_overhang_water() {
+        use crate::voxel::{MAT_STONE, MAT_WATER};
+        let mut world = World::new();
+        // Fully SEALED stone box (floor, four walls, roof) - no sky visible
+        // anywhere inside. Solid shell over [100,124]^2 x [60,68], hollow
+        // interior.
+        for y in 60..69u32 {
+            for z in 100..125u32 {
+                for x in 100..125u32 {
+                    let shell = x == 100 || x == 124 || z == 100 || z == 124
+                        || y == 60 || y == 68;
+                    if shell {
+                        world.set_voxel(x, y, z, MAT_STONE);
+                    }
+                }
+            }
+        }
+        for z in 101..124u32 {
+            for x in 101..124u32 {
+                world.set_voxel(x, 61, z, MAT_WATER); // 1-deep pool (foam-prone)
+            }
+        }
+        world.rebuild_active_bricks();
+        let mut cam = Camera::new();
+        cam.pos = glam::Vec3::new(104.0, 63.0, 104.0);
+        cam.yaw = std::f32::consts::FRAC_PI_4;
+        cam.pitch = -0.30;
+        let Some(rgba) = render_rgba(&world, &cam, 960, 540) else {
+            eprintln!("no GPU — skipping");
+            return;
+        };
+        std::fs::create_dir_all("target/lookdev").unwrap();
+        let file = std::fs::File::create("target/lookdev/overhang_water.png").unwrap();
+        let mut enc = png::Encoder::new(std::io::BufWriter::new(file), 960, 540);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header().unwrap().write_image_data(&rgba).unwrap();
+        eprintln!("wrote target/lookdev/overhang_water.png");
+    }
+
+    /// A full still lake in a stone basin (all L8), active bricks registered
+    /// so the physics sim will run on it.
+    fn build_lake_world() -> World {
+        use crate::voxel::*;
+        let mut world = World::new();
+        for z in 106..130u32 {
+            for x in 106..130u32 {
+                for y in 44..50u32 {
+                    world.set_voxel(x, y, z, MAT_STONE);
+                }
+                let edge = x == 106 || x == 129 || z == 106 || z == 129;
+                if edge {
+                    for y in 50..70u32 {
+                        world.set_voxel(x, y, z, MAT_STONE);
+                    }
+                }
+            }
+        }
+        // Deep water: y=50..64 (14 layers).
+        for z in 107..129u32 {
+            for x in 107..129u32 {
+                for y in 50..64u32 {
+                    world.set_voxel(x, y, z, MAT_WATER);
+                }
+            }
+        }
+        world.rebuild_active_bricks();
+        world
+    }
+
+    /// Reproduce the "broke a block in the lake" arches: fill a lake, punch
+    /// a 2x2 hole in the surface, then run the real water sim and capture
+    /// the FLOWING transient at several tick counts (that is when the
+    /// surface arches and creases, before it settles flat again).
+    #[test]
+    #[ignore]
+    fn dump_pool_views() {
+        use crate::voxel::MAT_AIR;
+        let mut world = build_lake_world();
+        // Break a deep 5x5 pit all the way down to the floor - a large,
+        // DEEP disruption so the surrounding lake cascades in and the
+        // surface arches and creases while filling.
+        for x in 116..121u32 {
+            for z in 116..121u32 {
+                for y in 50..64u32 {
+                    world.set_voxel(x, y, z, MAT_AIR);
+                }
+            }
+        }
+        world.rebuild_active_bricks();
+        let mut cam = Camera::new();
+        cam.pos = glam::Vec3::new(111.0, 65.6, 111.0);
+        cam.yaw = std::f32::consts::FRAC_PI_4;
+        cam.pitch = -0.30;
+        std::fs::create_dir_all("target/lookdev").unwrap();
+        let mut ticks = 0u32;
+        for target in [1u32, 2, 3, 5, 8] {
+            while ticks < target {
+                crate::physics::tick(&mut world);
+                ticks += 1;
+            }
+            let Some(rgba) = render_rgba(&world, &cam, 960, 540) else {
+                eprintln!("no GPU — skipping");
+                return;
+            };
+            let path = format!("target/lookdev/pool_t{target}.png");
+            let file = std::fs::File::create(&path).unwrap();
+            let mut enc = png::Encoder::new(std::io::BufWriter::new(file), 960, 540);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            enc.write_header().unwrap().write_image_data(&rgba).unwrap();
+            eprintln!("wrote {path} ({target} ticks)");
+        }
+    }
+
+    /// Transition bench: a flat ground of adjacent blend-material patches
+    /// (sand | grass | dirt | stone | snow) plus a stepped side-face
+    /// boundary, viewed from a shallow angle - the discriminating look for
+    /// how block-type edges read.
+    fn build_transition_world() -> World {
+        use crate::voxel::*;
+        let mut world = World::new();
+        let mats = [MAT_SAND, MAT_GRASS, MAT_DIRT, MAT_STONE, MAT_SNOW];
+        // Interlocking checker of the five materials on a flat top plane so
+        // every pair meets somewhere.
+        for z in 80..140u32 {
+            for x in 80..140u32 {
+                let cell = ((x - 80) / 12) as usize % mats.len();
+                let cell2 = ((z - 80) / 12) as usize % mats.len();
+                let m = mats[(cell + cell2) % mats.len()];
+                world.set_voxel(x, 62, z, m);
+                for y in 58..62u32 {
+                    world.set_voxel(x, y, z, MAT_STONE);
+                }
+            }
+        }
+        // A raised sand shelf against grass, so the vertical SIDE-face
+        // boundary (sand wall meeting grass) is in frame.
+        for z in 100..120u32 {
+            for x in 100..120u32 {
+                for y in 62..66u32 {
+                    world.set_voxel(x, y, z, MAT_SAND);
+                }
+                world.set_voxel(x, 66, z, MAT_SAND);
+            }
+        }
+        world
+    }
+
+    #[test]
+    #[ignore]
+    fn dump_transition_views() {
+        let world = build_transition_world();
+        std::fs::create_dir_all("target/lookdev").unwrap();
+        let mut top = Camera::new();
+        top.pos = glam::Vec3::new(110.0, 90.0, 111.0);
+        top.yaw = 0.0;
+        top.pitch = -1.15;
+        let mut angle = Camera::new();
+        angle.pos = glam::Vec3::new(96.0, 72.0, 96.0);
+        angle.yaw = std::f32::consts::FRAC_PI_4;
+        angle.pitch = -0.45;
+        for (name, cam) in [("transition_top", top), ("transition_angle", angle)] {
+            let Some(rgba) = render_rgba(&world, &cam, 960, 540) else {
+                eprintln!("no GPU — skipping");
+                return;
+            };
+            let path = format!("target/lookdev/{name}.png");
+            let file = std::fs::File::create(&path).unwrap();
+            let mut enc = png::Encoder::new(std::io::BufWriter::new(file), 960, 540);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            enc.write_header().unwrap().write_image_data(&rgba).unwrap();
+            eprintln!("wrote {path}");
+        }
+    }
+
     /// Renders a floating wall (or slab top) of `mat` twice: once as built,
     /// once shifted one voxel along the face normal WITH the camera shifted
     /// identically. Camera-relative geometry, lighting, fog and jitter are
