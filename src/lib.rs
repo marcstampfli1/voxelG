@@ -10,6 +10,7 @@ pub mod sprites;
 pub mod camera;
 pub mod leaffall;
 pub mod raycast;
+pub mod accel;
 pub mod physics;
 pub mod net;
 pub mod temporal;
