@@ -102,3 +102,17 @@ Architecture + rules: see the plan (scratchpad draft) and memory project-voxelg-
   accelerating occlusion alone. The big multiplier the pivot imagined lives in the
   PRIMARY trace (still the software DDA); RT-accelerating primary rays is Phase 4 and
   where most of the remaining speedup is. (Windowed fps is the user's own next check.)
+- Phase 4 groundwork DONE: the shared `resolve_brick` now also returns the entry-face
+  NORMAL (validated vs the CPU raycaster's normal on all 232 clean hits at both
+  origins). So the primary-hit RESOLVE - nearest voxel + material + normal - is
+  complete and proven; that is the core primitive a primary ray needs.
+  Phase 4 DESIGN (proposed, needs the user's call + windowed eyeball): the elegant
+  shape is a HYBRID trace - the RT core does the coarse BVH traversal to the nearest
+  candidate brick (replacing the software tile/chunk/L4 empty-space skipping), then
+  the EXISTING in-brick / sub-voxel resolve runs from there (water bilinear surfaces,
+  foliage cutouts, LOD - all unchanged, so it matches software pixel-for-pixel and
+  the A/B keeps working). A candidate brick that misses (foliage cutout, no solid)
+  continues to the next, exactly like rt_brick_occludes. This keeps every sub-voxel
+  feature while using RT to skip empty space. It is a big refactor of the monolithic
+  trace() and the sub-voxel features are visual, so it wants design sign-off + a
+  windowed check - not a blind headless change.
