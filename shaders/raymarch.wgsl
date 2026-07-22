@@ -2277,59 +2277,78 @@ fn water_subvoxel(
         return out;
     }
 
-    let a1 = c10.x - c00.x;
-    let a2 = c01.x - c00.x;
-    let a3 = c00.x - c10.x - c01.x + c11.x;
-    let r1 = c10.y - c00.y;
-    let r2 = c01.y - c00.y;
-    let r3 = c00.y - c10.y - c01.y + c11.y;
+    return water_tri_surface(c00, c10, c01, c11, p0, dir, t_entry, t_exit - t_entry, entry_n);
+}
 
-    let s0 = c00.x + a1 * p0.x + a2 * p0.z + a3 * p0.x * p0.z;
-    if (p0.y <= s0 + 1e-4) {
-        // Entered below the waterline: the entry face IS the water surface -
-        // a side wall at a shore/terrace drop, or the underside. Shared
-        // corners guarantee this never fires between two same-y water cells.
-        out.hit = true;
-        out.t_hit = t_entry;
-        out.normal = entry_n;
-        out.grad_rest = vec2<f32>(r1 + r3 * p0.z, r2 + r3 * p0.x);
-        return out;
-    }
-    // Entered above the patch: g(s) = y(s) - S(x(s), z(s)) is an exact
-    // quadratic in the ray parameter; C = g(0) > 0, so the smallest root in
-    // range is the downward crossing. Stable q-form roots; |A| ~ 0 falls
-    // back to the plane case (today's math shape).
-    let a_q = -a3 * dir.x * dir.z;
-    let b_q = dir.y - a1 * dir.x - a2 * dir.z - a3 * (p0.x * dir.z + p0.z * dir.x);
-    let c_q = p0.y - s0;
-    var s_hit = -1.0;
-    let s_max = t_exit - t_entry;
-    if (abs(a_q) < 1e-7) {
-        if (b_q < -1e-6) {
-            let s = c_q / (-b_q);
-            if (s < s_max) { s_hit = s; }
+// Cell water surface as TWO FLAT TRIANGLES instead of a bilinear patch.
+// A bilinear over 4 unequal corners is a hyperbolic saddle that bulges
+// into a curved "arch/fan" - the ugliness around a pit filling in a lake.
+// Splitting the cell along its FLATTER diagonal into two planar triangles
+// removes the bulge (a plane cannot arch) while staying C0: the triangles
+// share two corners and the split diagonal, and neighbouring cells share
+// full edges (both endpoints), so the surface stays watertight. Gentle
+// cells (near-equal corners) are near-coplanar, so the split is invisible.
+// corners: .x = height, .y = rest-height (for the shading gradient).
+fn water_tri_surface(
+    c00: vec2<f32>, c10: vec2<f32>, c01: vec2<f32>, c11: vec2<f32>,
+    p0: vec3<f32>, dir: vec3<f32>, t_entry: f32, s_max: f32, entry_n: vec3<f32>,
+) -> WaterSubHit {
+    var out: WaterSubHit;
+    out.hit = false;
+    out.grad_rest = vec2<f32>(0.0);
+    // Split along the diagonal whose two corners are closest in height, so
+    // the crease runs along the flatter direction.
+    let split_main = abs(c00.x - c11.x) <= abs(c10.x - c01.x);
+
+    var best_s = 1e30;
+    for (var t: i32 = 0; t < 2; t = t + 1) {
+        // Plane height = A + Bx*x + Bz*z over this triangle, plus the rest
+        // plane (Ar,Brx,Brz). `reg` >= 0 marks the triangle's half of the
+        // cell at a point (rx, rz).
+        var A: f32; var Bx: f32; var Bz: f32;
+        var Ar: f32; var Brx: f32; var Brz: f32;
+        if (split_main) {
+            if (t == 0) { // corners c00,c10,c11 ; region x >= z
+                A = c00.x; Bx = c10.x - c00.x; Bz = c11.x - c10.x;
+                Ar = c00.y; Brx = c10.y - c00.y; Brz = c11.y - c10.y;
+            } else {       // corners c00,c01,c11 ; region x <= z
+                A = c00.x; Bx = c11.x - c01.x; Bz = c01.x - c00.x;
+                Ar = c00.y; Brx = c11.y - c01.y; Brz = c01.y - c00.y;
+            }
+        } else {
+            if (t == 0) { // corners c00,c10,c01 ; region x + z <= 1
+                A = c00.x; Bx = c10.x - c00.x; Bz = c01.x - c00.x;
+                Ar = c00.y; Brx = c10.y - c00.y; Brz = c01.y - c00.y;
+            } else {       // corners c10,c01,c11 ; region x + z >= 1
+                A = c10.x + c01.x - c11.x; Bx = c11.x - c01.x; Bz = c11.x - c10.x;
+                Ar = c10.y + c01.y - c11.y; Brx = c11.y - c01.y; Brz = c11.y - c10.y;
+            }
         }
-    } else {
-        let disc = b_q * b_q - 4.0 * a_q * c_q;
-        if (disc >= 0.0) {
-            let q = -0.5 * (b_q + sign(b_q) * sqrt(disc));
-            let ra = q / a_q;
-            let rb = c_q / q;
-            let lo = min(ra, rb);
-            let hi = max(ra, rb);
-            var s = -1.0;
-            if (lo > 0.0) { s = lo; } else if (hi > 0.0) { s = hi; }
-            if (s > 0.0 && s < s_max) { s_hit = s; }
+        // Entry-below test: if p0 is inside this triangle and under its
+        // plane, the entry face IS the surface (a wall / underside).
+        let in_reg0 = select(p0.x + p0.z <= 1.0, p0.x >= p0.z, split_main) == (t == 0);
+        let s_plane_at_p0 = A + Bx * p0.x + Bz * p0.z;
+        if (in_reg0 && p0.y <= s_plane_at_p0 + 1e-4) {
+            out.hit = true;
+            out.t_hit = t_entry;
+            out.normal = entry_n;
+            out.grad_rest = vec2<f32>(Brx, Brz);
+            return out;
         }
-    }
-    if (s_hit >= 0.0) {
-        let ph = p0 + dir * s_hit;
-        let grad = vec2<f32>(a1 + a3 * ph.z, a2 + a3 * ph.x);
+        // Ray vs plane.
+        let den = dir.y - Bx * dir.x - Bz * dir.z;
+        if (abs(den) < 1e-7) { continue; }
+        let s = (A + Bx * p0.x + Bz * p0.z - p0.y) / den;
+        if (s <= 0.0 || s >= min(s_max, best_s)) { continue; }
+        let px = p0.x + dir.x * s;
+        let pz = p0.z + dir.z * s;
+        let in_reg = select(px + pz <= 1.0001, px >= pz - 1e-4, split_main) == (t == 0);
+        if (!in_reg) { continue; }
+        best_s = s;
         out.hit = true;
-        out.t_hit = t_entry + s_hit;
-        out.normal = normalize(vec3<f32>(-grad.x, 1.0, -grad.y));
-        out.grad_rest = vec2<f32>(r1 + r3 * ph.z, r2 + r3 * ph.x);
-        return out;
+        out.t_hit = t_entry + s;
+        out.normal = normalize(vec3<f32>(-Bx, 1.0, -Bz));
+        out.grad_rest = vec2<f32>(Brx, Brz);
     }
     return out;
 }
