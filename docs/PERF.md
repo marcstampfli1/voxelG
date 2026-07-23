@@ -49,6 +49,12 @@ Live static frames (tile-gated): ~1.9-2.5 ms GPU total.
   proportionate. LESSON (lab): a "pink grass cell" chased for a session was
   two dry-straw rows perspective-splitting at off-center x - verify cell
   identity with a single-material render before debugging color math.
+  Follow-up (Marc's eye): tussocks widened to the full voxel footprint
+  (edge-room-scaled half-width and lean, sway clamped at the walls, cl.y
+  bound added) and the five flower sprites redrawn with orthogonal pixel
+  connectivity + natural-tone colors ("single pixels escaping" fix).
+  Bench pair 1 identical to reference (285/202/216 both binaries); pair 2
+  thermal-only (terrain control itself fell 6%). Cost-neutral.
   reflection history is reprojected by ABSOLUTE surface position into the
   previous frame and reused when the stored position matches AND the view
   ray to the point rotated < ~2 degrees since last frame (computable from

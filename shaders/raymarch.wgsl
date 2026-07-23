@@ -1514,23 +1514,23 @@ fn flower_color(sprite: u32, val: u32) -> vec3<f32> {
     if (val == 2u) { return vec3<f32>(0.200, 0.450, 0.130); } // stem/leaf
     if (sprite == SPR_POPPY) {
         if (val == 3u) { return vec3<f32>(0.120, 0.090, 0.050); } // dark centre
-        return vec3<f32>(0.950, 0.150, 0.120);                    // red petals
+        return vec3<f32>(0.900, 0.160, 0.130);                    // red petals
     }
     if (sprite == SPR_DAISY) {
-        if (val == 3u) { return vec3<f32>(1.150, 0.850, 0.150); } // yellow centre
-        return vec3<f32>(0.950, 0.950, 0.900);                    // white petals
+        if (val == 3u) { return vec3<f32>(1.000, 0.820, 0.250); } // yellow centre
+        return vec3<f32>(0.930, 0.930, 0.880);                    // white petals
     }
     if (sprite == SPR_TULIP) {
-        if (val == 3u) { return vec3<f32>(1.100, 0.550, 0.200); } // lit rim
-        return vec3<f32>(1.000, 0.320, 0.100);                    // red-orange cup
+        if (val == 3u) { return vec3<f32>(0.950, 0.450, 0.280); } // lit rim
+        return vec3<f32>(0.860, 0.300, 0.240);                    // rose-red cup
     }
     if (sprite == SPR_CORNFLOWER) {
-        if (val == 3u) { return vec3<f32>(0.480, 0.620, 1.100); } // bright fringe
-        return vec3<f32>(0.240, 0.350, 0.950);                    // cornflower blue
+        if (val == 3u) { return vec3<f32>(0.470, 0.580, 0.960); } // bright fringe
+        return vec3<f32>(0.280, 0.380, 0.880);                    // cornflower blue
     }
     // Dandelion.
-    if (val == 3u) { return vec3<f32>(1.150, 1.000, 0.250); }     // bright core
-    return vec3<f32>(1.050, 0.820, 0.120);                        // yellow puff
+    if (val == 3u) { return vec3<f32>(1.000, 0.900, 0.320); }     // bright core
+    return vec3<f32>(0.950, 0.790, 0.240);                        // yellow puff
 }
 
 fn sprite_cross_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32) -> SubHit {
@@ -1646,18 +1646,25 @@ fn flora_clump_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32
 
     for (var i: i32 = 0; i < FLORA_BLADES; i = i + 1) {
         let bh = hash3f(voxel_min + vec3<f32>(f32(i) * 7.13 + 0.31, 3.7, f32(i) * 2.9 + 0.17));
-        // Sub-clump centre (3 per cell), blade root jittered around it.
+        // Sub-clump centre (3 per cell) spread across the WHOLE footprint,
+        // blade root jittered around it; the tussock owns its full voxel.
         let sc = f32(i % 3);
-        let cx = 0.28 + 0.44 * fract(vh * 23.0 + sc * 0.37);
-        let cz = 0.28 + 0.44 * fract(vh * 57.0 + sc * 0.71);
-        let root2 = vec2<f32>(cx, cz) + (vec2<f32>(fract(bh * 13.0), fract(bh * 29.0)) - vec2<f32>(0.5)) * 0.20;
+        let cx = 0.15 + 0.70 * fract(vh * 23.0 + sc * 0.37);
+        let cz = 0.15 + 0.70 * fract(vh * 57.0 + sc * 0.71);
+        let root2 = clamp(
+            vec2<f32>(cx, cz) + (vec2<f32>(fract(bh * 13.0), fract(bh * 29.0)) - vec2<f32>(0.5)) * 0.26,
+            vec2<f32>(0.03), vec2<f32>(0.97));
+        // Room to the nearest cell wall: wall-adjacent blades get thin and
+        // stand straight so nothing clips mid-blade at the (invisible) wall;
+        // interior blades stay fat and spray outward over their heads.
+        let edge_room = min(min(root2.x, 1.0 - root2.x), min(root2.y, 1.0 - root2.y));
         // Yaw: the 8-angle fan plus jitter; card tangent/normal from it.
         let ang = (f32(i & 7) / 8.0) * 6.2832 + fract(bh * 5.0) * 0.7;
         let ca = cos(ang);
         let sa = sin(ang);
         let pt2 = vec2<f32>(ca, sa);
         let pn = vec3<f32>(-sa, 0.0, ca);
-        let h = 0.55 + fract(bh * 3.0) * 0.45;
+        let h = 0.60 + fract(bh * 3.0) * 0.40;
         let denom = dot(dir, pn);
         if (abs(denom) < 1e-4) { continue; }
         let rootw = voxel_min + vec3<f32>(root2.x, 0.0, root2.y);
@@ -1665,18 +1672,24 @@ fn flora_clump_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32
         if (t < 0.0 || t >= best_t) { continue; }
         let pw = origin + dir * t;
         // Stay inside the cell like the cross quads do - hits beyond the
-        // cell wall would break the DDA's front-to-back ordering.
+        // cell walls would break the DDA's front-to-back ordering. All
+        // three axes: the card plane extends above the cell too.
         let cl = pw - voxel_min;
-        if (cl.x < 0.0 || cl.x > 1.0 || cl.z < 0.0 || cl.z > 1.0) { continue; }
+        if (cl.x < 0.0 || cl.x > 1.0 || cl.y > 1.0
+         || cl.z < 0.0 || cl.z > 1.0) { continue; }
         let p = pw - rootw;
         if (p.y < 0.0 || p.y > h) { continue; }
         let vn = p.y / h;
         // Outward lean from the sub-clump centre plus tip-weighted wind sway
-        // (v^2: roots stay planted, tips ride the gusts).
-        let lean = (root2 - vec2<f32>(0.5)) * 0.5;
-        let sway = lean * p.y + wind * (p.y * p.y);
+        // (v^2: roots stay planted, tips ride the gusts). The combined
+        // displacement is clamped to the cell so gust-blown tips crowd
+        // against the wall instead of being sliced off by it.
+        let lean = (root2 - vec2<f32>(0.5)) * 0.5 * clamp(edge_room * 3.0, 0.0, 1.0);
+        let sway = clamp(
+            lean * p.y + wind * (p.y * p.y),
+            vec2<f32>(0.03) - root2, vec2<f32>(0.97) - root2);
         let uoff = dot(p.xz - sway, pt2);
-        let wq = 0.26; // card half-width
+        let wq = clamp(edge_room, 0.06, 0.26); // card half-width
         if (abs(uoff) > wq) { continue; }
         let u = clamp(uoff / wq * 0.5 + 0.5, 0.0, 0.99999);
         var sprite = SPR_BLADE_A + (u32(fract(bh * 97.0) * 3.0) % 3u);
