@@ -156,7 +156,7 @@ fn vs_grass(@builtin(vertex_index) vid: u32,
 
     let fa = clump_ang + (fract(bh * 5.0) - 0.5) * 1.5;
     let fdir = vec2<f32>(cos(fa), sin(fa));
-    let h = field * clump_h * (0.35 + 0.50 * fract(bh * 3.0));
+    let h = field * clump_h * (0.45 + 0.55 * fract(bh * 3.0));
     let curve = 0.35 + 0.55 * fract(bh * 13.0);
     // Wind bends the CURVE (control points), not the whole blade rigidly.
     let phase = rootw.x * 0.40 + rootw.z * 0.55 + bh * 6.28;
@@ -179,7 +179,7 @@ fn vs_grass(@builtin(vertex_index) vid: u32,
     let wide3 = vec3<f32>(-wf.y, 0.0, wf.x);
 
     // Width: taper root->tip.
-    var hw = 0.013 * GRASS_WIDTH_MUL * (0.8 + 0.4 * fract(bh * 17.0)) * (1.0 - t0 * 0.85);
+    var hw = 0.032 * GRASS_WIDTH_MUL * (0.8 + 0.4 * fract(bh * 17.0)) * (1.0 - t0 * 0.80);
 
     let wp0 = p + wide3 * hw * cs;
     let d = wp0 - camera.origin;
@@ -214,10 +214,12 @@ fn vs_grass(@builtin(vertex_index) vid: u32,
     // ---- colour: clump-coherent, root-dark -> tip-bright, dry skew ----
     let ground = vec3<f32>(0.30, 0.65, 0.20); // palette[MAT_GRASS], SYNC renderer default_palette
     let dry = fract(cid * 9.77);
-    let hue = mix(vec3<f32>(1.0), vec3<f32>(1.30, 1.02, 0.52), dry * dry * 0.55);
-    let cb = (0.82 + 0.34 * fract(cid * 5.23)) * (0.90 + 0.20 * fract(bh * 23.0));
-    o.albedo0 = ground * hue * cb * 0.35;
-    o.albedo1 = ground * hue * cb * 1.15;
+    // Stylized lush field: only occasional clumps skew warm, and gently.
+    let hue = mix(vec3<f32>(1.0), vec3<f32>(1.22, 1.04, 0.62),
+                  smoothstep(0.75, 1.0, dry) * 0.45);
+    let cb = (0.88 + 0.24 * fract(cid * 5.23)) * (0.92 + 0.16 * fract(bh * 23.0));
+    o.albedo0 = ground * hue * cb * 0.42;
+    o.albedo1 = ground * hue * cb * 1.35;
     return o;
 }
 
