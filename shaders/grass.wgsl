@@ -320,8 +320,14 @@ fn fs_grass(in: VsOut) -> @location(0) vec4<f32> {
             * max(0.0, dot(vdir2, s) * 0.5 + 0.5);
         col = col + sc * shadow
             * (sheen * 0.25 * vec3<f32>(1.0, 1.0, 0.85)
-               + back * 0.55 * vec3<f32>(0.60, 0.88, 0.30) * (0.3 + 0.7 * sblade)
-               + rim * 0.35 * vec3<f32>(0.95, 1.0, 0.70));
+               + back * 0.38 * vec3<f32>(0.60, 0.88, 0.30) * (0.3 + 0.7 * sblade)
+               + rim * 0.16 * vec3<f32>(0.95, 1.0, 0.70));
+    }
+    // Solid silhouette: the outer sliver of each blade darkens slightly
+    // (stylized edge), so edges never read as light leaking through.
+    {
+        let edge = smoothstep(0.6, 1.0, abs(in.uv.x));
+        col *= 1.0 - edge * 0.18;
     }
 
     // Fog toward the horizon haze so far grass melts into the fogged

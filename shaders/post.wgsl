@@ -31,7 +31,9 @@ fn cs_bright(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Soft knee around 1.0: only genuinely hot pixels bloom (sun, glints,
     // backlit tips), never flat mid-tones.
     let l = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
-    let k = max(l - 1.0, 0.0) / max(l, 1e-4);
+    // Higher knee: only truly hot pixels bloom, so the glow never bleeds
+    // across dark blade silhouettes and makes them read transparent.
+    let k = max(l - 1.35, 0.0) / max(l, 1e-4);
     textureStore(bloom_out, p, vec4<f32>(c * k, 1.0));
 }
 
@@ -83,7 +85,7 @@ fn cs_post(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Bilinear-upsampled bloom, additive with a restrained weight.
     let uv = (vec2<f32>(p) + vec2<f32>(0.5)) / camera.resolution;
     let bloom = textureSampleLevel(bloom_in, lin_sampler, uv, 0.0).rgb;
-    hdr += bloom * 0.35;
+    hdr += bloom * 0.22;
 
     // Slight exposure lift into the filmic curve.
     var c = aces(hdr * 1.15);
