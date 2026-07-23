@@ -162,8 +162,8 @@ fn vs_grass(@builtin(vertex_index) vid: u32,
 
     let fa = clump_ang + (fract(bh * 5.0) - 0.5) * 1.5;
     let fdir = vec2<f32>(cos(fa), sin(fa));
-    let hfrac = 0.40 + 0.60 * fract(bh * 3.0);
-    let h = field * clump_h * hfrac * 1.15;
+    let hfrac = 0.55 + 0.45 * fract(bh * 3.0);
+    let h = field * clump_h * hfrac * 1.02;
     let curve = 0.16 + 0.30 * fract(bh * 13.0);
     // Wind bends the CURVE (control points), not the whole blade rigidly.
     let phase = rootw.x * 0.40 + rootw.z * 0.55 + bh * 6.28;
@@ -189,7 +189,11 @@ fn vs_grass(@builtin(vertex_index) vid: u32,
     let wide3 = vec3<f32>(-wf.y, 0.0, wf.x);
 
     // Width: taper root->tip.
-    var hw = 0.032 * GRASS_WIDTH_MUL * (0.8 + 0.4 * fract(bh * 17.0)) * (1.0 - t0 * 0.93);
+    // Plump profile: nearly full width through the middle of the blade,
+    // rounding off near the tip - the fluffy stylized silhouette, not a
+    // straw that thins from the root.
+    let plump = 1.0 - pow(t0, 1.6) * 0.97;
+    var hw = 0.034 * GRASS_WIDTH_MUL * (0.8 + 0.4 * fract(bh * 17.0)) * plump;
 
     let wp0 = p + wide3 * hw * cs;
     let d = wp0 - camera.origin;
@@ -231,8 +235,8 @@ fn vs_grass(@builtin(vertex_index) vid: u32,
     let hue = mix(vec3<f32>(1.0), vec3<f32>(1.22, 1.04, 0.62),
                   smoothstep(0.75, 1.0, dry) * 0.45);
     let cb = (0.88 + 0.24 * fract(cid * 5.23)) * (0.92 + 0.16 * fract(bh * 23.0));
-    o.albedo0 = ground * hue * cb * 0.58;
-    o.albedo1 = ground * hue * cb * 1.35;
+    o.albedo0 = ground * hue * cb * 0.66;
+    o.albedo1 = ground * hue * cb * 1.48;
     return o;
 }
 

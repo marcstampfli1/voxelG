@@ -20,7 +20,7 @@ pub const GRASS_LOD1_T: f32 = 44.0;
 pub const GRASS_LOD2_T: f32 = 90.0;
 
 /// blades x segments per LOD band; a segment is one 6-vertex quad.
-pub const LOD_SHAPE: [(u32, u32); 3] = [(56, 5), (30, 3), (14, 1)];
+pub const LOD_SHAPE: [(u32, u32); 3] = [(80, 5), (42, 3), (20, 1)];
 
 /// Vertices per cell instance in a band.
 pub fn verts_per_cell(lod: usize) -> u32 {
