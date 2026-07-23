@@ -15,19 +15,34 @@ get shown with numbers before shipping, never after.
   to refresh on static scenes - use UNCAPPED (Immediate) for headroom numbers.
 - Any config where software beats RT is a finding, not a curiosity.
 
-## Baselines (2026-07-23b, + glint gate, refl accum, probe staging; 1920x1080 all-dirty)
+## Baselines (2026-07-23c, + flat refracted-hit AO; 1920x1080 all-dirty)
 
 | scenario     | software | RT-primary       | RT-prim + probe GI |
 |--------------|----------|------------------|--------------------|
-| terrain      | 9.76     | 8.27  (1.18x sw) | 9.10  (1.07x sw)   |
-| foliage      | 11.02    | 10.02 (1.10x sw) | 10.93 (1.01x sw)   |
-| water-close  | 11.35    | 10.35 (1.10x sw) | 11.21 (1.01x sw)   |
+| terrain      | 9.83     | 8.32  (1.18x sw) | 9.14  (1.08x sw)   |
+| foliage      | 10.93    | 10.03 (1.09x sw) | 10.96 (1.00x sw)   |
+| water-close  | 9.65     | 7.74  (1.25x sw) | 8.48  (1.14x sw)   |
+
+Water-close static camera 7.34 ms. Per-pass water-close: SW transp 5.80,
+RT transp 4.71. Terrain/foliage rows are the 23b measurements (unaffected
+by the water change); water-close re-measured after flat AO.
 
 Per-pass water-close: transp 9.2-9.6 ms (THE whale). Foliage main ~10.3 all-dirty.
 Live static frames (tile-gated): ~1.9-2.5 ms GPU total.
 
 ## Proven (shipped)
 
+- Flat AO on refracted water hits: the transp cost-split attributed 2.55-2.66
+  ms (the single largest water cost) to AO rays traced for bed pixels whose
+  contribution absorption + tint then swamp. Replaced with a flat 0.4;
+  masked pixel diff vs traced AO: mean 1.3/255, 0.018% of pixels > 10/255
+  (above-water view; a submerged camera never runs this path). water-close
+  transp RT 7.28 -> 4.71, frame 11.06 -> 8.48 all-dirty / 9.90 -> 7.34
+  static; software gains too (transp 7.48 -> 5.80). Look signed off with
+  side-by-side stills. LESSON: the first look comparison used an UNDERWATER
+  view where shade_water_top's refraction branch never executes - identical
+  images that proved nothing (Marc caught it). Compare look changes in a
+  view that exercises the changed code path.
 - Probe-GI staged deterministic gather (the "breathing shadows" root fix):
   probe update rays were hashed on camera.time, so every 8-ray round was a
   fresh random estimate and the per-round EMA random-walked forever - visible

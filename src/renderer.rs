@@ -3703,6 +3703,14 @@ mod gpu_render_tests {
         eprintln!("pond at ({px},{pz}) floor {pfloor} surface {psurf}");
         flicker_probe_rt(&world, &uc, "underwater", day);
         flicker_probe_rt(&world, &uc, "underwater", no_gi);
+        // Standing surface view: down through the water surface at the bed
+        // (shallow shore and deeper middle in frame) - the view that
+        // exercises shade_water_top's refraction branch, which a submerged
+        // camera never does.
+        let mut wt = Camera::new();
+        wt.pos = glam::Vec3::new(px as f32 + 0.5, psurf as f32 + 6.0, pz as f32 - 10.0);
+        wt.pitch = -0.75;
+        flicker_probe_rt(&world, &wt, "water_top", day);
         // The primary symptom view: a lone tree's cast shadow on open grass,
         // camera aimed at the penumbra boundary. Sun at t=30 is at
         // s ~ (-0.36, 0.89, 0.29): the shadow of a crown ~9 up lands ~(+3.6,

@@ -2958,8 +2958,15 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>, px: vec2<i32>) -
                 // shadow_term is 0 by construction. Feed the constant through the
                 // reuse path instead of tracing a per-pixel ray for a known answer.
                 // AO stays computed (reuse_ao = false). Image-identical.
-                var known_dark = vec2<f32>(0.0, 0.0);
-                under_col = shade(under, refr_origin, refr_dir, jit, true, false, false, &known_dark, vec3<f32>(0.0));
+                // Flat AO for the refracted hit (cost-split PROVEN: traced
+                // AO was 2.55-2.66 ms of the transp pass - the single
+                // largest water cost - while absorption + tint swamp its
+                // contribution. Masked pixel diff vs traced AO from above
+                // the surface: mean 1.3/255, 0.018% of pixels > 10/255;
+                // identical below. Look signed off 2026-07-23). The shadow
+                // term stays the proven constant 0.
+                var known_dark = vec2<f32>(0.0, 0.4);
+                under_col = shade(under, refr_origin, refr_dir, jit, true, true, false, &known_dark, vec3<f32>(0.0));
             }
         } else {
             under_col = sky(refr_dir) * 0.6;
