@@ -3494,7 +3494,7 @@ fn shade(
     // (view- and distance-independent) so it can never read as a moving or
     // camera-following artifact.
     if (hit.mat == MAT_GRASS && hit.normal.y > 0.5) {
-        base *= 0.62;
+        base *= 0.94;
     }
     // Skip the cube-face AO for sub-voxel sphere hits (foliage). The curved
     // sphere normal already gives rim/falloff that reads as 3D.

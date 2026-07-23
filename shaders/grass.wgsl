@@ -190,16 +190,15 @@ fn vs_grass(@builtin(vertex_index) vid: u32,
     tang = normalize(tang);
 
     // Ribbon wide axis: across the facing, twisted slightly along the blade.
-    let tw = (fract(bh * 31.0) - 0.5) * 0.7 + t0 * 0.4;
+    let tw = (fract(bh * 31.0) - 0.5) * 0.3 + t0 * 0.15;
     let wf = vec2<f32>(cos(fa + tw), sin(fa + tw));
     let wide3 = vec3<f32>(-wf.y, 0.0, wf.x);
 
     // Width: taper root->tip.
-    // Plump profile: nearly full width through the middle of the blade,
-    // rounding off near the tip - the fluffy stylized silhouette, not a
-    // straw that thins from the root.
-    let plump = 1.0 - pow(t0, 1.6) * 0.97;
-    var hw = 0.034 * GRASS_WIDTH_MUL * (0.8 + 0.4 * fract(bh * 17.0)) * plump;
+    // Flat tapered spike: linear width to a sharp point (the reference's
+    // low-poly triangle blades, not rounded straws).
+    let plump = 1.0 - t0 * 0.98;
+    var hw = 0.036 * GRASS_WIDTH_MUL * (0.8 + 0.4 * fract(bh * 17.0)) * plump;
 
     let wp0 = p + wide3 * hw * cs;
     let d = wp0 - camera.origin;
@@ -232,7 +231,7 @@ fn vs_grass(@builtin(vertex_index) vid: u32,
     o.wide3 = wide3;
     // Sward interior: a blade shorter than its neighbourhood's tall canopy
     // lives in their shade. hfrac is the blade's height rank in the cell.
-    o.blade_ao = 0.86 + 0.14 * hfrac;
+    o.blade_ao = 0.94 + 0.06 * hfrac;
     // Project the root to screen space for the light-cache lookup (same
     // pinhole as the vertex path; jitter offset matches the cache's grid).
     let rd = rootw - camera.origin;
@@ -249,8 +248,11 @@ fn vs_grass(@builtin(vertex_index) vid: u32,
     let hue = mix(vec3<f32>(1.0), vec3<f32>(1.22, 1.04, 0.62),
                   smoothstep(0.75, 1.0, dry) * 0.45);
     let cb = (0.88 + 0.24 * fract(cid * 5.23)) * (0.92 + 0.16 * fract(bh * 23.0));
-    o.albedo0 = ground * hue * cb * 0.80;
-    o.albedo1 = ground * hue * cb * 1.48;
+    // Base: ONE shared carpet colour (warm bright green, no per-blade or
+    // per-clump variance) so the bottoms of neighbouring blades fuse into
+    // sameness like the reference; identity lives at the tips.
+    o.albedo0 = ground * vec3<f32>(1.18, 1.06, 0.68) * 0.98;
+    o.albedo1 = ground * hue * cb * 1.52;
     return o;
 }
 
@@ -293,13 +295,13 @@ fn fs_grass(in: VsOut) -> @location(0) vec4<f32> {
     let wide_s = normalize(in.wide3);
     var nf = normalize(cross(tang_s, wide_s));
     nf = nf * select(1.0, -1.0, nf.y < 0.0);
-    var n = normalize(nf + wide_s * in.uv.x * 0.65);
+    var n = normalize(nf + wide_s * in.uv.x * 0.22);
     n = normalize(mix(n, vec3<f32>(0.0, 1.0, 0.0), 0.25 + 0.35 * sblade));
 
     // Sward depth: the grass volume darkens toward its interior - the
     // height gradient AND the blade's height rank both pull light out.
     // This value range (deep shade to lit tips) is most of the "volume".
-    let sward = (0.70 + 0.30 * sblade) * in.blade_ao;
+    let sward = (0.88 + 0.12 * sblade) * in.blade_ao;
 
     // Wrapped diffuse: foliage responds softer than a hard lambert.
     let ndl = max(0.0, (dot(n, s) + 0.35) / 1.35);
@@ -313,7 +315,9 @@ fn fs_grass(in: VsOut) -> @location(0) vec4<f32> {
                    + vec3<f32>(0.10, 0.16, 0.06) * (0.4 + 0.6 * ao))
         * sky_f * sward;
 
-    let albedo = mix(in.albedo0, in.albedo1, sblade * sblade * 0.6 + sblade * 0.4);
+    // Bottom ~45% holds the flat carpet colour; the ramp to the tip colour
+    // happens in the upper body only.
+    let albedo = mix(in.albedo0, in.albedo1, smoothstep(0.45, 1.0, sblade));
     var col = albedo * (direct + ambient);
 
     // Sheen/backlight need the view ray; reconstruct it from the pixel.
