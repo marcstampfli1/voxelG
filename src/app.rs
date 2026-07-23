@@ -50,6 +50,111 @@ const ANIM_REFRESH_SPREAD: usize = 8;
 /// 8-tap sub-pixel jitter pattern (Halton(2,3), centred to [-0.5, 0.5]) for
 /// temporal anti-aliasing. Applied only while the camera is static so the
 /// accumulation converges to an anti-aliased image.
+/// One scripted benchmark segment: a fixed pose (plus optional +x strafe),
+/// held for `dur` seconds; the first `warmup` seconds are discarded (pipeline
+/// warm, tiles converging, TAA settling).
+struct BenchSeg {
+    name: &'static str,
+    pos: Vec3,
+    yaw: f32,
+    pitch: f32,
+    strafe: f32,
+    dur: f32,
+    warmup: f32,
+}
+
+pub(crate) struct BenchState {
+    segments: Vec<BenchSeg>,
+    idx: usize,
+    seg_start: Instant,
+    dts: Vec<f32>,
+    results: Vec<String>,
+}
+
+impl BenchState {
+    /// Segment poses use the standard demo-world anchors (512^2 island,
+    /// deterministic generator): the pond at (468, 92) with floor 57 /
+    /// surface 64, the leaf-heavy cell at (16, 272) with ground y 90.
+    fn from_env() -> Option<Self> {
+        if std::env::var("VOXELG_BENCH").is_err() {
+            return None;
+        }
+        // Power-state guard: battery power caps CPU/GPU clocks and silently
+        // poisons every number (a battery run drifted water-free control
+        // segments by 35%). Warn loudly; results from a battery run must be
+        // discarded.
+        // On battery only if NO adapter reports online (a machine can have
+        // several ports; an unplugged one must not raise a false alarm).
+        if let Ok(entries) = std::fs::read_dir("/sys/class/power_supply") {
+            let mut saw_adapter = false;
+            let mut any_online = false;
+            for e in entries.flatten() {
+                if let Ok(s) = std::fs::read_to_string(e.path().join("online")) {
+                    saw_adapter = true;
+                    any_online |= s.trim() == "1";
+                }
+            }
+            if saw_adapter && !any_online {
+                println!("bench WARNING: running on BATTERY - results are invalid, plug in AC");
+            }
+        }
+        // Stall watchdog on a detached thread: an unfocused Wayland window
+        // can stop receiving frame callbacks, freezing the bench clock with
+        // the window alive forever (seen live). The thread is immune to the
+        // event loop and force-exits well past the scripted duration.
+        std::thread::spawn(|| {
+            // Slack covers a cold driver shader-compile (~40 s) on a fresh
+            // binary plus the 30 s script.
+            std::thread::sleep(std::time::Duration::from_secs(140));
+            println!("bench WATCHDOG: exceeded scripted duration + slack, forcing exit");
+            unsafe { libc::_exit(3) };
+        });
+        let segs = vec![
+            BenchSeg { name: "water_mid", pos: Vec3::new(464.5, 71.0, 96.0), yaw: 0.0, pitch: -0.22, strafe: 0.0, dur: 6.0, warmup: 2.0 },
+            BenchSeg { name: "water_grazing", pos: Vec3::new(468.5, 65.4, 78.0), yaw: 0.0, pitch: -0.06, strafe: 0.0, dur: 6.0, warmup: 2.0 },
+            BenchSeg { name: "water_strafe", pos: Vec3::new(452.0, 70.0, 92.0), yaw: 0.6, pitch: -0.30, strafe: 12.0, dur: 6.0, warmup: 2.0 },
+            BenchSeg { name: "terrain", pos: Vec3::new(256.0, 140.0, 96.0), yaw: 0.0, pitch: -0.55, strafe: 0.0, dur: 6.0, warmup: 2.0 },
+            BenchSeg { name: "foliage", pos: Vec3::new(48.5, 104.0, 244.0), yaw: 0.0, pitch: -0.35, strafe: 0.0, dur: 6.0, warmup: 2.0 },
+        ];
+        Some(Self { segments: segs, idx: 0, seg_start: Instant::now(), dts: Vec::with_capacity(4096), results: Vec::new() })
+    }
+
+    /// Drive the camera for this frame; returns false when the bench is done.
+    fn step(&mut self, camera: &mut crate::camera::Camera, dt: f32) -> bool {
+        let now = Instant::now();
+        let seg = &self.segments[self.idx];
+        let elapsed = (now - self.seg_start).as_secs_f32();
+        camera.pos = seg.pos + Vec3::new(seg.strafe * elapsed, 0.0, 0.0);
+        camera.yaw = seg.yaw;
+        camera.pitch = seg.pitch;
+        if elapsed > seg.warmup {
+            self.dts.push(dt);
+        }
+        if elapsed >= seg.dur {
+            let mut d = std::mem::take(&mut self.dts);
+            if d.len() > 4 {
+                d.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let mean = d.iter().sum::<f32>() / d.len() as f32;
+                let p = |q: f32| d[((d.len() - 1) as f32 * q) as usize];
+                self.results.push(format!(
+                    "bench [{}]: avg {:.0} fps ({:.2} ms)  p1 {:.0}  p99 {:.0}  frames {}",
+                    seg.name, 1.0 / mean, mean * 1000.0, 1.0 / p(0.99), 1.0 / p(0.01), d.len()
+                ));
+            }
+            self.idx += 1;
+            self.seg_start = now;
+            if self.idx >= self.segments.len() {
+                println!("=== VOXELG_BENCH results (demo world, frozen sun t=30, uncapped) ===");
+                for r in &self.results {
+                    println!("{r}");
+                }
+                return false;
+            }
+        }
+        true
+    }
+}
+
 pub(crate) const JITTER_PATTERN: [[f32; 2]; 8] = [
     [0.0, -0.166_666_7],
     [-0.25, 0.166_666_7],
@@ -114,6 +219,12 @@ pub struct App {
     /// upload), render(acquire+encode+submit+present), whole frame] seconds.
     cpu_prof: [f64; 4],
     cpu_prof_n: u32,
+    /// Deterministic in-game benchmark (VOXELG_BENCH=1): drives the camera
+    /// through fixed scenario segments on the standard demo world, frozen
+    /// sun, uncapped present, and logs real end-to-end fps per segment
+    /// (everything the headless harness cannot see: present, pacing, CPU
+    /// loop, streaming). Same segments every run = honest before/after.
+    bench: Option<BenchState>,
     /// Rotating animation-refresh phase: each frame ~1/ANIM_REFRESH_SPREAD of
     /// the (otherwise clean) tiles are re-traced so sky/water/foliage keep
     /// animating on a still camera — spread evenly instead of one hard full
@@ -196,6 +307,7 @@ impl App {
             frame_counter: 0,
             cpu_prof: [0.0; 4],
             cpu_prof_n: 0,
+            bench: BenchState::from_env(),
             refresh_phase: 0,
             opts,
             leaf_sim: std::env::var("VOXELG_NO_LEAVES")
@@ -436,6 +548,18 @@ impl App {
         let r = (self.keys.right as i32 - self.keys.left as i32) as f32;
         let u = (self.keys.up as i32 - self.keys.down as i32) as f32;
         self.camera.translate_local(dt, f * speed, r * speed, u * speed);
+        // Benchmark mode: the script owns the camera (input overridden).
+        if let Some(mut b) = self.bench.take() {
+            if b.step(&mut self.camera, dt) {
+                self.bench = Some(b);
+            } else {
+                // _exit, not exit(): the process teardown path is broken (the
+                // known segfault/free-on-shutdown bug) and libc atexit
+                // handlers DEADLOCK from exit() - the results printed but the
+                // window sat forever. _exit skips all handlers.
+                unsafe { libc::_exit(0) };
+            }
+        }
 
         let cpu_t1 = Instant::now();
         // Streaming (brief world lock): keep the window centred with a
@@ -653,7 +777,14 @@ impl ApplicationHandler for App {
         }
         let attrs = Window::default_attributes()
             .with_title("voxel")
-            .with_inner_size(winit::dpi::LogicalSize::new(1280, 720));
+            .with_inner_size(if std::env::var("VOXELG_BENCH").is_ok() {
+                // Benchmark runs pin the render size to the panel/harness
+                // resolution so every run (and the GPU bench tables) compare
+                // apples to apples regardless of how the play window is sized.
+                winit::dpi::LogicalSize::new(1920, 1080)
+            } else {
+                winit::dpi::LogicalSize::new(1280, 720)
+            });
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => {

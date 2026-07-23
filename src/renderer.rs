@@ -1449,6 +1449,9 @@ impl Renderer {
         // `CurrentSurfaceTexture` enum. `Suboptimal` still yields a usable frame (historical
         // behavior rendered it), so it is folded into success; every other status is handed
         // back to the caller to drive the reconfigure/skip logic in `App`.
+        // (An acquire-late split - compute submitted before acquiring - was
+        // tried 2026-07-23 and REVERTED: no live fps change at any distance;
+        // the ~4 ms live "CPU" is not an acquire stall. See PERF.md.)
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
             | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
@@ -6060,6 +6063,133 @@ mod gpu_render_tests {
             eprintln!("  refl total {refl_total:.2} (trace {:.2} + shade {refl_shade:.2})  |  refr total {refr_total:.2} (trace {:.2} + shade {refr_shade:.2})  |  tail {min:.2}",
                 refl_total - refl_shade, refr_total - refr_shade);
         }
+    }
+
+    /// CPU cost of ENCODING a frame's compute work: today's split passes
+    /// (one begin/end per pass, as render() does) vs the same dispatches
+    /// merged into a single compute pass with pipeline/bind-group switches.
+    /// Pure CPU measurement - commands are encoded and dropped, never
+    /// submitted - so it is valid even while the game runs.
+    #[test]
+    #[ignore]
+    fn cpu_encode_bench() {
+        let Some((device, queue, _gpu)) = rt_headless_device() else {
+            eprintln!("cpu_encode_bench: no RT adapter, skipping");
+            return;
+        };
+        let _ = &queue;
+        let (w, h) = (1920u32, 1080u32);
+        let mut world = World::new();
+        world.fill_demo_terrain();
+        let wo = world.world_origin_voxel();
+        let cam = ab_camera(&world);
+        let cu = CameraUniform::from_camera(&cam, w, h, 0.0, 0.0, wo, [0.0, 0.0], 0.0);
+        let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None, contents: bytemuck::bytes_of(&cu),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let bricks_buf = storage(&device, "b", bytemuck::cast_slice(&world.bricks));
+        let tm = storage(&device, "tm", bytemuck::cast_slice(&world.tile_mask));
+        let cm = storage(&device, "cm", bytemuck::cast_slice(&world.chunk_mask));
+        let l4 = storage(&device, "l4", bytemuck::cast_slice(&world.l4_mask));
+        let bu = storage(&device, "bu", bytemuck::cast_slice(&pack_u8_to_u32(&world.brick_uniform)));
+        let tu = storage(&device, "tu", bytemuck::cast_slice(&pack_u8_to_u32(&world.tile_uniform)));
+        let palette = default_palette();
+        let palette_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None, contents: bytemuck::cast_slice(&palette),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let tw = (w + 7) / 8; let th = (h + 7) / 8;
+        let words = ((tw * th) as usize + 31) / 32;
+        let td = storage(&device, "td", bytemuck::cast_slice(&vec![u32::MAX; words]));
+        let players = storage(&device, "pl", &vec![0u8; 16 + MAX_REMOTE_PLAYERS * 16]);
+        let (_o, _ov) = create_output_texture(&device, w, h);
+        let (_b, bv) = create_beam_texture(&device, w, h);
+        let (_c, csv, _csw) = create_cloud_texture(&device, w, h);
+        let csamp = device.create_sampler(&wgpu::SamplerDescriptor { mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
+        let (_li, liv) = create_lighting_texture(&device, w, h);
+        let (_lo, lov) = create_lighting_texture(&device, w, h);
+        let tpb = create_transp_buf(&device, w, h);
+        let spr = storage(&device, "spr", bytemuck::cast_slice(&crate::sprites::encoded()));
+        let (_d, dv) = create_depth_texture(&device, w, h);
+        let (_g, gv) = create_output_texture(&device, w, h);
+        let (_hh, hv) = create_output_texture(&device, w, h);
+        let (_dd, ddv) = create_depth_texture(&device, 1, 1);
+        let bgl = create_compute_bgl(&device);
+        let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &gv, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &dv, &hv, &bv);
+        let bg_compose = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &_ov, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &ddv, &gv, &dv);
+        let accel = crate::accel::build_world_accel(&device, &queue, &world);
+        let rt_bgl = create_rt_bgl(&device);
+        let (_gi_i, gi_iv) = create_lighting_texture(&device, w, h);
+        let (_gi_o, gi_ov) = create_lighting_texture(&device, w, h);
+        let probe_buf = create_probe_buf(&device);
+        let rt_bg = make_rt_bg(&device, &rt_bgl, &accel, &gi_iv, &gi_ov, &probe_buf);
+        let rt_m = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(raymarch_source_variant(true).into()) });
+        let rt_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&bgl), Some(&rt_bgl)], immediate_size: 0 });
+        let base: &[(&'static str, f64)] = &[("GI_ENABLE", 1.0), ("RT_PRIMARY", 1.0), ("GI_PROBE_MODE", 1.0)];
+        let mk = |e: &'static str| device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None, layout: Some(&rt_pl), module: &rt_m, entry_point: Some(e),
+            compilation_options: wgpu::PipelineCompilationOptions { constants: base, ..Default::default() },
+            cache: None,
+        });
+        let (p_probe, p_main, p_transp, p_godray, p_comp) =
+            (mk("cs_gi_probe_update"), mk("cs_main"), mk("cs_transparent"), mk("cs_godrays"), mk("cs_compose"));
+        let probe_threads = (crate::voxel::PROBE_TOTAL / GI_PROBE_UPDATE_DIV).div_ceil(64);
+        let (hw, hh) = (w.div_ceil(2).div_ceil(8), h.div_ceil(2).div_ceil(8));
+
+        // Split encoding: one compute pass per dispatch, as render() does.
+        let encode_split = || {
+            let mut e = device.create_command_encoder(&Default::default());
+            {
+                let mut cp = e.begin_compute_pass(&Default::default());
+                cp.set_pipeline(&p_probe); cp.set_bind_group(0, &bg, &[]); cp.set_bind_group(1, &rt_bg, &[]);
+                cp.dispatch_workgroups(probe_threads, 1, 1);
+            }
+            for (pipe, b, x, y) in [(&p_main, &bg, tw, th), (&p_transp, &bg, tw, th), (&p_godray, &bg_compose, hw, hh), (&p_comp, &bg_compose, tw, th)] {
+                let mut cp = e.begin_compute_pass(&Default::default());
+                cp.set_pipeline(pipe); cp.set_bind_group(0, b, &[]); cp.set_bind_group(1, &rt_bg, &[]);
+                cp.dispatch_workgroups(x, y, 1);
+            }
+            e.finish()
+        };
+        // Merged encoding: same dispatches, ONE pass, switches inside.
+        let encode_merged = || {
+            let mut e = device.create_command_encoder(&Default::default());
+            {
+                let mut cp = e.begin_compute_pass(&Default::default());
+                cp.set_bind_group(1, &rt_bg, &[]);
+                cp.set_pipeline(&p_probe); cp.set_bind_group(0, &bg, &[]);
+                cp.dispatch_workgroups(probe_threads, 1, 1);
+                cp.set_pipeline(&p_main); cp.dispatch_workgroups(tw, th, 1);
+                cp.set_pipeline(&p_transp); cp.dispatch_workgroups(tw, th, 1);
+                cp.set_pipeline(&p_godray); cp.set_bind_group(0, &bg_compose, &[]);
+                cp.dispatch_workgroups(hw, hh, 1);
+                cp.set_pipeline(&p_comp); cp.dispatch_workgroups(tw, th, 1);
+            }
+            e.finish()
+        };
+        let time_encode = |f: &dyn Fn() -> wgpu::CommandBuffer| -> f64 {
+            for _ in 0..20 { drop(f()); }
+            let n = 500;
+            let t0 = std::time::Instant::now();
+            for _ in 0..n { drop(f()); }
+            t0.elapsed().as_secs_f64() * 1000.0 / n as f64
+        };
+        let split_ms = time_encode(&encode_split);
+        let merged_ms = time_encode(&encode_merged);
+        eprintln!("cpu_encode_bench: split {split_ms:.3} ms/frame  |  merged {merged_ms:.3} ms/frame  |  saved {:.3}", split_ms - merged_ms);
+        // CPU cost of queue.submit itself (driver command translation): time
+        // encode+submit without waiting, then drain once. The GPU runs
+        // concurrently; the measured wall time is the CPU-side cost as long
+        // as the queue never blocks (n kept small enough).
+        let n = 60;
+        for _ in 0..5 { queue.submit(std::iter::once(encode_split())); }
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        let t0 = std::time::Instant::now();
+        for _ in 0..n { queue.submit(std::iter::once(encode_split())); }
+        let submit_cpu = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        eprintln!("cpu_encode_bench: encode+submit CPU {submit_cpu:.3} ms/frame (excl. GPU wait)");
     }
 
     /// Time the raymarch + deferred-transparent dispatches at 1920x1080 for

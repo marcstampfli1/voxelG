@@ -64,7 +64,14 @@ fn parse_args() -> (Mode, ClientOpts) {
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    let (mode, opts) = parse_args();
+    let (mode, mut opts) = parse_args();
+    // Benchmark mode implies its full deterministic setup: uncapped present
+    // (real throughput) and a frozen sun (identical lighting every run).
+    if std::env::var("VOXELG_BENCH").is_ok() {
+        std::env::set_var("VOXELG_UNCAPPED", "1");
+        std::env::set_var("VOXELG_RT", "1");
+        opts.freeze_time = Some(30.0);
+    }
     match mode {
         Mode::Server(port) => server::run_server(port),
         mode => {

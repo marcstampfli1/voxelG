@@ -2305,6 +2305,7 @@ dependencies = [
  "env_logger",
  "flate2",
  "glam",
+ "libc",
  "log",
  "naga",
  "png",

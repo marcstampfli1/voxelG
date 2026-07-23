@@ -23,6 +23,7 @@ strip = "symbols"
 opt-level = 1
 
 [dependencies]
+libc = "0.2"
 winit = "0.30"
 # wgpu from GitHub trunk (pinned): procedural-AABB acceleration structures +
 # ray_query, needed for the hardware ray-tracing rework, are not in any crates.io

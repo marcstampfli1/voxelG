@@ -108,6 +108,21 @@ Live static frames (tile-gated): ~1.9-2.5 ms GPU total.
   flickered dappled shadows. (Foliage cost is PRIMARY-ray blade cutouts.)
 - Water secondary-shading LOD + refraction cap 40 + grazing reflection cap:
   perf ~neutral on water-close and damaged the look (user reverted).
+- 4-phase static reflection stagger (trace each 8x8 block every 4th frame
+  instead of every 2nd): the live deterministic bench measured IDENTICAL fps
+  on every water segment across interleaved before/after pairs (93/93,
+  74/74, 62/62) with water-free control segments agreeing within 1-5% - the
+  harness-projected ~0.9 ms static win does not survive the full live frame.
+  Look risk for zero gain: rejected. (Also the bench tool's first catch.)
+- Acquire-late render restructure (compute submitted before swapchain
+  acquire): no live fps change at any distance; the ~4 ms live "CPU" is not
+  an acquire stall. Reverted; hunt item 3 reopened with the discriminators.
+- Compute-pass merging (hunt item, est. -0.5-1 ms CPU): MEASURED at 0.013 ms
+  saved (cpu_encode_bench: split encoding 0.027 ms/frame, merged 0.014;
+  encode+submit total only 0.416). The estimate was off ~50x - encoding was
+  never where the live ~4 ms CPU went (it was the early swapchain acquire,
+  see Proven). Candidate killed by a 2-second micro-bench before any
+  refactor risk.
 - Motion-reproject of the lighting cache: fps-scaled resample drift ("warping").
 - Probe-lookup grid-coherence mask (world-anchored noise offset of the
   trilinear phase, to hide probe-grid periodicity): the ~1.3-voxel noise
@@ -133,9 +148,19 @@ Live static frames (tile-gated): ~1.9-2.5 ms GPU total.
    crowns. Needs an in-shader cost split first (primary vs canopy-AO vs GI
    sample); then candidates: cheaper blade parameterization, per-brick blade
    masks (skip cutout-free cells), NOT distance/res cuts.
-3. CPU render() 3.7-4.6 ms while GPU is 2.4 (static): encoder/submit overhead
-   across ~10 passes. Candidate: merge compute passes (multiple dispatches per
-   pass; wgpu inserts the same storage barriers) - est. -0.5-1 ms CPU.
+3. CPU render() 3.7-4.6 ms while GPU 2.4 (static): NOT encoding (0.027 ms),
+   NOT submit (0.416 total), and NOT an acquire stall - an acquire-late
+   restructure (compute submitted before acquiring) produced NO live fps
+   change at any distance and was reverted. Next discriminator: bracket the
+   live render() internally (acquire / encode / submit / present) and check
+   what the app-side "cpu frame ms" actually includes (world sim, uploads,
+   leaffall) before attributing further.
+3b. GRAZING-ANGLE water (Marc: very close + low angle drops to ~80 fps):
+   reflection rays skim parallel to the surface, traveling far and visiting
+   many bricks exactly when the screen is full of water. Candidates: deepen
+   static reflection amortization (1/4 blocks per frame), tighter secondary
+   t-cap where fog owns the result (sub-LSB proof required), grazing-aware
+   reflection origin bias. Look-gated, stills + numbers.
 4. GI textures rgba32float -> rgba16float (radiance fits f16; light cache must
    STAY f32 - the position match breaks at f16 precision).
 5. 44 s cold pipeline compile after shader edits (driver compile bomb): shrink
@@ -148,6 +173,21 @@ Live static frames (tile-gated): ~1.9-2.5 ms GPU total.
    GI-independent noise floor (~5k strong px on the meadow view). Candidate:
    bilinear history sample at the sub-pixel reprojected position + jitter
    compensation. RT-independent, cosmetic-tier.
+
+## Live bench (the end-to-end instrument)
+
+`VOXELG_BENCH=1 ./target/release/voxel` - a deterministic in-game benchmark:
+standard demo world, frozen sun t=30, RT + uncapped + 1920x1080 forced, five
+fixed camera segments (water_mid / water_grazing / water_strafe / terrain /
+foliage), 2 s warmup discarded per segment, avg + p1 + p99 fps printed, then
+self-exit (_exit; the normal teardown path deadlocks - known shutdown bug).
+Guards: battery warning (mains-online check), 140 s stall watchdog thread.
+PROTOCOL: AC power only, no other GPU apps, keep both candidate binaries and
+run INTERLEAVED pairs with settle gaps; the water-free terrain/foliage rows
+are CONTROLS - if they disagree >~5% across runs, discard the session (a
+battery session drifted them 35%). Live baseline (2026-07-23, post flat-AO +
+moving-reuse): water_mid 93, water_grazing 74, water_strafe 62, terrain 218,
+foliage ~200.
 
 ## Flicker rig (the temporal-stability instrument)
 
