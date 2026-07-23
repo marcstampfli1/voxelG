@@ -1,0 +1,46 @@
+From 78e69b279337c91ff2a828af654a2035a926a262 Mon Sep 17 00:00:00 2001
+From: mstampfli <marc.kurt.stampfli@icloud.com>
+Date: Thu, 23 Jul 2026 08:38:15 +0200
+Subject: [PATCH] Give a clear error when `dxc` is missing in the passthrough
+ tests
+
+The SPIR-V and DXIL passthrough tests compile shader.hlsl at runtime by
+shelling out to `dxc`, but the spawn result was bare-unwrapped: on a
+machine without the DirectX Shader Compiler every passthrough test dies
+with only "No such file or directory (os error 2)" and no hint which
+tool is missing (CI installs dxc via .github/actions/install-dxc, so
+only local runs ever hit this). Name the tool and the remedy in the
+panic instead.
+---
+ tests/tests/wgpu-gpu/passthrough/mod.rs | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/tests/tests/wgpu-gpu/passthrough/mod.rs b/tests/tests/wgpu-gpu/passthrough/mod.rs
+index 33e9658b3..4db63783f 100644
+--- a/tests/tests/wgpu-gpu/passthrough/mod.rs
++++ b/tests/tests/wgpu-gpu/passthrough/mod.rs
+@@ -268,7 +268,9 @@ fn compile_dxil(entry: &str, stage_str: &str, test_hash: u64) -> Cow<'static, [u
+             &out_path,
+         ])
+         .output()
+-        .unwrap();
++        .unwrap_or_else(|e| {
++            panic!("failed to run `dxc` (required to compile the passthrough test shaders; install the DirectX Shader Compiler and ensure `dxc` is on PATH): {e}")
++        });
+     let file = std::fs::read(&out_path);
+     let _ = std::fs::remove_file(out_path);
+     // Remove the file before checking for status
+@@ -357,7 +359,9 @@ fn spirv_source(test_hash: u64) -> Cow<'static, [u32]> {
+             &out_path,
+         ])
+         .output()
+-        .unwrap();
++        .unwrap_or_else(|e| {
++            panic!("failed to run `dxc` (required to compile the passthrough test shaders; install the DirectX Shader Compiler and ensure `dxc` is on PATH): {e}")
++        });
+     let file = std::fs::read(&out_path);
+     let _ = std::fs::remove_file(out_path);
+     // Remove the file before checking for status
+-- 
+2.47.3
+
