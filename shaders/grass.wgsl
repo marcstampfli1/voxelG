@@ -119,6 +119,12 @@ struct VsOut {
     // Sward-depth term: short blades under tall neighbours sit in the dark
     // interior of the grass volume (the GoT depth look).
     @location(6) @interpolate(flat) blade_ao: f32,
+    // The blade ROOT's screen position: the light cache must be sampled
+    // where the blade grows, not where its fragment lands - a fragment's
+    // own texel holds the shadow of whatever terrain is BEHIND it, and
+    // reading that painted the background's shadow pattern through every
+    // blade body.
+    @location(7) @interpolate(flat) root_px: vec2<f32>,
 };
 
 fn bez(cp0: vec3<f32>, cp1: vec3<f32>, cp2: vec3<f32>, t: f32) -> vec3<f32> {
@@ -227,6 +233,14 @@ fn vs_grass(@builtin(vertex_index) vid: u32,
     // Sward interior: a blade shorter than its neighbourhood's tall canopy
     // lives in their shade. hfrac is the blade's height rank in the cell.
     o.blade_ao = 0.78 + 0.22 * hfrac;
+    // Project the root to screen space for the light-cache lookup (same
+    // pinhole as the vertex path; jitter offset matches the cache's grid).
+    let rd = rootw - camera.origin;
+    let rz = max(dot(rd, camera.forward), 0.05);
+    var rndc = vec2<f32>(dot(rd, camera.right) / (rz * camera.tan_half_fov * aspect),
+                         dot(rd, camera.up) / (rz * camera.tan_half_fov));
+    rndc = rndc - vec2<f32>(camera.jitter.x, -camera.jitter.y) * 2.0 / camera.resolution;
+    o.root_px = vec2<f32>(rndc.x * 0.5 + 0.5, 0.5 - rndc.y * 0.5) * camera.resolution;
 
     // ---- colour: clump-coherent, root-dark -> tip-bright, dry skew ----
     let ground = vec3<f32>(0.30, 0.65, 0.20); // palette[MAT_GRASS], SYNC renderer default_palette
@@ -256,7 +270,8 @@ fn fs_grass(in: VsOut) -> @location(0) vec4<f32> {
     // behind this pixel - the ground the blade stands on. Grass shadows and
     // ambient occlusion stay consistent with the world for free.
     // SYNC: raymarch.wgsl pack_light_cache.
-    let lc = textureLoad(light_cache, vec2<i32>(in.pos.xy), 0);
+    let rp = clamp(vec2<i32>(in.root_px), vec2<i32>(0), vec2<i32>(camera.resolution) - 1);
+    let lc = textureLoad(light_cache, rp, 0);
     let pw = bitcast<u32>(lc.w);
     var shadow = f32(pw >> 24u) / 255.0;
     var ao = f32((pw >> 16u) & 0xFFu) / 255.0;
