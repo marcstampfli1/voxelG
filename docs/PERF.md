@@ -108,6 +108,15 @@ Live static frames (tile-gated): ~1.9-2.5 ms GPU total.
   flickered dappled shadows. (Foliage cost is PRIMARY-ray blade cutouts.)
 - Water secondary-shading LOD + refraction cap 40 + grazing reflection cap:
   perf ~neutral on water-close and damaged the look (user reverted).
+- Motion-reprojected lighting cache, second attempt (absolute-position
+  anchors kept on reuse, no re-anchoring): bench pairs measured only -0.16
+  to -0.27 ms on water_strafe main (the pass is trace-dominated; the
+  reusable shading pool is ~0.2 ms), and Marc saw TERRAIN WARPING in live
+  motion within minutes - water immune, exactly the cacheable/non-cacheable
+  split, confirming the transport still drifts visibly even with fixed
+  anchors. Rejected on both counts. PARKED: the mechanism only becomes
+  worth a third attempt if per-pixel shading cost ever grows to dominate
+  the moving frame, and then only with a stricter validation design.
 - Half-resolution reflection pass (cs_water_refl, quad-shared reflected
   content): the largest measured win of the hunt - water_mid 93 -> 169 fps,
   grazing 75 -> 155, strafe 63 -> 97 - but REJECTED BY MARC'S EYE and
