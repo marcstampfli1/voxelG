@@ -193,12 +193,20 @@ Live static frames (tile-gated): ~1.9-2.5 ms GPU total.
    specialization count / investigate driver cache priming.
 6. ReSTIR-style reuse on probe gather rays (GI phase 3, promised).
 7. TAA history copy -> ping-pong (same trick as #4).
-8. TAA edge ripple: cs_taa reprojects history to a ROUNDED pixel and never
-   unfilters the Halton jitter, so high-contrast edges (tuft silhouettes,
-   terrace lips) oscillate on the 8-frame cycle - the flicker rig's
-   GI-independent noise floor (~5k strong px on the meadow view). Candidate:
-   bilinear history sample at the sub-pixel reprojected position + jitter
-   compensation. RT-independent, cosmetic-tier.
+8. TAA edge ripple - PARKED after four rig-measured attempts (2026-07-23,
+   flora stage 0). Baselines: meadow 2527 strong, water_top 1959. Results:
+   (a) bilinear history + current-jitter unfilter on ALL paths: meadow 3314
+   (thin blades smear); (b) bilinear, no compensation: meadow 2877 /
+   water_top 2114 (float reprojection resurrects the jitter the old integer
+   rounding cancelled); (c) jitter compensation on the reprojection path
+   only: meadow 2696 / water_top 2115 (still above baseline); (d) variance
+   clipping gamma 1.25 instead of min/max clamp: water_top 1746 (-11%, the
+   only sub-baseline result) but meadow 3021 and tree_shadow 5820 (tight
+   statistical box rejects history at thin blades). CONCLUSION: the old
+   rounded fetch is accidentally near-optimal for static views; the ripple
+   is the current sample's jitter surviving the 0.9 blend. Next probes if
+   reopened: gamma sweep 1.5-2.0, or blend raised for converged pixels.
+   RT-independent, cosmetic-tier; flora stages gate on existing baselines.
 
 ## Live bench (the end-to-end instrument)
 
