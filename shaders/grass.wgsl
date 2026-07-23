@@ -232,7 +232,7 @@ fn vs_grass(@builtin(vertex_index) vid: u32,
     o.wide3 = wide3;
     // Sward interior: a blade shorter than its neighbourhood's tall canopy
     // lives in their shade. hfrac is the blade's height rank in the cell.
-    o.blade_ao = 0.78 + 0.22 * hfrac;
+    o.blade_ao = 0.86 + 0.14 * hfrac;
     // Project the root to screen space for the light-cache lookup (same
     // pinhole as the vertex path; jitter offset matches the cache's grid).
     let rd = rootw - camera.origin;
@@ -249,7 +249,7 @@ fn vs_grass(@builtin(vertex_index) vid: u32,
     let hue = mix(vec3<f32>(1.0), vec3<f32>(1.22, 1.04, 0.62),
                   smoothstep(0.75, 1.0, dry) * 0.45);
     let cb = (0.88 + 0.24 * fract(cid * 5.23)) * (0.92 + 0.16 * fract(bh * 23.0));
-    o.albedo0 = ground * hue * cb * 0.66;
+    o.albedo0 = ground * hue * cb * 0.80;
     o.albedo1 = ground * hue * cb * 1.48;
     return o;
 }
@@ -299,7 +299,7 @@ fn fs_grass(in: VsOut) -> @location(0) vec4<f32> {
     // Sward depth: the grass volume darkens toward its interior - the
     // height gradient AND the blade's height rank both pull light out.
     // This value range (deep shade to lit tips) is most of the "volume".
-    let sward = (0.55 + 0.45 * sblade) * in.blade_ao;
+    let sward = (0.70 + 0.30 * sblade) * in.blade_ao;
 
     // Wrapped diffuse: foliage responds softer than a hard lambert.
     let ndl = max(0.0, (dot(n, s) + 0.35) / 1.35);
