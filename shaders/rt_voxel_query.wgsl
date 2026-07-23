@@ -29,8 +29,17 @@ fn rt_face_normal(axis: i32, d: vec3<f32>) -> vec3<i32> {
 // in [t_lo, t_hi], or -1 if the ray crosses the brick with no solid voxel.
 // `first_vox` receives the hit voxel's brick-local coords and `first_normal` the
 // entry-face normal (for primary-ray shading; occlusion callers ignore it).
+// Transparent materials (water levels 5..12, glass 18) - keep in sync with
+// src/voxel.rs. Local copy: this file must stay self-contained for the
+// accel_probe validation module, which does not include the render shader
+// (same reason accel_probe.wgsl carries its own brick_voxel_solid).
+fn rt_is_transparent_mat(m: u32) -> bool {
+    return (m >= 5u && m <= 12u) || m == 18u;
+}
+
 fn resolve_brick(bi: i32, bmin: vec3<f32>, o: vec3<f32>, d: vec3<f32>,
-                 t_lo: f32, t_hi: f32, first_vox: ptr<function, vec3<i32>>,
+                 t_lo: f32, t_hi: f32, skip_transparent: bool,
+                 first_vox: ptr<function, vec3<i32>>,
                  first_normal: ptr<function, vec3<i32>>) -> f32 {
     let inv = vec3<f32>(rt_safe_inv(d.x), rt_safe_inv(d.y), rt_safe_inv(d.z));
     let tb0 = (bmin - o) * inv;
@@ -65,7 +74,9 @@ fn resolve_brick(bi: i32, bmin: vec3<f32>, o: vec3<f32>, d: vec3<f32>,
     for (var i: i32 = 0; i < 16; i = i + 1) {
         if (v.x < 0 || v.x > 3 || v.y < 0 || v.y > 3 || v.z < 0 || v.z > 3) { return -1.0; }
         if (t_cur > t_end) { return -1.0; }
-        if (brick_voxel_solid(bi, brick_voxel_idx(v.x, v.y, v.z))) {
+        let vi_q = brick_voxel_idx(v.x, v.y, v.z);
+        if (brick_voxel_solid(bi, vi_q)
+            && !(skip_transparent && rt_is_transparent_mat(brick_voxel_material(bi, vi_q)))) {
             *first_vox = v;
             *first_normal = rt_face_normal(last_axis, d);
             return t_cur;
@@ -80,3 +91,4 @@ fn resolve_brick(bi: i32, bmin: vec3<f32>, o: vec3<f32>, d: vec3<f32>,
     }
     return -1.0;
 }
+

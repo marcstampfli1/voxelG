@@ -20,6 +20,17 @@ const COMMON_WGSL: &str = include_str!("../shaders/common.wgsl");
 const RT_VOXEL_QUERY_WGSL: &str = include_str!("../shaders/rt_voxel_query.wgsl");
 const RT_SHADOW_WGSL: &str = include_str!("../shaders/rt_shadow.wgsl");
 const RT_GI_WGSL: &str = include_str!("../shaders/rt_gi.wgsl");
+const GI_PROBES_WGSL: &str = include_str!("../shaders/gi_probes.wgsl");
+/// Probe-update amortization factor: 1/GI_PROBE_UPDATE_DIV of the probes are
+/// re-gathered each frame (strided by the camera's gi_round). MUST match the
+/// `GI_UPDATE_DIV` override default in gi_probes.wgsl.
+const GI_PROBE_UPDATE_DIV: u32 = 8;
+/// Probe gather-direction epochs: each probe cycles GI_PROBE_DIR_EPOCHS fixed
+/// direction subsets (spherical Fibonacci), one per update round, so a static
+/// scene converges to a periodic constant instead of random-walking. The
+/// camera's gi_round counts frames mod DIV*EPOCHS: `% DIV` selects the probe
+/// slice, `/ DIV` the epoch. MUST match `GI_DIR_EPOCHS` in gi_probes.wgsl.
+const GI_PROBE_DIR_EPOCHS: u32 = 8;
 const RT_PRIMARY_WGSL: &str = include_str!("../shaders/rt_primary.wgsl");
 
 /// Software dispatchers injected into the non-RT variant so the render body's
@@ -28,8 +39,9 @@ const RT_PRIMARY_WGSL: &str = include_str!("../shaders/rt_primary.wgsl");
 /// one-bounce indirect (returns 0, the ambient-only look).
 const SHADOW_SW_WGSL: &str = concat!(
     "fn shadow_occluded(o: vec3<f32>, d: vec3<f32>, m: f32) -> bool { return trace_any(o, d, m); }\n",
-    "fn indirect_light(p: vec3<f32>, n: vec3<f32>, seed: f32, px: vec2<i32>, t: f32) -> vec3<f32> { return vec3<f32>(0.0); }\n",
-    "fn rt_primary_or_none(origin: vec3<f32>, dir: vec3<f32>, done: ptr<function, bool>) -> Hit { *done = false; var h: Hit; h.hit = false; h.mat = 0u; h.normal = vec3<f32>(0.0); h.voxel = vec3<i32>(0); h.last_axis = -1; h.t_hit = 0.0; h.tint = vec3<f32>(1.0); return h; }\n",
+    "fn indirect_light(p: vec3<f32>, n: vec3<f32>, seed: f32, px: vec2<i32>, t: f32, v: vec3<f32>) -> vec3<f32> { return vec3<f32>(0.0); }\n",
+    "fn trace_secondary(o: vec3<f32>, d: vec3<f32>, cap: f32) -> Hit { return trace_no_water(o, d, cap); }\n",
+    "fn rt_primary_or_none(origin: vec3<f32>, dir: vec3<f32>, skip_transparent: bool, done: ptr<function, bool>) -> Hit { *done = false; var h: Hit; h.hit = false; h.mat = 0u; h.normal = vec3<f32>(0.0); h.voxel = vec3<i32>(0); h.last_axis = -1; h.t_hit = 0.0; h.tint = vec3<f32>(1.0); return h; }\n",
 );
 
 /// Full raymarch shader source: world consts + common prelude + the sprite
@@ -44,13 +56,14 @@ const SHADOW_SW_WGSL: &str = concat!(
 pub(crate) fn raymarch_source_variant(rt: bool) -> String {
     if rt {
         format!(
-            "enable wgpu_ray_query;\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            "enable wgpu_ray_query;\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
             WORLD_CONSTS_WGSL,
             COMMON_WGSL,
             crate::sprites::wgsl_consts(),
             RT_VOXEL_QUERY_WGSL,
             RT_SHADOW_WGSL,
             RT_GI_WGSL,
+            GI_PROBES_WGSL,
             RT_PRIMARY_WGSL,
             include_str!("../shaders/raymarch.wgsl"),
         )
@@ -294,10 +307,17 @@ pub struct Renderer {
     #[allow(dead_code)] // owns the BLAS/TLAS/buffers that rt_bg binds; kept alive
     world_accel: Option<crate::accel::WorldAccel>,
     rt_bgl: Option<wgpu::BindGroupLayout>,
-    rt_bg: Option<wgpu::BindGroup>,
+    // TWO bind groups with gi_in/gi_out swapped: the frame parity picks one, so
+    // last frame's gi_out is this frame's gi_in WITHOUT the full-res copy the
+    // ping-pong used to pay (pure elimination; probe-mode GI never reads gi_in
+    // at all, legacy mode alternates correctly).
+    rt_bg: Option<[wgpu::BindGroup; 2]>,
     compute_pipeline_rt: Option<wgpu::ComputePipeline>,
     compose_pipeline_rt: Option<wgpu::ComputePipeline>,
     transparent_pipeline_rt: Option<wgpu::ComputePipeline>,
+    // World-space irradiance probe cache + its per-frame update pass (RT only).
+    gi_probe_buf: Option<wgpu::Buffer>,
+    gi_probe_pipeline: Option<wgpu::ComputePipeline>,
     // Signature the current accel was built for; the accel is rebuilt only when
     // it changes (brick set or window origin), not on every voxel edit.
     rt_accel_sig: u64,
@@ -320,6 +340,8 @@ pub struct Renderer {
     dummy_depth_tex: wgpu::Texture,
     dummy_depth_view: wgpu::TextureView,
     compose_pipeline: wgpu::ComputePipeline,
+    godray_pipeline: wgpu::ComputePipeline,
+    godray_pipeline_rt: Option<wgpu::ComputePipeline>,
     compose_bg: wgpu::BindGroup,
     leaves_buf: wgpu::Buffer,
     leaf_count: u32,
@@ -364,6 +386,43 @@ pub struct Renderer {
     // cache. None on the first frame (no reuse).
     prev_cam: Option<Camera>,
     prev_world_origin: glam::IVec3,
+    // Monotonic frame counter for the rotating GI-probe update (mod DIV = round).
+    gi_frame: u32,
+    // When the accel was last rebuilt. Streaming bursts change the accel
+    // signature every frame, but a full BLAS rebuild costs ~20 ms of CPU (wgpu
+    // allocates fresh build scratch per call), so while chunk generation is in
+    // flight rebuilds are RATE-LIMITED - the shader's rt_brick_active tile-bit
+    // gate keeps stale primitives correct (they render as sky), so freshness
+    // only controls when NEW chunks appear, not correctness. A quiet-world edit
+    // (block place) still rebuilds immediately.
+    // Per-pass GPU timing (Some only when VOXELG_GPU_PROFILE=1 and the adapter
+    // supports timestamp queries).
+    gpu_profiler: Option<GpuProfiler>,
+    // Async accel rebuild (RT only): the frame thread snapshots the tile mask
+    // and hands a SPARE accel set to a worker thread, which enumerates, DMAs
+    // and rebuilds the BVH into it - buffers no shader currently reads, so the
+    // frame never stalls and there is no read/write race. On completion the
+    // sets swap (a bind-group re-make, ~10us). A window-origin SHIFT still
+    // rebuilds synchronously: shifted positions must never coexist with the
+    // old origin (the wrong-chunk ghost class).
+    rt_accel_spare: Option<crate::accel::WorldAccel>,
+    accel_req_tx: Option<std::sync::mpsc::Sender<AccelJob>>,
+    accel_res_rx: Option<std::sync::mpsc::Receiver<AccelDone>>,
+    accel_job_inflight: bool,
+    rt_accel_origin: glam::IVec3,
+}
+
+/// Rebuild request handed to the accel worker thread.
+struct AccelJob {
+    tile_mask: Vec<u64>,
+    origin: glam::IVec3,
+    spare: crate::accel::WorldAccel,
+}
+
+/// Completed rebuild coming back from the worker.
+struct AccelDone {
+    accel: crate::accel::WorldAccel,
+    origin: glam::IVec3,
 }
 
 impl Renderer {
@@ -405,10 +464,24 @@ impl Renderer {
         // enable the ray-query feature + acceleration-structure limits so the RT
         // occlusion pipelines can run.
         let want_rt = std::env::var("VOXELG_RT").is_ok() && crate::accel::adapter_supports_rt(&adapter);
+        // Opt-in GPU pass profiling (VOXELG_GPU_PROFILE=1): request timestamp
+        // queries when the adapter has them; render() then brackets every pass
+        // and logs per-pass GPU ms. Zero cost when the env var is unset.
+        // write_timestamp between passes lives on the ENCODER, which needs
+        // TIMESTAMP_QUERY_INSIDE_ENCODERS on top of TIMESTAMP_QUERY.
+        let profile_wanted =
+            wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+        let profile_features = if std::env::var("VOXELG_GPU_PROFILE").is_ok()
+            && adapter.features().contains(profile_wanted)
+        {
+            profile_wanted
+        } else {
+            wgpu::Features::empty()
+        };
         let (device, queue, rt_shadows) = if want_rt {
             match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("voxel device (RT)"),
-                required_features: wgpu::Features::EXPERIMENTAL_RAY_QUERY,
+                required_features: wgpu::Features::EXPERIMENTAL_RAY_QUERY | profile_features,
                 // adapter.limits() supplies the acceleration-structure limits
                 // (which default to 0) and is a superset of base_limits.
                 required_limits: adapter.limits(),
@@ -437,7 +510,7 @@ impl Renderer {
         } else {
             let (d, q) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("voxel device"),
-                required_features: wgpu::Features::empty(),
+                required_features: profile_features,
                 required_limits: base_limits.clone(),
                 memory_hints: wgpu::MemoryHints::Performance,
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
@@ -446,6 +519,12 @@ impl Renderer {
             .map_err(|e| format!("request_device failed: {e}"))?;
             (d, q, false)
         };
+
+        // Per-pass GPU timing (only when VOXELG_GPU_PROFILE granted the features).
+        let gpu_profiler = device
+            .features()
+            .contains(profile_wanted)
+            .then(|| GpuProfiler::new(&device, &queue));
 
         let caps = surface.get_capabilities(&adapter);
         let surface_format = caps
@@ -478,6 +557,15 @@ impl Renderer {
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &config);
+        // Proof over inference: which present policy actually applies (Mailbox
+        // renders uncapped and presents latest at vblank; Fifo BLOCKS the loop
+        // at the refresh rate; Immediate is uncapped + tearing, usually absent
+        // on Wayland).
+        log::info!(
+            "present mode: {:?} (supported: {:?})",
+            config.present_mode,
+            caps.present_modes
+        );
 
         // -- buffers --
         let camera_init = CameraUniform::from_camera(&Camera::new(), width, height, 0.0, 0.0, glam::IVec3::ZERO, [0.0, 0.0], 0.0);
@@ -655,6 +743,14 @@ impl Renderer {
 
         let leaf_bg = make_leaf_bg(&device, &leaf_bgl, &camera_buf, &leaves_buf, &sprites_buf, &depth_view);
 
+        let godray_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("godray pipeline"),
+            layout: Some(&compute_pl),
+            module: &compute_shader,
+            entry_point: Some("cs_godrays"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
         let compose_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("compose pipeline"),
             layout: Some(&compute_pl),
@@ -692,45 +788,100 @@ impl Renderer {
             gi_in_view,
             gi_out_tex,
             gi_out_view,
+            gi_probe_buf,
+            gi_probe_pipeline,
+            godray_pipeline_rt,
+            rt_accel_spare,
+            accel_req_tx,
+            accel_res_rx,
         ) = if rt_shadows {
+            let t_accel = std::time::Instant::now();
             let accel = crate::accel::build_world_accel(&device, &queue, world);
+            // Spare set for the async double-buffered rebuild.
+            let accel_spare = crate::accel::build_world_accel(&device, &queue, world);
+            log::info!("RT init: accel built in {:.2}s", t_accel.elapsed().as_secs_f64());
             let rt_bgl = create_rt_bgl(&device);
             let (gi_in_tex, gi_in_view) = create_lighting_texture(&device, width, height);
             let (gi_out_tex, gi_out_view) = create_lighting_texture(&device, width, height);
-            let rt_bg = make_rt_bg(&device, &rt_bgl, &accel, &gi_in_view, &gi_out_view);
+            let probe_buf = create_probe_buf(&device);
+            let rt_bg = make_rt_bg_pair(&device, &rt_bgl, &accel, &gi_in_view, &gi_out_view, &probe_buf);
             let rt_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("rt compute pl"),
                 bind_group_layouts: &[Some(&compute_bgl), Some(&rt_bgl)],
                 immediate_size: 0,
             });
+            let t_shader = std::time::Instant::now();
             let rt_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("raymarch shader (RT)"),
                 source: wgpu::ShaderSource::Wgsl(raymarch_source_variant(true).into()),
             });
+            log::info!("RT init: shader module (naga validate) in {:.2}s", t_shader.elapsed().as_secs_f64());
+            // The shipped RT config: hardware primary trace (RT_PRIMARY) + the
+            // world-space probe GI (GI_PROBE_MODE, on by default). GI_ENABLE stays
+            // at its default 1.0. Verified faster than software WITH bounced light.
+            let rt_consts: &[(&'static str, f64)] = &[("RT_PRIMARY", 1.0)];
             let mk = |entry: &'static str, label: &'static str| {
                 device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some(label),
                     layout: Some(&rt_pl),
                     module: &rt_shader,
                     entry_point: Some(entry),
-                    compilation_options: Default::default(),
+                    compilation_options: wgpu::PipelineCompilationOptions {
+                        constants: rt_consts,
+                        ..Default::default()
+                    },
                     cache: None,
                 })
             };
+            let t_pipe = std::time::Instant::now();
+            let p_godray = mk("cs_godrays", "godray pipeline (RT)");
+            let p_main = mk("cs_main", "raymarch pipeline (RT)");
+            log::info!("RT init: cs_main pipeline (driver compile) in {:.2}s", t_pipe.elapsed().as_secs_f64());
+            let p_compose = mk("cs_compose", "compose pipeline (RT)");
+            let p_transp = mk("cs_transparent", "transparent pipeline (RT)");
+            let p_probe = mk("cs_gi_probe_update", "gi probe update (RT)");
+            log::info!("RT init: all 4 RT pipelines in {:.2}s total", t_pipe.elapsed().as_secs_f64());
+            // Worker: owns nothing persistent; each job carries the spare set in
+            // and back out. wgpu Device/Queue are internally refcounted.
+            let (req_tx, req_rx) = std::sync::mpsc::channel::<AccelJob>();
+            let (res_tx, res_rx) = std::sync::mpsc::channel::<AccelDone>();
+            let (wdev, wqueue) = (device.clone(), queue.clone());
+            std::thread::Builder::new()
+                .name("accel-rebuild".into())
+                .spawn(move || {
+                    while let Ok(mut job) = req_rx.recv() {
+                        crate::accel::rebuild_world_accel(
+                            &mut job.spare, &wdev, &wqueue, &job.tile_mask, job.origin,
+                        );
+                        if res_tx
+                            .send(AccelDone { accel: job.spare, origin: job.origin })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                })
+                .expect("spawn accel worker");
             (
                 Some(accel),
                 Some(rt_bgl),
                 Some(rt_bg),
-                Some(mk("cs_main", "raymarch pipeline (RT)")),
-                Some(mk("cs_compose", "compose pipeline (RT)")),
-                Some(mk("cs_transparent", "transparent pipeline (RT)")),
+                Some(p_main),
+                Some(p_compose),
+                Some(p_transp),
                 Some(gi_in_tex),
                 Some(gi_in_view),
                 Some(gi_out_tex),
                 Some(gi_out_view),
+                Some(probe_buf),
+                Some(p_probe),
+                Some(p_godray),
+                Some(accel_spare),
+                Some(req_tx),
+                Some(res_rx),
             )
         } else {
-            (None, None, None, None, None, None, None, None, None, None)
+            (None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None)
         };
 
         // -- half-res cloud pipeline (cs_clouds, same shader module) --
@@ -912,6 +1063,9 @@ impl Renderer {
             compute_bgl, compute_pipeline, compute_bg,
             rt_shadows, world_accel,
             rt_bgl, rt_bg, compute_pipeline_rt, compose_pipeline_rt, transparent_pipeline_rt,
+            gi_probe_buf, gi_probe_pipeline, godray_pipeline, godray_pipeline_rt,
+            rt_accel_spare, accel_req_tx, accel_res_rx, accel_job_inflight: false,
+            rt_accel_origin: world.world_origin_voxel(),
             rt_accel_sig: if rt_shadows { accel_signature(world) } else { 0 },
             gi_in_tex, gi_in_view, gi_out_tex, gi_out_view,
             transparent_pipeline, transp_buf, depth_tex, depth_view,
@@ -929,6 +1083,8 @@ impl Renderer {
             dirty_words_scratch: Vec::with_capacity(4096),
             prev_cam: None,
             prev_world_origin: glam::IVec3::ZERO,
+            gi_frame: 0,
+            gpu_profiler,
         })
     }
 
@@ -1006,8 +1162,11 @@ impl Renderer {
         if self.rt_shadows {
             let (git, giv) = create_lighting_texture(&self.device, rw, rh);
             let (got, gov) = create_lighting_texture(&self.device, rw, rh);
-            if let (Some(bgl), Some(accel)) = (&self.rt_bgl, &self.world_accel) {
-                self.rt_bg = Some(make_rt_bg(&self.device, bgl, accel, &giv, &gov));
+            if let (Some(bgl), Some(accel), Some(pb)) =
+                (&self.rt_bgl, &self.world_accel, &self.gi_probe_buf)
+            {
+                self.rt_bg =
+                                Some(make_rt_bg_pair(&self.device, bgl, accel, &giv, &gov, pb));
             }
             self.gi_in_tex = Some(git);
             self.gi_in_view = Some(giv);
@@ -1035,16 +1194,74 @@ impl Renderer {
         // rebuild IS needed it is currently a full rebuild; the scalable upgrade
         // is an incremental AS refit of only the changed bricks (see docs/rt).
         if self.rt_shadows {
-            let sig = accel_signature(world);
-            if sig != self.rt_accel_sig {
-                let accel = crate::accel::build_world_accel(&self.device, &self.queue, world);
-                if let (Some(bgl), Some(giv_in), Some(giv_out)) =
-                    (&self.rt_bgl, &self.gi_in_view, &self.gi_out_view)
-                {
-                    self.rt_bg = Some(make_rt_bg(&self.device, bgl, &accel, giv_in, giv_out));
+            let origin = world.world_origin_voxel();
+            // 1. Land any finished async rebuild: activate it only if the
+            //    window origin it was built for is still current (a shifted
+            //    origin means its window-local positions are wrong - the
+            //    wrong-chunk ghost class - so it goes back to the spare pool).
+            if let Some(rx) = &self.accel_res_rx {
+                while let Ok(done) = rx.try_recv() {
+                    self.accel_job_inflight = false;
+                    if done.origin == origin {
+                        let old = self.world_accel.replace(done.accel);
+                        self.rt_accel_spare = old;
+                        if let (Some(accel), Some(bgl), Some(giv_in), Some(giv_out), Some(pb)) = (
+                            &self.world_accel,
+                            &self.rt_bgl,
+                            &self.gi_in_view,
+                            &self.gi_out_view,
+                            &self.gi_probe_buf,
+                        ) {
+                            self.rt_bg =
+                                Some(make_rt_bg_pair(&self.device, bgl, accel, giv_in, giv_out, pb));
+                        }
+                    } else {
+                        self.rt_accel_spare = Some(done.accel);
+                    }
                 }
-                self.world_accel = Some(accel);
+            }
+            let sig = accel_signature(world);
+            if origin != self.rt_accel_origin {
+                // 2. Origin SHIFT: rebuild the ACTIVE set synchronously - the
+                //    active BVH's window-local positions are invalid the moment
+                //    the origin moves, and no stale-primitive gate can fix a
+                //    POSITION mismatch. Once per 2-chunk crossing.
+                if let Some(accel) = self.world_accel.as_mut() {
+                    let grew = crate::accel::rebuild_world_accel(
+                        accel, &self.device, &self.queue, &world.tile_mask, origin,
+                    );
+                    if grew {
+                        if let (Some(accel), Some(bgl), Some(giv_in), Some(giv_out), Some(pb)) = (
+                            &self.world_accel,
+                            &self.rt_bgl,
+                            &self.gi_in_view,
+                            &self.gi_out_view,
+                            &self.gi_probe_buf,
+                        ) {
+                            self.rt_bg =
+                                Some(make_rt_bg_pair(&self.device, bgl, accel, giv_in, giv_out, pb));
+                        }
+                    }
+                }
+                self.rt_accel_origin = origin;
                 self.rt_accel_sig = sig;
+            } else if sig != self.rt_accel_sig && !self.accel_job_inflight {
+                // 3. Content change (chunk install, block edit): hand the spare
+                //    set + a 128 KB mask snapshot to the worker. Zero frame-
+                //    thread cost; the swap lands a frame or two later.
+                if let (Some(tx), Some(spare)) = (&self.accel_req_tx, self.rt_accel_spare.take()) {
+                    if tx
+                        .send(AccelJob {
+                            tile_mask: world.tile_mask.clone(),
+                            origin,
+                            spare,
+                        })
+                        .is_ok()
+                    {
+                        self.accel_job_inflight = true;
+                        self.rt_accel_sig = sig;
+                    }
+                }
             }
         }
 
@@ -1172,10 +1389,17 @@ impl Renderer {
         let mut u = CameraUniform::from_camera(
             camera, self.size.0, self.size.1, time, sun_time, world_origin_voxel, jitter, taa_blend,
         );
-        // Lighting + colour-history reprojection runs only while ACCUMULATING
-        // (taa_blend > 0 = static camera), with a previous frame and an unchanged
-        // world origin. On motion (taa_blend == 0) it's disabled so we trace fresh
-        // — motion reprojection warped the image and the engine has the headroom.
+        // Rotate the GI-probe update round so the amortized 1/DIV slice sweeps the
+        // whole grid over DIV frames.
+        u.gi_round = (self.gi_frame % (GI_PROBE_UPDATE_DIV * GI_PROBE_DIR_EPOCHS)) as i32;
+        self.gi_frame = self.gi_frame.wrapping_add(1);
+        // Lighting reprojection is STATIC-ONLY, deliberately: a still camera
+        // re-reads its own pixel's entry (no resampling, drift impossible), but
+        // a moving camera resamples the cache nearest-neighbour and the
+        // resample-restore chain random-walks shadow/AO edges - tried once,
+        // seen as lighting "warping" while looking around, reverted. Motion
+        // traces fresh with a FROZEN jitter phase instead (see cs_main), which
+        // is temporally stable at full correctness.
         let reproject_ok = taa_blend > 0.0 && self.prev_world_origin == world_origin_voxel;
         match &self.prev_cam {
             Some(prev) => u.set_prev_camera(prev, reproject_ok),
@@ -1237,6 +1461,9 @@ impl Renderer {
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("frame"),
         });
+        // gi ping-pong parity: selects which rt bind group (gi_in/gi_out order).
+        let gi_idx = (self.gi_frame & 1) as usize;
+        if let Some(p) = &self.gpu_profiler { p.stamp(&mut encoder, 0); }
 
         // Temporal-differential: if no tile is dirty, we still blit (so the
         // swapchain stays in sync), but skip the beam + raymarch compute
@@ -1254,6 +1481,7 @@ impl Renderer {
                 let hy = ((self.size.1 + 1) / 2 + 7) / 8;
                 cp.dispatch_workgroups(hx, hy, 1);
             }
+            if let Some(pr) = &self.gpu_profiler { pr.stamp(&mut encoder, 1); }
             // ---- beam pre-pass at 1/8 resolution ----
             {
                 let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1266,6 +1494,27 @@ impl Renderer {
                 let by = ((self.size.1 + 7) / 8 + 7) / 8;
                 cp.dispatch_workgroups(bx, by, 1);
             }
+            if let Some(pr) = &self.gpu_profiler { pr.stamp(&mut encoder, 2); }
+            // ---- world-space GI probe update (RT) ----
+            // Amortized irradiance gather: every probe casts a few fresh RT rays,
+            // temporally accumulated in the probe SH. Runs before the main pass so
+            // cs_main samples this frame's probes. World-space, so it keeps working
+            // (and stays converged) as the camera moves - no per-pixel bounce ray.
+            if self.rt_shadows {
+                if let (Some(pipe), Some(bg)) = (&self.gi_probe_pipeline, &self.rt_bg) {
+                    let bg = &bg[gi_idx];
+                    let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("gi probe update"),
+                        timestamp_writes: None,
+                    });
+                    cp.set_pipeline(pipe);
+                    cp.set_bind_group(0, &self.compute_bg, &[]);
+                    cp.set_bind_group(1, bg, &[]);
+                    let threads = crate::voxel::PROBE_TOTAL / GI_PROBE_UPDATE_DIV;
+                    cp.dispatch_workgroups((threads + 63) / 64, 1, 1);
+                }
+            }
+            if let Some(pr) = &self.gpu_profiler { pr.stamp(&mut encoder, 3); }
             // ---- main raymarch (skips clean tiles in-shader) ----
             {
                 let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1275,7 +1524,7 @@ impl Renderer {
                 if self.rt_shadows {
                     cp.set_pipeline(self.compute_pipeline_rt.as_ref().unwrap());
                     cp.set_bind_group(0, &self.compute_bg, &[]);
-                    cp.set_bind_group(1, self.rt_bg.as_ref().unwrap(), &[]);
+                    cp.set_bind_group(1, &self.rt_bg.as_ref().unwrap()[gi_idx], &[]);
                 } else {
                     cp.set_pipeline(&self.compute_pipeline);
                     cp.set_bind_group(0, &self.compute_bg, &[]);
@@ -1284,6 +1533,7 @@ impl Renderer {
                 let gy = (self.size.1 + 7) / 8;
                 cp.dispatch_workgroups(gx, gy, 1);
             }
+            if let Some(pr) = &self.gpu_profiler { pr.stamp(&mut encoder, 4); }
             // ---- deferred transparent pass (#16): shade water/glass pixels ----
             {
                 let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1293,7 +1543,7 @@ impl Renderer {
                 if self.rt_shadows {
                     cp.set_pipeline(self.transparent_pipeline_rt.as_ref().unwrap());
                     cp.set_bind_group(0, &self.compute_bg, &[]);
-                    cp.set_bind_group(1, self.rt_bg.as_ref().unwrap(), &[]);
+                    cp.set_bind_group(1, &self.rt_bg.as_ref().unwrap()[gi_idx], &[]);
                 } else {
                     cp.set_pipeline(&self.transparent_pipeline);
                     cp.set_bind_group(0, &self.compute_bg, &[]);
@@ -1301,6 +1551,26 @@ impl Renderer {
                 let gx = (self.size.0 + 7) / 8;
                 let gy = (self.size.1 + 7) / 8;
                 cp.dispatch_workgroups(gx, gy, 1);
+            }
+            if let Some(pr) = &self.gpu_profiler { pr.stamp(&mut encoder, 5); }
+            // ---- half-res god-ray occlusion march (scratch in transp_buf tail,
+            // consumed by cs_compose's depth-weighted upsample) ----
+            {
+                let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("godrays"),
+                    timestamp_writes: None,
+                });
+                if self.rt_shadows {
+                    cp.set_pipeline(self.godray_pipeline_rt.as_ref().unwrap());
+                    cp.set_bind_group(0, &self.compose_bg, &[]);
+                    cp.set_bind_group(1, &self.rt_bg.as_ref().unwrap()[gi_idx], &[]);
+                } else {
+                    cp.set_pipeline(&self.godray_pipeline);
+                    cp.set_bind_group(0, &self.compose_bg, &[]);
+                }
+                let hw = self.size.0.div_ceil(2);
+                let hh = self.size.1.div_ceil(2);
+                cp.dispatch_workgroups(hw.div_ceil(8), hh.div_ceil(8), 1);
             }
             // ---- full-screen compose: geometry + clouds + god rays ----
             // EVERY pixel EVERY frame: per-frame-varying terms must never
@@ -1313,7 +1583,7 @@ impl Renderer {
                 if self.rt_shadows {
                     cp.set_pipeline(self.compose_pipeline_rt.as_ref().unwrap());
                     cp.set_bind_group(0, &self.compose_bg, &[]);
-                    cp.set_bind_group(1, self.rt_bg.as_ref().unwrap(), &[]);
+                    cp.set_bind_group(1, &self.rt_bg.as_ref().unwrap()[gi_idx], &[]);
                 } else {
                     cp.set_pipeline(&self.compose_pipeline);
                     cp.set_bind_group(0, &self.compose_bg, &[]);
@@ -1322,16 +1592,10 @@ impl Renderer {
                 let gy = (self.size.1 + 7) / 8;
                 cp.dispatch_workgroups(gx, gy, 1);
             }
-            // ---- temporal GI: this frame's gi_out becomes next frame's gi_in ----
-            if self.rt_shadows {
-                if let (Some(gout), Some(gin)) = (&self.gi_out_tex, &self.gi_in_tex) {
-                    encoder.copy_texture_to_texture(
-                        wgpu::TexelCopyTextureInfo { texture: gout, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                        wgpu::TexelCopyTextureInfo { texture: gin, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                        wgpu::Extent3d { width: self.size.0, height: self.size.1, depth_or_array_layers: 1 },
-                    );
-                }
-            }
+            if let Some(pr) = &self.gpu_profiler { pr.stamp(&mut encoder, 6); }
+            // (temporal GI needs no copy: the gi textures ping-pong via the two
+            // rt bind groups selected by frame parity.)
+            // (stamp 6 covers compose + the gi_out->gi_in copy)
             // ---- TAA resolve: raymarch output + history -> resolve ----
             {
                 let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1344,6 +1608,7 @@ impl Renderer {
                 let gy = (self.size.1 + 7) / 8;
                 cp.dispatch_workgroups(gx, gy, 1);
             }
+            if let Some(pr) = &self.gpu_profiler { pr.stamp(&mut encoder, 7); }
             // Feed this frame's resolved image back as next frame's history.
             encoder.copy_texture_to_texture(
                 wgpu::TexelCopyTextureInfo {
@@ -1404,6 +1669,7 @@ impl Renderer {
             }
         }
 
+        if let Some(pr) = &self.gpu_profiler { pr.stamp(&mut encoder, 8); }
         {
             let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("blit"),
@@ -1428,7 +1694,20 @@ impl Renderer {
             rp.draw(0..3, 0..1);
         }
 
+        // Final timestamp + per-pass resolve/readback (profiling frames only;
+        // instrument only dirty frames so the numbers are the real render cost).
+        if any_dirty {
+            if let Some(pr) = &self.gpu_profiler {
+                pr.stamp(&mut encoder, 9);
+                pr.resolve(&mut encoder);
+            }
+        }
         self.queue.submit(std::iter::once(encoder.finish()));
+        if any_dirty {
+            if let Some(pr) = &mut self.gpu_profiler {
+                pr.report(&self.device);
+            }
+        }
         // wgpu 30 moved presentation from `SurfaceTexture::present()` to `Queue::present()`.
         self.queue.present(frame);
         Ok(())
@@ -1777,9 +2056,19 @@ fn create_compute_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
 }
 
 fn create_transp_buf(device: &wgpu::Device, w: u32, h: u32) -> wgpu::Buffer {
+    // Per-pixel transparent records PLUS a half-res tail used by cs_godrays as
+    // its occlusion-fraction scratch. The tail sits BEYOND the record region:
+    // on a still camera cs_main is tile-gated and clean tiles do NOT rewrite
+    // their records each frame, so any overlap would let the scratch clobber
+    // live records (seen as a corrupt band at the bottom of the screen).
+    let (w, h) = (w.max(1), h.max(1));
+    let half = w.div_ceil(2) * h.div_ceil(2);
     device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("transp records"),
-        size: (w.max(1) * h.max(1)) as u64 * 16, // vec4<f32> per pixel
+        label: Some("transp records + godray scratch + refl history"),
+        // Three regions: per-pixel transparent records, half-res god-ray
+        // occlusion scratch, and the full-res temporal reflection history
+        // (rgb f16 + validating surface point).
+        size: (w * h * 2 + half) as u64 * 16,
         usage: wgpu::BufferUsages::STORAGE,
         mapped_at_creation: false,
     })
@@ -1945,6 +2234,18 @@ pub(crate) fn create_rt_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
             // Temporal GI accumulation: gi_in (last frame) + gi_out (this frame).
             bgl_tex(3, false),
             bgl_storage_tex(4, wgpu::TextureFormat::Rgba32Float),
+            // World-space irradiance probe cache (read_write: the update pass
+            // writes it, cs_main reads it).
+            wgpu::BindGroupLayoutEntry {
+                binding: 5,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ],
     })
 }
@@ -1974,6 +2275,7 @@ pub(crate) fn make_rt_bg(
     accel: &crate::accel::WorldAccel,
     gi_in_view: &wgpu::TextureView,
     gi_out_view: &wgpu::TextureView,
+    probe_buf: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("rt bg (group 1)"),
@@ -1987,7 +2289,122 @@ pub(crate) fn make_rt_bg(
             wgpu::BindGroupEntry { binding: 2, resource: accel.aabb_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(gi_in_view) },
             wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(gi_out_view) },
+            wgpu::BindGroupEntry { binding: 5, resource: probe_buf.as_entire_binding() },
         ],
+    })
+}
+
+/// GPU per-pass profiler (opt-in via VOXELG_GPU_PROFILE): brackets each pass of
+/// the LIVE frame with timestamp queries, resolves + reads back every Nth dirty
+/// frame and logs the per-pass GPU milliseconds. The all-tiles-dirty benches
+/// mislead for the static-camera frame (tile-skip changes everything), so the
+/// 300fps hunt needs these real numbers.
+pub(crate) struct GpuProfiler {
+    query_set: wgpu::QuerySet,
+    resolve_buf: wgpu::Buffer,
+    read_buf: wgpu::Buffer,
+    period_ns: f32,
+    frame: u32,
+}
+
+/// Pass boundaries bracketed in render(); N_TS timestamps -> N_TS-1 deltas.
+const GPU_PROFILE_LABELS: [&str; 9] =
+    ["clouds", "beam", "probe", "main", "transp", "compose", "taa", "post", "blit"];
+const GPU_PROFILE_TS: u32 = GPU_PROFILE_LABELS.len() as u32 + 1;
+
+impl GpuProfiler {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
+        let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("gpu profiler timestamps"),
+            ty: wgpu::QueryType::Timestamp,
+            count: GPU_PROFILE_TS,
+        });
+        let bytes = GPU_PROFILE_TS as u64 * 8;
+        let resolve_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu profiler resolve"),
+            size: bytes,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let read_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu profiler read"),
+            size: bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        Self { query_set, resolve_buf, read_buf, period_ns: queue.get_timestamp_period(), frame: 0 }
+    }
+
+    /// True on the frames that resolve + read back (1 in 64 dirty frames).
+    fn sampling(&self) -> bool {
+        self.frame % 64 == 0
+    }
+
+    fn stamp(&self, enc: &mut wgpu::CommandEncoder, idx: u32) {
+        if self.sampling() {
+            enc.write_timestamp(&self.query_set, idx);
+        }
+    }
+
+    fn resolve(&self, enc: &mut wgpu::CommandEncoder) {
+        if self.sampling() {
+            enc.resolve_query_set(&self.query_set, 0..GPU_PROFILE_TS, &self.resolve_buf, 0);
+            enc.copy_buffer_to_buffer(&self.resolve_buf, 0, &self.read_buf, 0, GPU_PROFILE_TS as u64 * 8);
+        }
+    }
+
+    /// After submit on a sampling frame: map, log per-pass ms, advance.
+    fn report(&mut self, device: &wgpu::Device) {
+        let was_sampling = self.sampling();
+        self.frame = self.frame.wrapping_add(1);
+        if !was_sampling {
+            return;
+        }
+        let slice = self.read_buf.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        let ts: Vec<u64> = {
+            let data = slice.get_mapped_range().unwrap();
+            bytemuck::cast_slice(&data).to_vec()
+        };
+        self.read_buf.unmap();
+        let ms = |a: u64, b: u64| (b.saturating_sub(a)) as f64 * self.period_ns as f64 / 1.0e6;
+        let mut line = String::from("gpu pass ms:");
+        for (i, name) in GPU_PROFILE_LABELS.iter().enumerate() {
+            line.push_str(&format!(" {name} {:.2}", ms(ts[i], ts[i + 1])));
+        }
+        line.push_str(&format!("  | total {:.2}", ms(ts[0], ts[GPU_PROFILE_TS as usize - 1])));
+        log::info!("{line}");
+    }
+}
+
+/// The gi ping-pong pair: index by frame parity (see `rt_bg` field docs).
+pub(crate) fn make_rt_bg_pair(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    accel: &crate::accel::WorldAccel,
+    gi_a: &wgpu::TextureView,
+    gi_b: &wgpu::TextureView,
+    probe_buf: &wgpu::Buffer,
+) -> [wgpu::BindGroup; 2] {
+    [
+        make_rt_bg(device, layout, accel, gi_a, gi_b, probe_buf),
+        make_rt_bg(device, layout, accel, gi_b, gi_a, probe_buf),
+    ]
+}
+
+/// Zeroed irradiance-probe storage buffer (PROBE_TOTAL probes x 96 bytes:
+/// 3x SH radiance + 2x SH visibility moments + info). Zeroed
+/// info.w = 0 marks every slot "never gathered", so the update pass fills them
+/// fresh on the first frames instead of blending against garbage.
+pub(crate) fn create_probe_buf(device: &wgpu::Device) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("gi probes"),
+        // 96 B displayed SH + info, 96 B staging accumulator (GiProbe in
+        // gi_probes.wgsl).
+        size: crate::voxel::PROBE_TOTAL as u64 * 192,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
     })
 }
 
@@ -2517,18 +2934,963 @@ mod gpu_render_tests {
             eprintln!("rt_shadows_match_software: no RT adapter, skipping");
             return;
         };
+        // GI off: this A/B proves the OCCLUSION path matches software; RT_PRIMARY
+        // off so the software primary trace runs under both (isolating shadows/AO).
+        let occl: &[(&'static str, f64)] = &[("GI_ENABLE", 0.0)];
         let mut w0 = World::new();
         w0.fill_demo_terrain();
-        rt_ab_check(&device, &queue, &w0, &ab_camera(&w0), "origin0");
+        rt_ab_check(&device, &queue, &w0, &ab_camera(&w0), "origin0", occl, 3.0);
 
         let mut ws = World::new();
         ws.fill_demo_terrain();
         ws.shift_origin(glam::IVec2::new(3, 5));
         ws.process_pending_gen_blocking();
-        rt_ab_check(&device, &queue, &ws, &ab_camera(&ws), "shifted");
+        rt_ab_check(&device, &queue, &ws, &ab_camera(&ws), "shifted", occl, 3.0);
     }
 
-    fn rt_ab_check(device: &wgpu::Device, queue: &wgpu::Queue, world: &World, cam: &Camera, label: &str) {
+    // The hardware RT primary trace (trace_rt) must resolve the exact same first
+    // surface as the software hierarchical DDA - water sub-voxel tops, foliage/
+    // decoration cutouts and opaque cubes all through the shared resolve_solid_voxel.
+    // Renders water- and foliage-heavy views with RT_PRIMARY on (GI off) and holds
+    // them pixel-close to the software frame.
+    #[test]
+    fn rt_primary_matches_software() {
+        let Some((device, queue, _gpu)) = rt_headless_device() else {
+            eprintln!("rt_primary_matches_software: no RT adapter, skipping");
+            return;
+        };
+        let mut world = World::new();
+        world.fill_demo_terrain();
+        let (water_anchor, leaf_anchor, leaf_ground) = find_scene_anchors(&world);
+        // GI off isolates the primary trace; RT_PRIMARY on routes the primary hit
+        // through the RT cores + resolve_brick_full.
+        let prim: &[(&'static str, f64)] = &[("GI_ENABLE", 0.0), ("RT_PRIMARY", 1.0)];
+
+        let mut wc = Camera::new();
+        wc.pos = glam::Vec3::new(clamp_anchor(water_anchor.x), leaf_ground as f32 + 10.0, clamp_anchor(water_anchor.y) - 26.0);
+        wc.pitch = -0.30;
+        rt_ab_check(&device, &queue, &world, &wc, "water", prim, 4.0);
+
+        let mut fc = Camera::new();
+        fc.pos = glam::Vec3::new(clamp_anchor(leaf_anchor.x), leaf_ground as f32 + 14.0, clamp_anchor(leaf_anchor.y) - 30.0);
+        fc.pitch = -0.35;
+        rt_ab_check(&device, &queue, &world, &fc, "foliage", prim, 4.0);
+    }
+
+    /// Temporal-stability rig: STATIC camera, sun advancing at real per-frame
+    /// speed, with the LIVE reprojection/staleness cache active across a frame
+    /// sequence (light G-buffer ping-ponged exactly like the renderer). Counts
+    /// per-pixel "flicker" - luma deltas that CHANGE DIRECTION with amplitude,
+    /// the jumping-shadow signature (a smooth global dimming never flips sign).
+    /// Run with --nocapture to see counts; dumps a heatmap to target/lookdev.
+    fn flicker_probe(world: &World, cam: &Camera, label: &str) -> f64 {
+        let Some((device, queue, _gpu)) = (|| headless_device())() else {
+            eprintln!("flicker_probe: no GPU, skipping");
+            return 0.0;
+        };
+        let (w, h) = (640u32, 400u32);
+        let wo = world.world_origin_voxel();
+        let camera_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("camera"),
+            size: std::mem::size_of::<CameraUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bricks_buf = storage(&device, "bricks", bytemuck::cast_slice(&world.bricks));
+        let tile_mask_buf = storage(&device, "tm", bytemuck::cast_slice(&world.tile_mask));
+        let chunk_mask_buf = storage(&device, "cm", bytemuck::cast_slice(&world.chunk_mask));
+        let l4_mask_buf = storage(&device, "l4", bytemuck::cast_slice(&world.l4_mask));
+        let bu = storage(&device, "bu", bytemuck::cast_slice(&pack_u8_to_u32(&world.brick_uniform)));
+        let tu = storage(&device, "tu", bytemuck::cast_slice(&pack_u8_to_u32(&world.tile_uniform)));
+        let palette = default_palette();
+        let palette_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("palette"),
+            contents: bytemuck::cast_slice(&palette),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let tiles_w = (w + 7) / 8;
+        let tiles_h = (h + 7) / 8;
+        let words = ((tiles_w * tiles_h) as usize + 31) / 32;
+        let tile_dirty_buf = storage(&device, "td", bytemuck::cast_slice(&vec![u32::MAX; words]));
+        let players_buf = storage(&device, "pl", &vec![0u8; 16 + MAX_REMOTE_PLAYERS * 16]);
+        let (out_tex, output_view) = create_output_texture(&device, w, h);
+        let (_btex, beam_view) = create_beam_texture(&device, w, h);
+        let (_ctex, cloud_sampled_view, _csv) = create_cloud_texture(&device, w, h);
+        let cloud_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        // The live light-cache ping-pong: two textures, two bind-group flavours.
+        let (_la, light_a) = create_lighting_texture(&device, w, h);
+        let (_lb, light_b) = create_lighting_texture(&device, w, h);
+        let transp_buf = create_transp_buf(&device, w, h);
+        let sprites_buf = storage(&device, "spr", bytemuck::cast_slice(&crate::sprites::encoded()));
+        let (_dtex, depth_view) = create_depth_texture(&device, w, h);
+        let (_gtex, geom_view) = create_output_texture(&device, w, h);
+        let (_ddtex, dummy_depth_view) = create_depth_texture(&device, 1, 1);
+        let bgl = create_compute_bgl(&device);
+        // main flavour (writes geom+depth) and compose flavour (writes output,
+        // reads geom+depth), each in both light parities.
+        let mk_main = |lin: &wgpu::TextureView, lout: &wgpu::TextureView| {
+            make_compute_bg(
+                &device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
+                &palette_buf, &geom_view, &beam_view, &tile_dirty_buf, &players_buf,
+                &bu, &tu, &l4_mask_buf, &cloud_sampled_view, &cloud_sampler,
+                lin, lout, &transp_buf, &sprites_buf, &depth_view, &dummy_depth_view, &beam_view,
+            )
+        };
+        let mk_compose = |lin: &wgpu::TextureView, lout: &wgpu::TextureView| {
+            make_compute_bg(
+                &device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
+                &palette_buf, &output_view, &beam_view, &tile_dirty_buf, &players_buf,
+                &bu, &tu, &l4_mask_buf, &cloud_sampled_view, &cloud_sampler,
+                lin, lout, &transp_buf, &sprites_buf, &dummy_depth_view, &geom_view, &depth_view,
+            )
+        };
+        let bg_main = [mk_main(&light_a, &light_b), mk_main(&light_b, &light_a)];
+        let bg_comp = [mk_compose(&light_a, &light_b), mk_compose(&light_b, &light_a)];
+
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(raymarch_source().into()),
+        });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
+        });
+        let mk_pipe = |entry: &str| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: None,
+                layout: Some(&pl),
+                module: &module,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
+        let p_main = mk_pipe("cs_main");
+        let p_transp = mk_pipe("cs_transparent");
+        let p_comp = mk_pipe("cs_compose");
+
+        let bpr = w * 4;
+        let n_frames = 24usize;
+        let mut frames: Vec<Vec<u8>> = Vec::with_capacity(n_frames);
+        for f in 0..n_frames {
+            // Sun advances at real speed for ~50 fps play (0.02 sun-time/frame);
+            // animation time frozen so water/foliage motion cannot pollute the
+            // shadow-flicker measurement. taa_blend > 0 marks "static camera";
+            // reproject enabled with the SAME camera as previous frame.
+            let sun_t = 30.0 + f as f32 * 0.02;
+            let mut cu = CameraUniform::from_camera(cam, w, h, 30.0, sun_t, wo, [0.0, 0.0], 0.9);
+            cu.set_prev_camera(cam, f > 0);
+            queue.write_buffer(&camera_buf, 0, bytemuck::bytes_of(&cu));
+            let parity = f & 1;
+            let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: (bpr * h) as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut enc = device.create_command_encoder(&Default::default());
+            for (pipe, bg) in [(&p_main, &bg_main[parity]), (&p_transp, &bg_main[parity]), (&p_comp, &bg_comp[parity])] {
+                let mut cp = enc.begin_compute_pass(&Default::default());
+                cp.set_pipeline(pipe);
+                cp.set_bind_group(0, bg, &[]);
+                cp.dispatch_workgroups(tiles_w, tiles_h, 1);
+            }
+            enc.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo { texture: &out_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::TexelCopyBufferInfo { buffer: &readback, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(h) } },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+            queue.submit(std::iter::once(enc.finish()));
+            let slice = readback.slice(..);
+            slice.map_async(wgpu::MapMode::Read, |_| {});
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            frames.push(slice.get_mapped_range().unwrap().to_vec());
+        }
+
+        // Flicker = luma delta that changes SIGN with amplitude (up-down-up):
+        // a smooth global sunset dim never flips; a popping shadow does.
+        let n = (w * h) as usize;
+        let mut flicker = vec![0u32; n];
+        for i in 0..n {
+            let luma = |f: &Vec<u8>| {
+                (f[i * 4] as i32 + f[i * 4 + 1] as i32 + f[i * 4 + 2] as i32) / 3
+            };
+            let mut flips = 0u32;
+            let mut prev_delta = 0i32;
+            for fidx in 1..n_frames {
+                let d = luma(&frames[fidx]) - luma(&frames[fidx - 1]);
+                if d.abs() >= 5 && prev_delta.abs() >= 5 && (d > 0) != (prev_delta > 0) {
+                    flips += 1;
+                }
+                if d.abs() >= 5 {
+                    prev_delta = d;
+                }
+            }
+            flicker[i] = flips;
+        }
+        let flickering = flicker.iter().filter(|&&c| c >= 2).count();
+        let frac = flickering as f64 / n as f64;
+        eprintln!("flicker_probe[{label}]: {flickering} flickering pixels ({:.3}%)", frac * 100.0);
+        // Heatmap: red intensity = flip count over the last frame's image.
+        std::fs::create_dir_all("target/lookdev").unwrap();
+        let mut img = frames[n_frames - 1].clone();
+        for i in 0..n {
+            if flicker[i] >= 2 {
+                img[i * 4] = 255;
+                img[i * 4 + 1] = (img[i * 4 + 1] / 3).min(80);
+                img[i * 4 + 2] = (img[i * 4 + 2] / 3).min(80);
+            }
+        }
+        let path = format!("target/lookdev/flicker_{label}.png");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut enc2 = png::Encoder::new(std::io::BufWriter::new(file), w, h);
+        enc2.set_color(png::ColorType::Rgba);
+        enc2.set_depth(png::BitDepth::Eight);
+        enc2.write_header().unwrap().write_image_data(&img).unwrap();
+        eprintln!("wrote {path}");
+        frac
+    }
+
+    /// RT-variant flicker probe: same sequence + analysis as flicker_probe but
+    /// with the live RT config (RT primary, RT shadows, probe GI with the
+    /// live 1/8 amortized update + gi ping-pong). `gi_on` isolates the probe
+    /// cache as a flicker source.
+    /// Flicker rig knobs. `animate: false` freezes water/wind/caustics while
+    /// the sun still advances - the discriminator between legitimate sway
+    /// motion and jitter/shadow churn.
+    #[derive(Clone, Copy)]
+    struct RigOpts {
+        gi_on: bool,
+        sun_base: f32,
+        animate: bool,
+        /// Freeze the shading-noise phase (JIT_PHASE_FREEZE override): the
+        /// discriminator for held-random-sample churn (shadow cone, GI jitter).
+        jit_freeze: bool,
+    }
+
+    impl Default for RigOpts {
+        fn default() -> Self {
+            Self { gi_on: true, sun_base: 30.0, animate: true, jit_freeze: false }
+        }
+    }
+
+    fn flicker_probe_rt(world: &World, cam: &Camera, label: &str, opts: RigOpts) -> f64 {
+        let RigOpts { gi_on, sun_base, animate, jit_freeze } = opts;
+        let Some((device, queue, _gpu)) = rt_headless_device() else {
+            eprintln!("flicker_probe_rt: no RT adapter, skipping");
+            return 0.0;
+        };
+        let (device, queue) = (&device, &queue);
+        // Native resolution: thin decoration blades alias with sub-pixel
+        // coverage, so flicker counts only transfer to what Marc sees when
+        // measured at the resolution he plays at.
+        let (w, h) = (1920u32, 1080u32);
+        let wo = world.world_origin_voxel();
+        let camera_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("camera"),
+            size: std::mem::size_of::<CameraUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bricks_buf = storage(device, "bricks", bytemuck::cast_slice(&world.bricks));
+        let tile_mask_buf = storage(device, "tm", bytemuck::cast_slice(&world.tile_mask));
+        let chunk_mask_buf = storage(device, "cm", bytemuck::cast_slice(&world.chunk_mask));
+        let l4_mask_buf = storage(device, "l4", bytemuck::cast_slice(&world.l4_mask));
+        let bu = storage(device, "bu", bytemuck::cast_slice(&pack_u8_to_u32(&world.brick_uniform)));
+        let tu = storage(device, "tu", bytemuck::cast_slice(&pack_u8_to_u32(&world.tile_uniform)));
+        let palette = default_palette();
+        let palette_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("palette"),
+            contents: bytemuck::cast_slice(&palette),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let tiles_w = (w + 7) / 8;
+        let tiles_h = (h + 7) / 8;
+        let words = ((tiles_w * tiles_h) as usize + 31) / 32;
+        let tile_dirty_buf = storage(device, "td", bytemuck::cast_slice(&vec![u32::MAX; words]));
+        let players_buf = storage(device, "pl", &vec![0u8; 16 + MAX_REMOTE_PLAYERS * 16]);
+        let (_out_tex, output_view) = create_output_texture(device, w, h);
+        let (_btex, beam_view) = create_beam_texture(device, w, h);
+        let (_ctex, cloud_sampled_view, cloud_storage_view) = create_cloud_texture(device, w, h);
+        let cloud_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let (_la, light_a) = create_lighting_texture(device, w, h);
+        let (_lb, light_b) = create_lighting_texture(device, w, h);
+        let transp_buf = create_transp_buf(device, w, h);
+        let sprites_buf = storage(device, "spr", bytemuck::cast_slice(&crate::sprites::encoded()));
+        let (_dtex, depth_view) = create_depth_texture(device, w, h);
+        let (_gtex, geom_view) = create_output_texture(device, w, h);
+        let (_ddtex, dummy_depth_view) = create_depth_texture(device, 1, 1);
+        let bgl = create_compute_bgl(device);
+        let mk_main = |lin: &wgpu::TextureView, lout: &wgpu::TextureView| {
+            make_compute_bg(
+                device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
+                &palette_buf, &geom_view, &beam_view, &tile_dirty_buf, &players_buf,
+                &bu, &tu, &l4_mask_buf, &cloud_sampled_view, &cloud_sampler,
+                lin, lout, &transp_buf, &sprites_buf, &depth_view, &dummy_depth_view, &beam_view,
+            )
+        };
+        let mk_compose = |lin: &wgpu::TextureView, lout: &wgpu::TextureView| {
+            make_compute_bg(
+                device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
+                &palette_buf, &output_view, &beam_view, &tile_dirty_buf, &players_buf,
+                &bu, &tu, &l4_mask_buf, &cloud_sampled_view, &cloud_sampler,
+                lin, lout, &transp_buf, &sprites_buf, &dummy_depth_view, &geom_view, &depth_view,
+            )
+        };
+        let bg_main = [mk_main(&light_a, &light_b), mk_main(&light_b, &light_a)];
+        let bg_comp = [mk_compose(&light_a, &light_b), mk_compose(&light_b, &light_a)];
+
+        // RT group 1 with the LIVE gi ping-pong pair.
+        let accel = crate::accel::build_world_accel(device, queue, world);
+        let rt_bgl = create_rt_bgl(device);
+        let (_gia, gi_a) = create_lighting_texture(device, w, h);
+        let (_gib, gi_b) = create_lighting_texture(device, w, h);
+        let probe_buf = create_probe_buf(device);
+        let rt_bg = make_rt_bg_pair(device, &rt_bgl, &accel, &gi_a, &gi_b, &probe_buf);
+
+        let rt_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(raymarch_source_variant(true).into()),
+        });
+        let rt_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[Some(&bgl), Some(&rt_bgl)],
+            immediate_size: 0,
+        });
+        let gi = if gi_on { 1.0 } else { 0.0 };
+        let jf = if jit_freeze { 1.0 } else { 0.0 };
+        let consts: &[(&str, f64)] = &[("RT_PRIMARY", 1.0), ("GI_ENABLE", gi), ("JIT_PHASE_FREEZE", jf)];
+        let mk_pipe = |entry: &str| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: None,
+                layout: Some(&rt_pl),
+                module: &rt_module,
+                entry_point: Some(entry),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: consts,
+                    ..Default::default()
+                },
+                cache: None,
+            })
+        };
+        let p_main = mk_pipe("cs_main");
+        let p_transp = mk_pipe("cs_transparent");
+        let p_comp = mk_pipe("cs_compose");
+        let p_probe = mk_pipe("cs_gi_probe_update");
+        let p_godray = mk_pipe("cs_godrays");
+
+        // Half-res cloud pre-pass (its own tiny layout, same shader module).
+        let cloud_bgl = create_cloud_bgl(device);
+        let cloud_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("rig cloud pl"),
+            bind_group_layouts: &[Some(&cloud_bgl)],
+            immediate_size: 0,
+        });
+        let p_clouds = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("rig cloud pipeline"),
+            layout: Some(&cloud_pl),
+            module: &rt_module,
+            entry_point: Some("cs_clouds"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let cloud_bg = make_cloud_bg(device, &cloud_bgl, &camera_buf, &cloud_storage_view);
+
+        // TAA resolve, exactly as live: static camera = Halton jitter +
+        // 0.9 history blend; the flip counter reads the RESOLVED image (what
+        // the player sees), not the raw raymarch output.
+        let (resolve_tex, resolve_view) = create_output_texture(device, w, h);
+        let (history_tex, history_view) = create_history_texture(device, w, h);
+        let taa_bgl = create_taa_bgl(device);
+        let taa_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("rig taa pl"),
+            bind_group_layouts: &[Some(&taa_bgl)],
+            immediate_size: 0,
+        });
+        let taa_src = format!("{}\n{}\n{}", WORLD_CONSTS_WGSL, COMMON_WGSL, include_str!("../shaders/taa.wgsl"));
+        let taa_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("rig taa shader"),
+            source: wgpu::ShaderSource::Wgsl(taa_src.into()),
+        });
+        let p_taa = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("rig taa pipeline"),
+            layout: Some(&taa_pl),
+            module: &taa_module,
+            entry_point: Some("cs_taa"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        // Binding 4 is the lighting G-buffer (reprojection): the OUT side of
+        // the light ping-pong for the frame's parity (parity 0 writes b).
+        let taa_bg = [
+            make_taa_bg(device, &taa_bgl, &camera_buf, &output_view, &history_view, &resolve_view, &light_b),
+            make_taa_bg(device, &taa_bgl, &camera_buf, &output_view, &history_view, &resolve_view, &light_a),
+        ];
+
+        let bpr = w * 4;
+        // Long horizon: the probe-GI walk develops over tens of update rounds
+        // (tau = 1/(1-hysteresis) ~ 33 updates), invisible in a 24-frame
+        // window. Warm 256 frames (32 updates/probe), then read back every
+        // 8th frame over 192 frames: 24 samples spanning 24 more updates.
+        // Stride 8 also samples in phase with the Halton cycle, aliasing out
+        // the 8-periodic TAA edge ripple - slow walks stand alone.
+        let n_warm = 256usize;
+        let n_frames = 24usize;
+        let stride = 8usize;
+        let mut frames: Vec<Vec<u8>> = Vec::with_capacity(n_frames);
+        // One continuous frame stream, the full live pass chain every frame
+        // (clouds -> probe -> main -> transp -> godrays -> compose -> TAA ->
+        // history feedback). The first n_warm frames converge every temporal
+        // cache (probes, light cache, reflection history, TAA history) at a
+        // frozen clock; only then do sun + animation advance and frames get
+        // read back. The beam pre-pass is deliberately absent: a zeroed beam
+        // texture means beam_skip = 0, which is image-identical (just slower).
+        for f in 0..(n_warm + (n_frames - 1) * stride + 1) {
+            // Sun speed 0.0025/frame: the same 0.48 total sweep as the old
+            // 24-frame rig, stretched over the long horizon.
+            let step = f.saturating_sub(n_warm - 1) as f32;
+            let sun_t = sun_base + step * 0.0025;
+            // Animation time advances WITH the sun (live behaviour): waves,
+            // foliage sway (animated blade cutouts = moving dapple), caustics.
+            // With animate off it stays frozen while the sun still moves.
+            let anim_t = if animate { sun_t } else { sun_base };
+            let jitter = crate::app::JITTER_PATTERN[f & 7];
+            let mut cu = CameraUniform::from_camera(cam, w, h, anim_t, sun_t, wo, jitter, 0.9);
+            cu.gi_round = (f % (GI_PROBE_UPDATE_DIV * GI_PROBE_DIR_EPOCHS) as usize) as i32;
+            cu.set_prev_camera(cam, f > 0);
+            queue.write_buffer(&camera_buf, 0, bytemuck::bytes_of(&cu));
+            let parity = f & 1;
+            let mut enc = device.create_command_encoder(&Default::default());
+            {
+                let mut cp = enc.begin_compute_pass(&Default::default());
+                cp.set_pipeline(&p_clouds);
+                cp.set_bind_group(0, &cloud_bg, &[]);
+                cp.dispatch_workgroups(((w + 1) / 2 + 7) / 8, ((h + 1) / 2 + 7) / 8, 1);
+            }
+            {
+                let mut cp = enc.begin_compute_pass(&Default::default());
+                cp.set_pipeline(&p_probe);
+                cp.set_bind_group(0, &bg_main[parity], &[]);
+                cp.set_bind_group(1, &rt_bg[parity], &[]);
+                let threads = crate::voxel::PROBE_TOTAL / GI_PROBE_UPDATE_DIV;
+                cp.dispatch_workgroups(threads.div_ceil(64), 1, 1);
+            }
+            for (pipe, bg) in [(&p_main, &bg_main[parity]), (&p_transp, &bg_main[parity])] {
+                let mut cp = enc.begin_compute_pass(&Default::default());
+                cp.set_pipeline(pipe);
+                cp.set_bind_group(0, bg, &[]);
+                cp.set_bind_group(1, &rt_bg[parity], &[]);
+                cp.dispatch_workgroups(tiles_w, tiles_h, 1);
+            }
+            {
+                let mut cp = enc.begin_compute_pass(&Default::default());
+                cp.set_pipeline(&p_godray);
+                cp.set_bind_group(0, &bg_comp[parity], &[]);
+                cp.set_bind_group(1, &rt_bg[parity], &[]);
+                cp.dispatch_workgroups(w.div_ceil(2).div_ceil(8), h.div_ceil(2).div_ceil(8), 1);
+            }
+            {
+                let mut cp = enc.begin_compute_pass(&Default::default());
+                cp.set_pipeline(&p_comp);
+                cp.set_bind_group(0, &bg_comp[parity], &[]);
+                cp.set_bind_group(1, &rt_bg[parity], &[]);
+                cp.dispatch_workgroups(tiles_w, tiles_h, 1);
+            }
+            {
+                let mut cp = enc.begin_compute_pass(&Default::default());
+                cp.set_pipeline(&p_taa);
+                cp.set_bind_group(0, &taa_bg[parity], &[]);
+                cp.dispatch_workgroups(tiles_w, tiles_h, 1);
+            }
+            enc.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo { texture: &resolve_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::TexelCopyTextureInfo { texture: &history_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+            if f < n_warm || (f - n_warm) % stride != 0 {
+                queue.submit(std::iter::once(enc.finish()));
+                continue;
+            }
+            let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: (bpr * h) as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            enc.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo { texture: &resolve_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::TexelCopyBufferInfo { buffer: &readback, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(h) } },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+            queue.submit(std::iter::once(enc.finish()));
+            let slice = readback.slice(..);
+            slice.map_async(wgpu::MapMode::Read, |_| {});
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            frames.push(slice.get_mapped_range().unwrap().to_vec());
+        }
+
+        let n = (w * h) as usize;
+        // Direction flips of the per-frame luma delta, at two magnitudes:
+        // strong (>= 5/255, plainly visible) and faint (>= 2/255, the slow
+        // crawl a 0.9 TAA blend compresses large underlying steps into).
+        const THRS: [i32; 2] = [5, 2];
+        let mut flicker = vec![[0u32; 2]; n];
+        for i in 0..n {
+            let luma = |fr: &Vec<u8>| {
+                (fr[i * 4] as i32 + fr[i * 4 + 1] as i32 + fr[i * 4 + 2] as i32) / 3
+            };
+            let mut flips = [0u32; 2];
+            let mut prev_delta = [0i32; 2];
+            for fidx in 1..n_frames {
+                let d = luma(&frames[fidx]) - luma(&frames[fidx - 1]);
+                for (k, &thr) in THRS.iter().enumerate() {
+                    if d.abs() >= thr && prev_delta[k].abs() >= thr && (d > 0) != (prev_delta[k] > 0) {
+                        flips[k] += 1;
+                    }
+                    if d.abs() >= thr {
+                        prev_delta[k] = d;
+                    }
+                }
+            }
+            flicker[i] = flips;
+        }
+        let flickering = flicker.iter().filter(|c| c[0] >= 2).count();
+        let faint = flicker.iter().filter(|c| c[1] >= 2).count();
+        let frac = flickering as f64 / n as f64;
+        // Shadow-edge BREATHING detector: Marc's symptom is a shadow whose
+        // body stays but whose extent grows/shrinks over seconds - too slow
+        // for the frame-delta flip counter. Per pixel, Schmitt-trigger the
+        // luma between its own dark and bright states: >= 2 full transitions
+        // (left AND returned) = the pixel breathed in and out of shadow.
+        let mut breathing_map = vec![false; n];
+        for i in 0..n {
+            let luma = |fr: &Vec<u8>| {
+                (fr[i * 4] as i32 + fr[i * 4 + 1] as i32 + fr[i * 4 + 2] as i32) / 3
+            };
+            let (mut lo, mut hi) = (255i32, 0i32);
+            for fr in &frames {
+                let l = luma(fr);
+                lo = lo.min(l);
+                hi = hi.max(l);
+            }
+            if hi - lo < 12 {
+                continue;
+            }
+            let mid = (hi + lo) / 2;
+            let hyst = ((hi - lo) / 6).max(3);
+            let mut state = luma(&frames[0]) > mid;
+            let mut transitions = 0u32;
+            for fr in &frames[1..] {
+                let l = luma(fr);
+                if state && l < mid - hyst {
+                    state = false;
+                    transitions += 1;
+                } else if !state && l > mid + hyst {
+                    state = true;
+                    transitions += 1;
+                }
+            }
+            breathing_map[i] = transitions >= 2;
+        }
+        let breathing = breathing_map.iter().filter(|&&b| b).count();
+        // Mean luma of the last frame: framing sanity. A view accidentally
+        // aimed at sky/void reads ~200+, a pitch-black night view ~0 (both
+        // make the flip counter blind); healthy ground/underwater framing
+        // sits well inside that range.
+        let mean_luma = frames[n_frames - 1]
+            .chunks_exact(4)
+            .map(|p| (p[0] as u32 + p[1] as u32 + p[2] as u32) as f64 / 3.0)
+            .sum::<f64>() / n as f64;
+        eprintln!("flicker_probe_rt[{label} gi={gi_on} jf={jit_freeze}]: {flickering} strong / {faint} faint flickering, {breathing} breathing pixels ({:.3}% strong), mean luma {mean_luma:.0}", frac * 100.0);
+        std::fs::create_dir_all("target/lookdev").unwrap();
+        // Heatmap: breathing blue (the priority symptom), strong flicker red,
+        // faint-only orange.
+        let mut img = frames[n_frames - 1].clone();
+        for i in 0..n {
+            if breathing_map[i] {
+                img[i * 4] = (img[i * 4] / 3).min(60);
+                img[i * 4 + 1] = 120;
+                img[i * 4 + 2] = 255;
+            } else if flicker[i][0] >= 2 {
+                img[i * 4] = 255;
+                img[i * 4 + 1] = (img[i * 4 + 1] / 3).min(80);
+                img[i * 4 + 2] = (img[i * 4 + 2] / 3).min(80);
+            } else if flicker[i][1] >= 2 {
+                img[i * 4] = 255;
+                img[i * 4 + 1] = 150;
+                img[i * 4 + 2] = (img[i * 4 + 2] / 3).min(60);
+            }
+        }
+        let path = format!("target/lookdev/flicker_rt_{label}_gi{}.png", gi_on as u8);
+        let file = std::fs::File::create(&path).unwrap();
+        let mut enc2 = png::Encoder::new(std::io::BufWriter::new(file), w, h);
+        enc2.set_color(png::ColorType::Rgba);
+        enc2.set_depth(png::BitDepth::Eight);
+        enc2.write_header().unwrap().write_image_data(&img).unwrap();
+        eprintln!("wrote {path}");
+        frac
+    }
+
+    /// Topmost SOLID voxel of a world column: (y, material). Decoration
+    /// overlays standing on the ground (tall grass, flowers, dry tufts, the
+    /// invisible leaf-fringe markers, smoke, fire) are see-through for
+    /// terrain classification - a tufted meadow is still a meadow. Leaves and
+    /// wood are NOT skipped: a column under a canopy reports the canopy.
+    /// (0, MAT_AIR) for an empty column (off-island void).
+    fn column_top(world: &World, x: i32, z: i32) -> (i32, u8) {
+        use crate::voxel::{
+            MAT_AIR, MAT_FIRE, MAT_FLOWER, MAT_LEAF_FRINGE, MAT_SMOKE, MAT_TALL_GRASS,
+            MAT_TALL_GRASS_DRY,
+        };
+        for y in (1..200).rev() {
+            let m = world.material_at_world(x, y, z);
+            if matches!(m, MAT_AIR | MAT_TALL_GRASS | MAT_FLOWER | MAT_TALL_GRASS_DRY | MAT_LEAF_FRINGE | MAT_SMOKE | MAT_FIRE) {
+                continue;
+            }
+            return (y, m);
+        }
+        (0, MAT_AIR)
+    }
+
+    /// Flat treeless grass patch for ground-flicker views: every column of a
+    /// 13x13 window tops out in grass within +-1 voxel of the center height
+    /// with open sky above (an overhanging canopy would top out in leaves and
+    /// reject the window). Returns (x, z, ground_y) of the flattest match.
+    fn find_meadow(world: &World) -> (i32, i32, i32) {
+        use crate::voxel::MAT_GRASS;
+        let mut best: Option<(i32, i32, i32, i32)> = None;
+        for cz in (40..472).step_by(8) {
+            for cx in (40..472).step_by(8) {
+                let (y0, m0) = column_top(world, cx, cz);
+                if m0 != MAT_GRASS {
+                    continue;
+                }
+                let mut spread = 0;
+                let mut ok = true;
+                'patch: for dz in -6..=6 {
+                    for dx in -6..=6 {
+                        let (y, m) = column_top(world, cx + dx, cz + dz);
+                        if m != MAT_GRASS || (y - y0).abs() > 4 {
+                            ok = false;
+                            break 'patch;
+                        }
+                        spread = spread.max((y - y0).abs());
+                    }
+                }
+                if ok && best.map_or(true, |b| spread < b.3) {
+                    best = Some((cx, cz, y0, spread));
+                    if spread == 0 {
+                        return (cx, cz, y0);
+                    }
+                }
+            }
+        }
+        let b = best.expect("demo terrain has no 13x13 flat grass patch");
+        (b.0, b.1, b.2)
+    }
+
+    /// Pond interior for the submerged flicker view: a water column >= 3 deep
+    /// whose surface stays water for 10 voxels toward +z, so a camera inside
+    /// the pond looking down +z sees the pond bed and terrace walls, never
+    /// the shore or open air. Returns (x, z, floor_y, surface_y) of the
+    /// deepest match.
+    fn find_pond(world: &World) -> (i32, i32, i32, i32) {
+        use crate::voxel::{is_water_mat, MAT_AIR};
+        let mut best: Option<(i32, i32, i32, i32)> = None;
+        for cz in (40..460).step_by(4) {
+            for cx in (40..472).step_by(4) {
+                let mut surface = -1;
+                for y in (1..200).rev() {
+                    let m = world.material_at_world(cx, y, cz);
+                    if is_water_mat(m) {
+                        surface = y;
+                        break;
+                    }
+                    if m != MAT_AIR {
+                        break;
+                    }
+                }
+                if surface < 0 {
+                    continue;
+                }
+                let mut floor = surface;
+                while floor > 1 && is_water_mat(world.material_at_world(cx, floor - 1, cz)) {
+                    floor -= 1;
+                }
+                let depth = surface - floor + 1;
+                if depth < 3 {
+                    continue;
+                }
+                let ahead_water = (2..=10).all(|d| is_water_mat(world.material_at_world(cx, surface, cz + d)));
+                if !ahead_water {
+                    continue;
+                }
+                if best.map_or(true, |b| depth > b.3 - b.2 + 1) {
+                    best = Some((cx, cz, floor, surface));
+                }
+            }
+        }
+        best.expect("demo terrain has no pond >= 3 deep with 10 voxels of open water")
+    }
+
+    /// A lone tree on open grass: a leaf-topped column whose crown stays
+    /// inside radius 7 (ring 8..14 is pure grass), so its cast shadow lands
+    /// on clean ground with a visible penumbra boundary. Returns
+    /// (x, z, ground_y) with ground_y sampled from the open ring.
+    fn find_lone_tree(world: &World) -> Option<(i32, i32, i32)> {
+        use crate::voxel::{is_leaf_mat, MAT_GRASS};
+        for cz in (48..464).step_by(4) {
+            'cand: for cx in (48..464).step_by(4) {
+                let (_, m0) = column_top(world, cx, cz);
+                if !is_leaf_mat(m0) {
+                    continue;
+                }
+                let mut ring_ground = None;
+                for r in [8i32, 10, 12, 14] {
+                    for k in 0..12 {
+                        let ang = k as f32 * std::f32::consts::TAU / 12.0;
+                        let (dx, dz) = ((r as f32 * ang.cos()) as i32, (r as f32 * ang.sin()) as i32);
+                        let (y, m) = column_top(world, cx + dx, cz + dz);
+                        if m != MAT_GRASS {
+                            continue 'cand;
+                        }
+                        if ring_ground.is_none() {
+                            ring_ground = Some(y);
+                        }
+                    }
+                }
+                return Some((cx, cz, ring_ground.unwrap()));
+            }
+        }
+        None
+    }
+
+    #[test]
+    #[ignore]
+    fn flicker_probe_rt_views() {
+        let mut world = World::new();
+        world.fill_demo_terrain();
+        let (_, leaf_anchor, leaf_ground) = find_scene_anchors(&world);
+        let mut cam = Camera::new();
+        cam.pos = glam::Vec3::new(clamp_anchor(leaf_anchor.x), leaf_ground as f32 + 10.0, clamp_anchor(leaf_anchor.y) - 24.0);
+        cam.pitch = -0.3;
+        let day = RigOpts::default();
+        let no_gi = RigOpts { gi_on: false, ..day };
+        flicker_probe_rt(&world, &cam, "terrain_trees", day);
+        flicker_probe_rt(&world, &cam, "terrain_trees", no_gi);
+        // Submerged inside a real pond, aimed at its bed and terrace walls
+        // (the view where Marc sees the rectangular probe-cell flicker). Eye
+        // at 60% depth: comfortably underwater with the bed a few voxels
+        // ahead, not hugging it.
+        let (px, pz, pfloor, psurf) = find_pond(&world);
+        let depth = (psurf - pfloor + 1) as f32;
+        let mut uc = Camera::new();
+        uc.pos = glam::Vec3::new(
+            px as f32 + 0.5,
+            (pfloor as f32 + 0.6 * depth).clamp(pfloor as f32 + 2.0, psurf as f32 - 0.5),
+            pz as f32 + 0.5,
+        );
+        uc.pitch = -0.45;
+        eprintln!("pond at ({px},{pz}) floor {pfloor} surface {psurf}");
+        flicker_probe_rt(&world, &uc, "underwater", day);
+        flicker_probe_rt(&world, &uc, "underwater", no_gi);
+        // The primary symptom view: a lone tree's cast shadow on open grass,
+        // camera aimed at the penumbra boundary. Sun at t=30 is at
+        // s ~ (-0.36, 0.89, 0.29): the shadow of a crown ~9 up lands ~(+3.6,
+        // -2.9) from the trunk.
+        if let Some((tx, tz, tground)) = find_lone_tree(&world) {
+            let mut tc = Camera::new();
+            tc.pos = glam::Vec3::new(tx as f32 + 4.1, tground as f32 + 5.5, tz as f32 - 13.9);
+            tc.pitch = -0.42;
+            eprintln!("lone tree at ({tx},{tz}) ground {tground}");
+            flicker_probe_rt(&world, &tc, "tree_shadow", day);
+            flicker_probe_rt(&world, &tc, "tree_shadow", no_gi);
+        } else {
+            eprintln!("WARN: no lone tree found - tree_shadow views skipped");
+        }
+        // Low over open treeless grass: isolates ground shadows from canopy
+        // and tuft pixel churn.
+        let (mx, mz, mground) = find_meadow(&world);
+        let mut mc = Camera::new();
+        mc.pos = glam::Vec3::new(mx as f32 + 0.5, mground as f32 + 4.0, mz as f32 + 0.5);
+        mc.pitch = -0.55;
+        eprintln!("meadow at ({mx},{mz}) ground {mground}");
+        flicker_probe_rt(&world, &mc, "meadow", day);
+        flicker_probe_rt(&world, &mc, "meadow", no_gi);
+    }
+
+    #[test]
+    #[ignore]
+    fn flicker_probe_views() {
+        let mut world = World::new();
+        world.fill_demo_terrain();
+        let (water_anchor, leaf_anchor, leaf_ground) = find_scene_anchors(&world);
+        // Terrain + trees view.
+        let mut cam = Camera::new();
+        cam.pos = glam::Vec3::new(clamp_anchor(leaf_anchor.x), leaf_ground as f32 + 10.0, clamp_anchor(leaf_anchor.y) - 24.0);
+        cam.pitch = -0.3;
+        flicker_probe(&world, &cam, "terrain_trees");
+        // Above-water view.
+        let mut wc = Camera::new();
+        wc.pos = glam::Vec3::new(clamp_anchor(water_anchor.x), 74.0, clamp_anchor(water_anchor.y) - 10.0);
+        wc.pitch = -0.35;
+        flicker_probe(&world, &wc, "water_above");
+        // Underwater view (worse per report).
+        let mut uc = Camera::new();
+        uc.pos = glam::Vec3::new(clamp_anchor(water_anchor.x), 62.5, clamp_anchor(water_anchor.y));
+        uc.pitch = -0.1;
+        flicker_probe(&world, &uc, "underwater");
+    }
+
+    // The world-space probe cache must actually LIGHT the scene: after the update
+    // pass converges the probes, indirect must add real, bounded light (brighter
+    // than GI-off, not zero, not blown out, no NaN). Proves the SH gather/project/
+    // sample chain end-to-end on the GPU - CPU tests can't see this.
+    #[test]
+    fn probe_gi_lights_the_scene() {
+        let Some((device, queue, _gpu)) = rt_headless_device() else {
+            eprintln!("probe_gi_lights_the_scene: no RT adapter, skipping");
+            return;
+        };
+        let (device, queue) = (&device, &queue);
+        let mut world = World::new();
+        world.fill_demo_terrain();
+        let (_wa, leaf_anchor, leaf_ground) = find_scene_anchors(&world);
+        // Under-canopy view: plenty of shadowed geometry that indirect should lift.
+        let mut cam = Camera::new();
+        cam.pos = glam::Vec3::new(clamp_anchor(leaf_anchor.x), leaf_ground as f32 + 6.0, clamp_anchor(leaf_anchor.y) - 18.0);
+        cam.pitch = -0.15;
+
+        let (w, h) = (320u32, 200u32);
+        let wo = world.world_origin_voxel();
+        let cu = CameraUniform::from_camera(&cam, w, h, 30.0, 30.0, wo, [0.0, 0.0], 0.0);
+        let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("camera"), contents: bytemuck::bytes_of(&cu),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let bricks_buf = storage(device, "bricks", bytemuck::cast_slice(&world.bricks));
+        let tile_mask_buf = storage(device, "tile_mask", bytemuck::cast_slice(&world.tile_mask));
+        let chunk_mask_buf = storage(device, "chunk_mask", bytemuck::cast_slice(&world.chunk_mask));
+        let l4_mask_buf = storage(device, "l4_mask", bytemuck::cast_slice(&world.l4_mask));
+        let brick_uniform_buf = storage(device, "bu", bytemuck::cast_slice(&pack_u8_to_u32(&world.brick_uniform)));
+        let tile_uniform_buf = storage(device, "tu", bytemuck::cast_slice(&pack_u8_to_u32(&world.tile_uniform)));
+        let palette = default_palette();
+        let palette_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("palette"), contents: bytemuck::cast_slice(&palette),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let words = (((w + 7) / 8 * ((h + 7) / 8)) as usize + 31) / 32;
+        let tile_dirty_buf = storage(device, "tile_dirty", bytemuck::cast_slice(&vec![u32::MAX; words]));
+        let players_buf = storage(device, "players", &vec![0u8; 16 + MAX_REMOTE_PLAYERS * 16]);
+        let (out_tex, output_view) = create_output_texture(device, w, h);
+        let (_btex, beam_view) = create_beam_texture(device, w, h);
+        let (_ctex, cloud_sampled_view, _cloud_storage_view) = create_cloud_texture(device, w, h);
+        let cloud_sampler = device.create_sampler(&wgpu::SamplerDescriptor { label: None, mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
+        let (_ltex, light_in_view) = create_lighting_texture(device, w, h);
+        let (_ltex2, light_out_view) = create_lighting_texture(device, w, h);
+        let transp_buf = create_transp_buf(device, w, h);
+        let sprites_buf = storage(device, "sprites", bytemuck::cast_slice(&crate::sprites::encoded()));
+        let (_dtex, depth_view) = create_depth_texture(device, w, h);
+        let (_gtex, geom_view) = create_output_texture(device, w, h);
+        let (_ddtex, dummy_depth_view) = create_depth_texture(device, 1, 1);
+        let bgl = create_compute_bgl(device);
+        let bg = make_compute_bg(
+            device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
+            &palette_buf, &output_view, &beam_view, &tile_dirty_buf, &players_buf,
+            &brick_uniform_buf, &tile_uniform_buf, &l4_mask_buf,
+            &cloud_sampled_view, &cloud_sampler, &light_in_view, &light_out_view, &transp_buf,
+            &sprites_buf, &dummy_depth_view, &geom_view, &depth_view,
+        );
+        let accel = crate::accel::build_world_accel(device, queue, &world);
+        let rt_bgl = create_rt_bgl(device);
+        let (_gi_i, gi_iv) = create_lighting_texture(device, w, h);
+        let (_gi_o, gi_ov) = create_lighting_texture(device, w, h);
+        let probe_buf = create_probe_buf(device);
+        let rt_bg = make_rt_bg(device, &rt_bgl, &accel, &gi_iv, &gi_ov, &probe_buf);
+        let rt_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None, source: wgpu::ShaderSource::Wgsl(raymarch_source_variant(true).into()),
+        });
+        let rt_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None, bind_group_layouts: &[Some(&bgl), Some(&rt_bgl)], immediate_size: 0,
+        });
+        let mk = |entry: &'static str, consts: &[(&'static str, f64)]| device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None, layout: Some(&rt_pl), module: &rt_module, entry_point: Some(entry),
+            compilation_options: wgpu::PipelineCompilationOptions { constants: consts, ..Default::default() }, cache: None,
+        });
+        // RT primary on both so the ONLY difference is the indirect term.
+        let off = mk("cs_main", &[("GI_ENABLE", 0.0), ("RT_PRIMARY", 1.0)]);
+        let on = mk("cs_main", &[("GI_ENABLE", 1.0), ("RT_PRIMARY", 1.0), ("GI_PROBE_MODE", 1.0)]);
+        // DIV=1: this test converges by dispatching the update repeatedly, so it
+        // must touch every probe each pass (no amortization striding).
+        let update = mk("cs_gi_probe_update", &[("GI_ENABLE", 1.0), ("RT_PRIMARY", 1.0), ("GI_PROBE_MODE", 1.0), ("GI_UPDATE_DIV", 1.0)]);
+
+        let bpr = w * 4;
+        let render = |main: &wgpu::ComputePipeline, converge: u32| -> Vec<u8> {
+            let mut enc = device.create_command_encoder(&Default::default());
+            // Converge the probes (each pass = one frame of temporal accumulation).
+            for _ in 0..converge {
+                let mut cp = enc.begin_compute_pass(&Default::default());
+                cp.set_pipeline(&update);
+                cp.set_bind_group(0, &bg, &[]);
+                cp.set_bind_group(1, &rt_bg, &[]);
+                cp.dispatch_workgroups((crate::voxel::PROBE_TOTAL + 63) / 64, 1, 1);
+            }
+            {
+                let mut cp = enc.begin_compute_pass(&Default::default());
+                cp.set_pipeline(main);
+                cp.set_bind_group(0, &bg, &[]);
+                cp.set_bind_group(1, &rt_bg, &[]);
+                cp.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
+            }
+            let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None, size: (bpr * h) as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false,
+            });
+            enc.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo { texture: &out_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::TexelCopyBufferInfo { buffer: &readback, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(h) } },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+            queue.submit(std::iter::once(enc.finish()));
+            let slice = readback.slice(..);
+            slice.map_async(wgpu::MapMode::Read, |_| {});
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            slice.get_mapped_range().unwrap().to_vec()
+        };
+
+        let a = render(&off, 0);          // GI off
+        let b = render(&on, 80);          // probe GI, converged over 80 update passes
+
+        let n = (w * h) as usize;
+        let (mut sum_a, mut sum_b, mut max_b, mut brighter) = (0.0f64, 0.0f64, 0u32, 0usize);
+        for i in 0..n {
+            let la = (a[i * 4] as u32 + a[i * 4 + 1] as u32 + a[i * 4 + 2] as u32) / 3;
+            let lb = (b[i * 4] as u32 + b[i * 4 + 1] as u32 + b[i * 4 + 2] as u32) / 3;
+            sum_a += la as f64; sum_b += lb as f64; max_b = max_b.max(lb);
+            if lb > la + 3 { brighter += 1; }
+        }
+        let (mean_a, mean_b) = (sum_a / n as f64, sum_b / n as f64);
+        let bright_frac = brighter as f64 / n as f64;
+        eprintln!("probe_gi_lights_the_scene: mean_luma off={mean_a:.2} probeGI={mean_b:.2} brighter_frac={bright_frac:.3} max_b={max_b}");
+        // Indirect only ADDS light: the GI frame must be brighter overall.
+        assert!(mean_b > mean_a + 0.5, "probe GI added no measurable light (off {mean_a:.2} vs GI {mean_b:.2})");
+        // GI must be spatially present, not a flat tiny offset on a few pixels.
+        assert!(bright_frac > 0.15, "probe GI lit too few pixels ({bright_frac:.3}); gather/sample likely broken");
+        // ...but bounded: no blow-out / NaN-to-255 everywhere, and not a 2x over-bright wash.
+        assert!(max_b <= 255, "impossible luma");
+        assert!(mean_b < mean_a * 2.2 + 20.0, "probe GI over-bright ({mean_b:.2} vs off {mean_a:.2}); SH scale wrong");
+    }
+
+    fn rt_ab_check(device: &wgpu::Device, queue: &wgpu::Queue, world: &World, cam: &Camera, label: &str, rt_consts: &[(&'static str, f64)], tol: f64) {
         let (w, h) = (320u32, 200u32);
         let wo = world.world_origin_voxel();
         let t = 30.0;
@@ -2587,7 +3949,8 @@ mod gpu_render_tests {
         let rt_bgl = create_rt_bgl(device);
         let (_gi_i, gi_iv) = create_lighting_texture(device, w, h);
         let (_gi_o, gi_ov) = create_lighting_texture(device, w, h);
-        let rt_bg = make_rt_bg(device, &rt_bgl, &accel, &gi_iv, &gi_ov);
+        let probe_buf = create_probe_buf(device);
+        let rt_bg = make_rt_bg(device, &rt_bgl, &accel, &gi_iv, &gi_ov, &probe_buf);
 
         // ---- pipelines ----
         let sw_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -2621,10 +3984,8 @@ mod gpu_render_tests {
             layout: Some(&rt_pl),
             module: &rt_module,
             entry_point: Some("cs_main"),
-            // GI off: this A/B proves the OCCLUSION path matches software; the
-            // one-bounce indirect intentionally changes the look (see the game).
             compilation_options: wgpu::PipelineCompilationOptions {
-                constants: &[("GI_ENABLE", 0.0)],
+                constants: rt_consts,
                 ..Default::default()
             },
             cache: None,
@@ -2698,7 +4059,7 @@ mod gpu_render_tests {
         // The scene must actually have shading contrast (not a flat frame), else
         // the comparison proves nothing.
         assert!(sw_luma_max as i32 - sw_luma_min as i32 > 60, "[{label}] software frame has no contrast; A/B meaningless");
-        assert!(mean_abs < 3.0, "[{label}] RT vs software frame differs too much: mean |dRGB| = {mean_abs:.3}");
+        assert!(mean_abs < tol, "[{label}] RT vs software frame differs too much: mean |dRGB| = {mean_abs:.3} (tol {tol})");
         assert!(big < n / 12, "[{label}] too many large-diff channels ({big}) between RT and software");
     }
 
@@ -3127,6 +4488,129 @@ mod gpu_render_tests {
         );
     }
 
+    /// Look toward a low sun so the god-ray shafts fill the frame; render two
+    /// animation times a frame apart to expose the "waves moving up" (the sample
+    /// banding shifting with the per-frame jitter).
+    #[test]
+    #[ignore]
+    fn dump_godrays() {
+        std::fs::create_dir_all("target/lookdev").unwrap();
+        let mut world = World::new();
+        world.fill_demo_terrain();
+        let (_wa, leaf_anchor, leaf_ground) = find_scene_anchors(&world);
+        let mut cam = Camera::new();
+        cam.pos = glam::Vec3::new(clamp_anchor(leaf_anchor.x) + 60.0, leaf_ground as f32 + 8.0, clamp_anchor(leaf_anchor.y) + 60.0);
+        // Face the sun's azimuth (sun_time 68 -> dir ~ (-0.97, +, +0.30)); yaw=atan2(x,z).
+        cam.yaw = (-0.971f32).atan2(0.30);
+        cam.pitch = 0.06;
+        for (name, at) in [("godrays_f0", 30.000f32), ("godrays_f1", 30.033f32)] {
+            let Some(rgba) = render_rgba_time_sun(&world, &cam, 960, 540, at, 68.0) else {
+                eprintln!("no GPU — skipping");
+                return;
+            };
+            let path = format!("target/lookdev/{name}.png");
+            let file = std::fs::File::create(&path).unwrap();
+            let mut enc = png::Encoder::new(std::io::BufWriter::new(file), 960, 540);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            enc.write_header().unwrap().write_image_data(&rgba).unwrap();
+            eprintln!("wrote {path}");
+        }
+    }
+
+    /// A plain daytime meadow view (high sun) to sanity-check overall brightness
+    /// after removing the sky_access ambient darkening.
+    #[test]
+    #[ignore]
+    fn dump_day_meadow() {
+        std::fs::create_dir_all("target/lookdev").unwrap();
+        let mut world = World::new();
+        world.fill_demo_terrain();
+        let (_wa, leaf_anchor, leaf_ground) = find_scene_anchors(&world);
+        // Low over open grass, a little away from the tree cell, looking across.
+        let mut cam = Camera::new();
+        cam.pos = glam::Vec3::new(clamp_anchor(leaf_anchor.x) - 40.0, leaf_ground as f32 + 4.0, clamp_anchor(leaf_anchor.y) + 30.0);
+        cam.yaw = 2.3;
+        cam.pitch = -0.12;
+        let Some(rgba) = render_rgba_at_time(&world, &cam, 960, 540, 30.0) else {
+            eprintln!("no GPU — skipping");
+            return;
+        };
+        let path = "target/lookdev/day_meadow.png".to_string();
+        let file = std::fs::File::create(&path).unwrap();
+        let mut enc = png::Encoder::new(std::io::BufWriter::new(file), 960, 540);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header().unwrap().write_image_data(&rgba).unwrap();
+        eprintln!("wrote {path}");
+    }
+
+    /// Distant water study: elevated camera looking across the water cell at a
+    /// grazing angle (the "jittery black lines on far water" report). Two frames
+    /// a tick apart expose whether the lines are static geometry (plate seams)
+    /// or temporal (per-frame jitter that TAA cannot settle).
+    #[test]
+    #[ignore]
+    fn dump_water_far() {
+        std::fs::create_dir_all("target/lookdev").unwrap();
+        let mut world = World::new();
+        world.fill_demo_terrain();
+        let (water_anchor, _la, ground) = find_scene_anchors(&world);
+        let wx = clamp_anchor(water_anchor.x);
+        let wz = clamp_anchor(water_anchor.y);
+        // Stand well back and slightly above, looking across the water so most
+        // of it sits at t ~ 80-300 (the "a bit further away" regime).
+        let mut cam = Camera::new();
+        cam.pos = glam::Vec3::new(wx - 140.0, ground as f32 + 22.0, wz - 140.0);
+        cam.yaw = (wx - cam.pos.x).atan2(wz - cam.pos.z);
+        cam.pitch = -0.10;
+        for (name, t) in [("water_far_t0", 30.00f32), ("water_far_t1", 30.05f32)] {
+            let Some(rgba) = render_rgba_at_time(&world, &cam, 960, 540, t) else {
+                eprintln!("no GPU — skipping");
+                return;
+            };
+            let path = format!("target/lookdev/{name}.png");
+            let file = std::fs::File::create(&path).unwrap();
+            let mut enc = png::Encoder::new(std::io::BufWriter::new(file), 960, 540);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            enc.write_header().unwrap().write_image_data(&rgba).unwrap();
+            eprintln!("wrote {path}");
+        }
+    }
+
+    /// Sunset sequence: a terrain overview rendered across a range of SUN
+    /// elevations (animation time frozen) so the "rings/waves of light washing
+    /// over the land" artifact at sunrise/sunset can be studied frame by frame.
+    #[test]
+    #[ignore]
+    fn dump_sunset_sequence() {
+        std::fs::create_dir_all("target/lookdev").unwrap();
+        let mut world = World::new();
+        world.fill_demo_terrain();
+        let (_wa, leaf_anchor, leaf_ground) = find_scene_anchors(&world);
+        let mut cam = Camera::new();
+        cam.pos = glam::Vec3::new(clamp_anchor(leaf_anchor.x) - 40.0, leaf_ground as f32 + 4.0, clamp_anchor(leaf_anchor.y) + 30.0);
+        cam.yaw = 2.3;
+        cam.pitch = -0.12;
+        // s.y = sin(sun_t*0.025 + 1.20); horizon (~0) at sun_t ~= 77.7. Higher sun
+        // first so there is enough light to see the bands form and sweep.
+        for st in [40.0f32, 55.0, 64.0, 70.0, 74.0, 77.0] {
+            let Some(rgba) = render_rgba_time_sun(&world, &cam, 960, 540, 30.0, st) else {
+                eprintln!("no GPU — skipping");
+                return;
+            };
+            let sy = (st * 0.025 + 1.20).sin();
+            let path = format!("target/lookdev/sunset_st{:.0}_sy{:.2}.png", st, sy);
+            let file = std::fs::File::create(&path).unwrap();
+            let mut enc = png::Encoder::new(std::io::BufWriter::new(file), 960, 540);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            enc.write_header().unwrap().write_image_data(&rgba).unwrap();
+            eprintln!("wrote {path} (sun.y={sy:.3})");
+        }
+    }
+
     /// The user's cloud-shade artifact view: high above the cloud slab,
     /// looking straight down - ground seen through/around clouds, cloud
     /// shade as semi-transparent darkening. Rendered at two times to study
@@ -3288,7 +4772,12 @@ mod gpu_render_tests {
             eprintln!("no GPU adapter — skipping cloud shadow test");
             return;
         };
-        let b = render_rgba_time_sun(&world, &cam, w as u32, h as u32, 32.0, 30.0).unwrap();
+        // Cloud drift rides the DAY clock (camera.sun_time - so freeze-time
+        // freezes clouds with the sun, and the rigid-ground guard can isolate
+        // rogue fields). Advancing both clocks together is exactly normal
+        // gameplay time; the patch-scale cloud-shade motion dominates the
+        // spatial std over the mild 3-degree sun shift.
+        let b = render_rgba_time_sun(&world, &cam, w as u32, h as u32, 32.0, 32.0).unwrap();
         let luma = |f: &[u8], x: usize, y: usize| {
             let i = (y * w + x) * 4;
             (f[i] as f32 + f[i + 1] as f32 + f[i + 2] as f32) / (3.0 * 255.0)
@@ -3925,9 +5414,11 @@ mod gpu_render_tests {
         // (unconnected surfaces showing the shadowed shelf/gap) drives it far
         // below this. The dark-pixel fraction is a looser guard - it was
         // recalibrated when shoreline foam stopped whitening calm shallow
-        // water, which legitimately darkened the connected wedge (dark 0.26
-        // -> 0.48 with the fold still intact).
-        assert!(mean > 0.45, "corner wedge too dark - surfaces not connected (mean {mean:.3})");
+        // water (dark 0.26 -> 0.48), and again when the eased fog curve
+        // (fog_amount: clear below t=60) stopped mixing bright sky into near
+        // water, legitimately darkening the connected wedge (mean 0.46 ->
+        // 0.39 with the fold still intact).
+        assert!(mean > 0.34, "corner wedge too dark - surfaces not connected (mean {mean:.3})");
         assert!(dark < 0.60, "dark notch at the diagonal corner - surfaces not connected (dark {dark:.3})");
     }
 
@@ -4246,7 +5737,8 @@ mod gpu_render_tests {
         let rt_bgl = create_rt_bgl(&device);
         let (_gi_i, gi_iv) = create_lighting_texture(&device, w, h);
         let (_gi_o, gi_ov) = create_lighting_texture(&device, w, h);
-        let rt_bg = make_rt_bg(&device, &rt_bgl, &accel, &gi_iv, &gi_ov);
+        let probe_buf = create_probe_buf(&device);
+        let rt_bg = make_rt_bg(&device, &rt_bgl, &accel, &gi_iv, &gi_ov, &probe_buf);
 
         // Pipelines: software (one group) and RT (two groups).
         let sw_m = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(raymarch_source().into()) });
@@ -4261,20 +5753,46 @@ mod gpu_render_tests {
         // RT primary trace on the RT cores (GI off, so this isolates the primary
         // traversal cost against the software beam+DDA).
         let rtp: &[(&'static str, f64)] = &[("GI_ENABLE", 0.0), ("RT_PRIMARY", 1.0)];
+        // The config the game ships: RT primary trace AND probe-cache GI.
+        let rtpg: &[(&'static str, f64)] = &[("GI_ENABLE", 1.0), ("RT_PRIMARY", 1.0), ("GI_PROBE_MODE", 1.0)];
+        // Legacy per-pixel bounce-ray GI (screen-space), kept as the reference the
+        // probe cache replaces.
+        let rtpg_old: &[(&'static str, f64)] = &[("GI_ENABLE", 1.0), ("RT_PRIMARY", 1.0), ("GI_PROBE_MODE", 0.0)];
         let (rt_main, rt_transp, rt_compose) = (mk(&rt_m, &rt_pl, "cs_main", gi_off), mk(&rt_m, &rt_pl, "cs_transparent", gi_off), mk(&rt_m, &rt_pl, "cs_compose", gi_off));
-        // RT with GI on: the one-bounce indirect cost on top.
-        let (gi_main, gi_transp, gi_compose) = (mk(&rt_m, &rt_pl, "cs_main", gi_on), mk(&rt_m, &rt_pl, "cs_transparent", gi_on), mk(&rt_m, &rt_pl, "cs_compose", gi_on));
+        // swPrim + legacy per-pixel GI reference.
+        let gi_on_old: &[(&'static str, f64)] = &[("GI_ENABLE", 1.0), ("GI_PROBE_MODE", 0.0)];
+        let (gi_main, gi_transp, gi_compose) = (mk(&rt_m, &rt_pl, "cs_main", gi_on_old), mk(&rt_m, &rt_pl, "cs_transparent", gi_on_old), mk(&rt_m, &rt_pl, "cs_compose", gi_on_old));
+        let _ = gi_on;
         let (rtp_main, rtp_transp, rtp_compose) = (mk(&rt_m, &rt_pl, "cs_main", rtp), mk(&rt_m, &rt_pl, "cs_transparent", rtp), mk(&rt_m, &rt_pl, "cs_compose", rtp));
+        // NEW probe-cache GI (the shipped path) + its amortized update pass.
+        let (rtpg_main, rtpg_transp, rtpg_compose) = (mk(&rt_m, &rt_pl, "cs_main", rtpg), mk(&rt_m, &rt_pl, "cs_transparent", rtpg), mk(&rt_m, &rt_pl, "cs_compose", rtpg));
+        let prg_update = mk(&rt_m, &rt_pl, "cs_gi_probe_update", rtpg);
+        // Legacy per-pixel RT-primary+GI (for the shade-cost reference line).
+        let (rtpg_old_main, rtpg_old_transp, rtpg_old_compose) = (mk(&rt_m, &rt_pl, "cs_main", rtpg_old), mk(&rt_m, &rt_pl, "cs_transparent", rtpg_old), mk(&rt_m, &rt_pl, "cs_compose", rtpg_old));
+        // Primary-trace-ONLY (PROFILE_FLAT: skip all shading) to isolate traversal
+        // cost - software hierarchical DDA vs RT-cores full-resolve primary.
+        let sw_flat: &[(&'static str, f64)] = &[("PROFILE_FLAT_F", 1.0)];
+        let rt_flat: &[(&'static str, f64)] = &[("PROFILE_FLAT_F", 1.0), ("RT_PRIMARY", 1.0), ("GI_ENABLE", 0.0)];
+        let sw_flat_main = mk(&sw_m, &sw_pl, "cs_main", sw_flat);
+        let rtp_flat_main = mk(&rt_m, &rt_pl, "cs_main", rt_flat);
 
         // Foliage-heavy and terrain-overview cameras (occlusion cost differs a
         // lot: dense canopy AO/shadow rays vs open terrain).
-        let (_wa, leaf_anchor, leaf_ground) = find_scene_anchors(&world);
+        let (water_anchor, leaf_anchor, leaf_ground) = find_scene_anchors(&world);
         let scenarios = [
             ("terrain", ab_camera(&world)),
             ("foliage", {
                 let mut c = Camera::new();
                 c.pos = glam::Vec3::new(clamp_anchor(leaf_anchor.x), leaf_ground as f32 + 14.0, clamp_anchor(leaf_anchor.y) - 30.0);
                 c.pitch = -0.35; c
+            }),
+            // Grazing close-up over water: the transp-pass worst case (screen
+            // full of water pixels, reflections skimming the surface). This is
+            // the scenario every water optimization must prove itself on.
+            ("water-close", {
+                let mut c = Camera::new();
+                c.pos = glam::Vec3::new(clamp_anchor(water_anchor.x), 71.0, clamp_anchor(water_anchor.y) - 8.0);
+                c.pitch = -0.22; c
             }),
         ];
 
@@ -4301,14 +5819,225 @@ mod gpu_render_tests {
                 device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
                 t0.elapsed().as_secs_f64() * 1000.0 / n as f64
             };
+            // Frame with the amortized probe-update pass prepended (the shipped
+            // GI path: update probes, then main/transp/compose sample them).
+            let run_probe = |update: &wgpu::ComputePipeline, main: &wgpu::ComputePipeline, transp: &wgpu::ComputePipeline, compose: &wgpu::ComputePipeline| -> f64 {
+                let encode = || {
+                    let mut e = device.create_command_encoder(&Default::default());
+                    {
+                        let mut cp = e.begin_compute_pass(&Default::default());
+                        cp.set_pipeline(update);
+                        cp.set_bind_group(0, &bg, &[]);
+                        cp.set_bind_group(1, &rt_bg, &[]);
+                        let threads = crate::voxel::PROBE_TOTAL / GI_PROBE_UPDATE_DIV;
+                        cp.dispatch_workgroups((threads + 63) / 64, 1, 1);
+                    }
+                    for (pipe, bind) in [(main, &bg), (transp, &bg), (compose, &bg_compose)] {
+                        let mut cp = e.begin_compute_pass(&Default::default());
+                        cp.set_pipeline(pipe);
+                        cp.set_bind_group(0, bind, &[]);
+                        cp.set_bind_group(1, &rt_bg, &[]);
+                        cp.dispatch_workgroups(tw, th, 1);
+                    }
+                    e.finish()
+                };
+                for _ in 0..5 { queue.submit(std::iter::once(encode())); }
+                device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+                let n = 60;
+                let t0 = std::time::Instant::now();
+                for _ in 0..n { queue.submit(std::iter::once(encode())); }
+                device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+                t0.elapsed().as_secs_f64() * 1000.0 / n as f64
+            };
             let sw_ms = run(&sw_main, &sw_transp, &sw_compose, false);
             let rt_ms = run(&rt_main, &rt_transp, &rt_compose, true);
             let gi_ms = run(&gi_main, &gi_transp, &gi_compose, true);
             let rtp_ms = run(&rtp_main, &rtp_transp, &rtp_compose, true);
+            let rtpg_old_ms = run(&rtpg_old_main, &rtpg_old_transp, &rtpg_old_compose, true);
+            let rtpg_ms = run_probe(&prg_update, &rtpg_main, &rtpg_transp, &rtpg_compose);
+            // STATIC-camera variant (taa_blend > 0): the temporal reflection
+            // accumulation only engages here - the whale's worst case is a
+            // still camera staring at water.
+            let cu_static = CameraUniform::from_camera(cam, w, h, 0.0, 0.0, wo, [0.0, 0.0], 0.9);
+            queue.write_buffer(&camera_buf, 0, bytemuck::bytes_of(&cu_static));
+            let rtpg_static_ms = run_probe(&prg_update, &rtpg_main, &rtpg_transp, &rtpg_compose);
+            eprintln!("  static-cam [{name}]: RT-prim+PROBE-GI {rtpg_static_ms:.2} ms");
+            queue.write_buffer(&camera_buf, 0, bytemuck::bytes_of(&cu));
             eprintln!(
-                "rt_vs_software_timing [{name}] {w}x{h}: software {sw_ms:.2} ms  |  RT-occl {rt_ms:.2} ms ({:.2}x)  |  RT-primary {rtp_ms:.2} ms ({:.2}x sw)  |  RT+GI {gi_ms:.2} ms ({:.2}x sw)",
-                sw_ms / rt_ms, sw_ms / rtp_ms, sw_ms / gi_ms
+                "rt_vs_software_timing [{name}] {w}x{h}: software {sw_ms:.2} ms  |  RT-occl {rt_ms:.2} ms ({:.2}x)  |  RT-primary {rtp_ms:.2} ms ({:.2}x sw)  |  swPrim+perpixelGI {gi_ms:.2} ms ({:.2}x sw)  |  RT-prim+perpixelGI {rtpg_old_ms:.2} ms ({:.2}x sw)  |  RT-prim+PROBE-GI {rtpg_ms:.2} ms ({:.2}x sw)",
+                sw_ms / rt_ms, sw_ms / rtp_ms, sw_ms / gi_ms, sw_ms / rtpg_old_ms, sw_ms / rtpg_ms
             );
+
+            // Per-pass breakdown: which dispatch actually costs the frame time.
+            // main = primary trace + shade (shadows/AO/GI/secondary rays),
+            // transp = deferred water/glass shading, compose = clouds/fog/final.
+            let run1 = |pipe: &wgpu::ComputePipeline, bind: &wgpu::BindGroup, rt: bool| -> f64 {
+                let encode = || {
+                    let mut e = device.create_command_encoder(&Default::default());
+                    let mut cp = e.begin_compute_pass(&Default::default());
+                    cp.set_pipeline(pipe);
+                    cp.set_bind_group(0, bind, &[]);
+                    if rt { cp.set_bind_group(1, &rt_bg, &[]); }
+                    cp.dispatch_workgroups(tw, th, 1);
+                    drop(cp);
+                    e.finish()
+                };
+                for _ in 0..5 { queue.submit(std::iter::once(encode())); }
+                device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+                let n = 60;
+                let t0 = std::time::Instant::now();
+                for _ in 0..n { queue.submit(std::iter::once(encode())); }
+                device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+                t0.elapsed().as_secs_f64() * 1000.0 / n as f64
+            };
+            eprintln!(
+                "  per-pass [{name}] SW: main {:.2}  transp {:.2}  compose {:.2}  ||  RT-prim+GI: main {:.2}  transp {:.2}  compose {:.2}",
+                run1(&sw_main, &bg, false), run1(&sw_transp, &bg, false), run1(&sw_compose, &bg_compose, false),
+                run1(&rtpg_main, &bg, true), run1(&rtpg_transp, &bg, true), run1(&rtpg_compose, &bg_compose, true),
+            );
+            eprintln!(
+                "  primary-trace-only [{name}]: SW cs_main {:.2}  ||  RT-primary cs_main {:.2}  (=> SW shade {:.2}, RT-prim+GI shade {:.2})",
+                run1(&sw_flat_main, &bg, false), run1(&rtp_flat_main, &bg, true),
+                run1(&sw_main, &bg, false) - run1(&sw_flat_main, &bg, false),
+                run1(&rtpg_main, &bg, true) - run1(&rtp_flat_main, &bg, true),
+            );
+        }
+    }
+
+    /// Attribute the transparent-pass milliseconds on the water-close whale:
+    /// times cs_transparent alone (shipped RT-primary + probe-GI config) with
+    /// each PROF_TRANSP_* component toggled off and differences the runs into
+    /// reflection-trace / reflection-shade / refraction-trace /
+    /// refraction-shade / tail, for both a moving and a static camera.
+    #[test]
+    #[ignore]
+    fn transp_cost_split() {
+        let Some((device, queue, _gpu)) = rt_headless_device() else {
+            eprintln!("transp_cost_split: no RT adapter, skipping");
+            return;
+        };
+        let (w, h) = (1920u32, 1080u32);
+        let mut world = World::new();
+        world.fill_demo_terrain();
+        let wo = world.world_origin_voxel();
+        let cam0 = ab_camera(&world);
+        let cu0 = CameraUniform::from_camera(&cam0, w, h, 0.0, 0.0, wo, [0.0, 0.0], 0.0);
+        let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None, contents: bytemuck::bytes_of(&cu0),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let bricks_buf = storage(&device, "b", bytemuck::cast_slice(&world.bricks));
+        let tm = storage(&device, "tm", bytemuck::cast_slice(&world.tile_mask));
+        let cm = storage(&device, "cm", bytemuck::cast_slice(&world.chunk_mask));
+        let l4 = storage(&device, "l4", bytemuck::cast_slice(&world.l4_mask));
+        let bu = storage(&device, "bu", bytemuck::cast_slice(&pack_u8_to_u32(&world.brick_uniform)));
+        let tu = storage(&device, "tu", bytemuck::cast_slice(&pack_u8_to_u32(&world.tile_uniform)));
+        let palette = default_palette();
+        let palette_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None, contents: bytemuck::cast_slice(&palette),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let tw = (w + 7) / 8; let th = (h + 7) / 8;
+        let words = ((tw * th) as usize + 31) / 32;
+        let td = storage(&device, "td", bytemuck::cast_slice(&vec![u32::MAX; words]));
+        let players = storage(&device, "pl", &vec![0u8; 16 + MAX_REMOTE_PLAYERS * 16]);
+        let (_o, _ov) = create_output_texture(&device, w, h);
+        let (_b, bv) = create_beam_texture(&device, w, h);
+        let (_c, csv, _csw) = create_cloud_texture(&device, w, h);
+        let csamp = device.create_sampler(&wgpu::SamplerDescriptor { mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
+        let (_li, liv) = create_lighting_texture(&device, w, h);
+        let (_lo, lov) = create_lighting_texture(&device, w, h);
+        let tpb = create_transp_buf(&device, w, h);
+        let spr = storage(&device, "spr", bytemuck::cast_slice(&crate::sprites::encoded()));
+        let (_d, dv) = create_depth_texture(&device, w, h);
+        let (_g, gv) = create_output_texture(&device, w, h);
+        let (_hh, hv) = create_output_texture(&device, w, h);
+        let bgl = create_compute_bgl(&device);
+        let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &gv, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &dv, &hv, &bv);
+        let accel = crate::accel::build_world_accel(&device, &queue, &world);
+        let rt_bgl = create_rt_bgl(&device);
+        let (_gi_i, gi_iv) = create_lighting_texture(&device, w, h);
+        let (_gi_o, gi_ov) = create_lighting_texture(&device, w, h);
+        let probe_buf = create_probe_buf(&device);
+        let rt_bg = make_rt_bg(&device, &rt_bgl, &accel, &gi_iv, &gi_ov, &probe_buf);
+        let rt_m = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(raymarch_source_variant(true).into()) });
+        let rt_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&bgl), Some(&rt_bgl)], immediate_size: 0 });
+        let base: &[(&'static str, f64)] = &[("GI_ENABLE", 1.0), ("RT_PRIMARY", 1.0), ("GI_PROBE_MODE", 1.0)];
+        let mk_t = |extra: &[(&'static str, f64)]| {
+            let consts: Vec<(&'static str, f64)> = base.iter().chain(extra.iter()).cloned().collect();
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: None, layout: Some(&rt_pl), module: &rt_m, entry_point: Some("cs_transparent"),
+                compilation_options: wgpu::PipelineCompilationOptions { constants: &consts, ..Default::default() },
+                cache: None,
+            })
+        };
+        // cs_main runs once per camera state so transp has records to shade.
+        let main_pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None, layout: Some(&rt_pl), module: &rt_m, entry_point: Some("cs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions { constants: base, ..Default::default() },
+            cache: None,
+        });
+        let variants: [(&str, &[(&'static str, f64)]); 6] = [
+            ("full", &[]),
+            ("no_refl", &[("PROF_TRANSP_NO_REFL", 1.0)]),
+            ("no_refr", &[("PROF_TRANSP_NO_REFR", 1.0)]),
+            ("min", &[("PROF_TRANSP_NO_REFL", 1.0), ("PROF_TRANSP_NO_REFR", 1.0)]),
+            ("refl_flat", &[("PROF_TRANSP_REFL_FLATSHADE", 1.0)]),
+            ("refr_flat", &[("PROF_TRANSP_REFR_FLATSHADE", 1.0)]),
+        ];
+        let pipes: Vec<(&str, wgpu::ComputePipeline)> =
+            variants.iter().map(|(n, e)| (*n, mk_t(e))).collect();
+
+        let (water_anchor, _, _) = find_scene_anchors(&world);
+        let mut cam = Camera::new();
+        cam.pos = glam::Vec3::new(clamp_anchor(water_anchor.x), 71.0, clamp_anchor(water_anchor.y) - 8.0);
+        cam.pitch = -0.22;
+
+        let time1 = |pipe: &wgpu::ComputePipeline| -> f64 {
+            let encode = || {
+                let mut e = device.create_command_encoder(&Default::default());
+                let mut cp = e.begin_compute_pass(&Default::default());
+                cp.set_pipeline(pipe);
+                cp.set_bind_group(0, &bg, &[]);
+                cp.set_bind_group(1, &rt_bg, &[]);
+                cp.dispatch_workgroups(tw, th, 1);
+                drop(cp);
+                e.finish()
+            };
+            for _ in 0..5 { queue.submit(std::iter::once(encode())); }
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            let n = 60;
+            let t0 = std::time::Instant::now();
+            for _ in 0..n { queue.submit(std::iter::once(encode())); }
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            t0.elapsed().as_secs_f64() * 1000.0 / n as f64
+        };
+        for (state, taa) in [("moving", 0.0f32), ("static", 0.9f32)] {
+            let cu = CameraUniform::from_camera(&cam, w, h, 0.0, 0.0, wo, [0.0, 0.0], taa);
+            queue.write_buffer(&camera_buf, 0, bytemuck::bytes_of(&cu));
+            // Populate the transp records + reflection history for this state.
+            {
+                let mut e = device.create_command_encoder(&Default::default());
+                let mut cp = e.begin_compute_pass(&Default::default());
+                cp.set_pipeline(&main_pipe);
+                cp.set_bind_group(0, &bg, &[]);
+                cp.set_bind_group(1, &rt_bg, &[]);
+                cp.dispatch_workgroups(tw, th, 1);
+                drop(cp);
+                queue.submit(std::iter::once(e.finish()));
+                device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            }
+            let ms: Vec<(&str, f64)> = pipes.iter().map(|(n, p)| (*n, time1(p))).collect();
+            let get = |n: &str| ms.iter().find(|(k, _)| *k == n).unwrap().1;
+            let (full, no_refl, no_refr, min, refl_flat, refr_flat) =
+                (get("full"), get("no_refl"), get("no_refr"), get("min"), get("refl_flat"), get("refr_flat"));
+            let refl_total = full - no_refl;
+            let refr_total = full - no_refr;
+            let refl_shade = full - refl_flat;
+            let refr_shade = full - refr_flat;
+            eprintln!("transp_cost_split [water-close {state}] {w}x{h}: full {full:.2} ms");
+            eprintln!("  refl total {refl_total:.2} (trace {:.2} + shade {refl_shade:.2})  |  refr total {refr_total:.2} (trace {:.2} + shade {refr_shade:.2})  |  tail {min:.2}",
+                refl_total - refl_shade, refr_total - refr_shade);
         }
     }
 

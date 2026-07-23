@@ -1,10 +1,12 @@
 // Hardware ray-tracing acceleration structure built from the voxel world.
 //
-// Coarse-to-fine: one AABB per NON-EMPTY brick goes into a bottom-level
-// acceleration structure (BLAS); the GPU's RT cores traverse that BVH to skip
-// empty space at hardware speed, and a tiny per-brick DDA (in the ray-query
-// shader) resolves the exact voxel inside a candidate brick. This is the voxel
-// mechanism proven in the rt-spike, now driven by real world data.
+// Coarse-to-fine: one AABB per NON-EMPTY TILE (16^3 voxels) goes into a
+// bottom-level acceleration structure (BLAS); the RT cores traverse that BVH to
+// skip empty space at hardware speed, a brick-grid DDA refines the candidate
+// tile to its present bricks (gated by the tile_mask bit - the streaming-
+// correct presence test), and the shared per-brick DDA resolves the exact
+// voxel. Tile granularity keeps the BVH at <=16384 primitives, so a streaming
+// rebuild is sub-millisecond and runs every time the world changes.
 //
 // AABBs are in WINDOW-LOCAL voxel space: local = world_voxel - world_origin, a
 // CONTIGUOUS [0, WORLD_VOXELS) box, which is the single linear space the BVH
@@ -12,20 +14,13 @@
 // (`o_local = origin - world_origin`) exactly as the software DDA marches world
 // coords and folds them to the window.
 //
-// The voxel STORAGE, however, is toroidal: world brick (wob + local) lives in
-// storage slot (wob + local) mod WORLD_BRICKS (see world_to_slot_voxel in the
-// shader). So the AABB is placed at the local position while its occupancy is
-// read from the wrapped slot, and `brick_map[primitive_index]` holds that
-// STORAGE brick index for the in-shader occupancy/material lookup (primitive
-// index is NOT the brick index - empty bricks are skipped). world_origin is
-// always brick-aligned (chunk streaming shifts by 32 voxels, y is never
-// streamed), so window-local and storage share within-brick voxel offsets.
+// The voxel STORAGE, however, is toroidal: the AABB sits at the window-local
+// tile position while `brick_map[primitive_index]` holds the STORAGE tile
+// index; the in-shader `rt_tile_brick` maps (tile, brick offset) to the storage
+// brick for occupancy/material reads. world_origin is always tile-aligned
+// (chunk streaming shifts by 32 voxels, y never streams).
 
-use wgpu::util::DeviceExt;
-
-use crate::voxel::{
-    brick_idx, World, BRICK_DIM, WORLD_BRICKS_X, WORLD_BRICKS_Y, WORLD_BRICKS_Z,
-};
+use crate::voxel::{World, WORLD_TILES_X, WORLD_TILES_Y, WORLD_TILES_Z};
 
 /// One packed AABB primitive: min then max (two `vec3<f32>`), padded to 32 bytes
 /// (stride must be a multiple of 8 and at least 24; 32 keeps it 16-byte aligned
@@ -39,19 +34,43 @@ pub struct GpuAabb {
 }
 
 /// The world's acceleration structure plus the primitive->brick map.
+///
+/// Buffers and the BLAS are allocated once at `capacity` primitives and REUSED
+/// across streaming rebuilds (`rebuild_world_accel`): the CPU re-enumerates the
+/// non-empty bricks (mask-driven, sub-ms), DMAs only the changed prefix, and the
+/// GPU re-builds the BVH in place. No per-rebuild allocation, and the render
+/// bind group stays valid unless the capacity has to grow.
 pub struct WorldAccel {
     pub blas: wgpu::Blas,
     pub tlas: wgpu::Tlas,
-    /// primitive_index -> STORAGE brick index (u32), one entry per non-empty
-    /// brick. Storage is toroidal, so this is the wrapped slot the shader reads
-    /// occupancy/material from, NOT the window-local position (that comes from
-    /// the AABB min in `aabb_buf`).
+    /// primitive_index -> STORAGE tile index (u32), one entry per non-empty
+    /// tile. The shader decodes brick/voxel storage coords from it; the
+    /// window-local position comes from the AABB min in `aabb_buf`.
     pub brick_map: wgpu::Buffer,
     /// The packed AABBs, kept so the ray-query shader can read a candidate
     /// brick's window-local min directly (no brick-index decode needed).
     pub aabb_buf: wgpu::Buffer,
     pub aabb_count: u32,
+    /// Primitive capacity the buffers + BLAS were created for. The BLAS is always
+    /// BUILT with `capacity` primitives; entries beyond `aabb_count` are
+    /// degenerate far-away boxes no ray can hit, so the build size never has to
+    /// re-negotiate with the created size.
+    pub capacity: u32,
+    /// How many entries of `aabb_buf` currently hold REAL (non-degenerate) data;
+    /// a shrink only needs to overwrite `[count, high_water)` with degenerates.
+    high_water: u32,
+    // CPU-side scratch reused across rebuilds (no per-rebuild allocation).
+    aabb_scratch: Vec<GpuAabb>,
+    map_scratch: Vec<u32>,
 }
+
+/// A degenerate AABB far outside any reachable ray range; pads the BLAS build
+/// range beyond the live primitive count.
+const DEGENERATE_AABB: GpuAabb = GpuAabb {
+    min: [-1.0e9, -1.0e9, -1.0e9],
+    max: [-1.0e9 + 1.0, -1.0e9 + 1.0, -1.0e9 + 1.0],
+    _pad: [0.0, 0.0],
+};
 
 /// True if the adapter can do the hardware ray-tracing we need.
 pub fn adapter_supports_rt(adapter: &wgpu::Adapter) -> bool {
@@ -60,78 +79,152 @@ pub fn adapter_supports_rt(adapter: &wgpu::Adapter) -> bool {
         .contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY)
 }
 
-/// Enumerate non-empty bricks into AABBs + the primitive->brick map, then build
-/// the BLAS and a single-instance TLAS. The device MUST have been created with
-/// `EXPERIMENTAL_RAY_QUERY` + `ExperimentalFeatures::enabled()` and the
-/// acceleration-structure limits raised (they default to 0; the renderer passes
-/// `adapter.limits()` for the RT device, see `Renderer::new`).
-pub fn build_world_accel(device: &wgpu::Device, queue: &wgpu::Queue, world: &World) -> WorldAccel {
-    // World-origin in brick units. Chunk streaming shifts x/z by whole storage
-    // chunks (32 voxels = 8 bricks) and never shifts y, so this is exact.
-    let wo = world.world_origin_voxel();
-    let (wob_x, wob_z) = (wo.x / BRICK_DIM as i32, wo.z / BRICK_DIM as i32);
-    let (nbx, nby, nbz) = (
-        WORLD_BRICKS_X as i32,
-        WORLD_BRICKS_Y as i32,
-        WORLD_BRICKS_Z as i32,
-    );
-
-    let mut aabbs: Vec<GpuAabb> = Vec::new();
-    let mut brick_map: Vec<u32> = Vec::new();
-    // Enumerate WINDOW-LOCAL bricks; read occupancy from the wrapped storage
-    // slot. AABB sits at the local position (contiguous BVH space); brick_map
-    // records the storage index for the in-shader occupancy/material read.
-    for lbz in 0..nbz {
-        let sbz = (wob_z + lbz).rem_euclid(nbz) as u32;
-        for lby in 0..nby {
-            let sby = lby as u32; // y is never streamed
-            for lbx in 0..nbx {
-                let sbx = (wob_x + lbx).rem_euclid(nbx) as u32;
-                let bi = brick_idx(sbx, sby, sbz);
-                if world.bricks[bi as usize].occupancy != 0 {
-                    let mn = [
-                        (lbx * BRICK_DIM as i32) as f32,
-                        (lby * BRICK_DIM as i32) as f32,
-                        (lbz * BRICK_DIM as i32) as f32,
-                    ];
-                    let e = BRICK_DIM as f32;
-                    aabbs.push(GpuAabb {
-                        min: mn,
-                        max: [mn[0] + e, mn[1] + e, mn[2] + e],
-                        _pad: [0.0, 0.0],
-                    });
-                    brick_map.push(bi);
-                }
-            }
+/// Enumerate the non-empty BRICKS into AABBs + the primitive->brick map,
+/// MASK-DRIVEN from the tile occupancy words alone (no voxel reads): one AABB
+/// per set brick bit. Per-brick primitives keep the hardware BVH doing the
+/// whole empty-space hierarchy - benchmarked ~1.3-1.4x over software, where a
+/// tile-level BVH (in-shader brick marching) measured ~1.0x. The streaming
+/// cost of the bigger build is paid OFF the frame thread (see the async
+/// rebuild worker in renderer.rs); `tile_mask` arrives as a snapshot so this
+/// can run on any thread. AABBs sit at WINDOW-LOCAL positions; `map` records
+/// STORAGE brick indices.
+pub(crate) fn enumerate_non_empty(
+    tile_mask: &[u64],
+    world_origin: glam::IVec3,
+    aabbs: &mut Vec<GpuAabb>,
+    map: &mut Vec<u32>,
+) {
+    aabbs.clear();
+    map.clear();
+    let (wob_x, wob_z) = (world_origin.x / 4, world_origin.z / 4);
+    let (nbx, nbz) = ((WORLD_TILES_X * 4) as i32, (WORLD_TILES_Z * 4) as i32);
+    let (tx_n, ty_n) = (WORLD_TILES_X as usize, WORLD_TILES_Y as usize);
+    let e = 4.0f32;
+    for (ti, &mask) in tile_mask.iter().enumerate() {
+        if mask == 0 {
+            continue;
+        }
+        let tx = (ti % tx_n) as i32;
+        let ty = ((ti / tx_n) % ty_n) as i32;
+        let tz = (ti / (tx_n * ty_n)) as i32;
+        let mut m = mask;
+        while m != 0 {
+            let b = m.trailing_zeros() as i32;
+            m &= m - 1;
+            // brick_bit_in_tile(lx, ly, lz) = lx + lz*4 + ly*16
+            let (lx, ly, lz) = (b & 3, (b >> 4) & 3, (b >> 2) & 3);
+            let (sbx, sby, sbz) = (tx * 4 + lx, ty * 4 + ly, tz * 4 + lz);
+            let lbx = (sbx - wob_x).rem_euclid(nbx);
+            let lbz = (sbz - wob_z).rem_euclid(nbz);
+            let mn = [(lbx * 4) as f32, (sby * 4) as f32, (lbz * 4) as f32];
+            aabbs.push(GpuAabb {
+                min: mn,
+                max: [mn[0] + e, mn[1] + e, mn[2] + e],
+                _pad: [0.0, 0.0],
+            });
+            map.push((sbx + sby * nbx + sbz * nbx * (WORLD_TILES_Y as i32 * 4)) as u32);
         }
     }
-    // An empty world still needs a valid (>=1 primitive) BLAS; a degenerate
-    // AABB far outside the window is never hit.
-    if aabbs.is_empty() {
-        aabbs.push(GpuAabb {
-            min: [-1.0e9, -1.0e9, -1.0e9],
-            max: [-1.0e9 + 1.0, -1.0e9 + 1.0, -1.0e9 + 1.0],
-            _pad: [0.0, 0.0],
-        });
-        brick_map.push(0);
-    }
-    let count = aabbs.len() as u32;
+}
 
-    let aabb_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("world aabb primitives"),
-        contents: bytemuck::cast_slice(&aabbs),
-        usage: wgpu::BufferUsages::BLAS_INPUT | wgpu::BufferUsages::STORAGE,
-    });
-    let brick_map_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("aabb primitive -> brick map"),
-        contents: bytemuck::cast_slice(&brick_map),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-
+/// Record the BLAS + TLAS build commands. The BLAS is always built with
+/// `capacity` primitives (the size it was created with) - the live prefix holds
+/// the real bricks, the tail degenerate far-away boxes - so the build size never
+/// has to re-negotiate with the created size.
+fn encode_accel_build(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    blas: &wgpu::Blas,
+    tlas: &wgpu::Tlas,
+    aabb_buf: &wgpu::Buffer,
+    capacity: u32,
+) {
     let size_desc = wgpu::BlasAABBGeometrySizeDescriptor {
-        primitive_count: count,
+        primitive_count: capacity,
         flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
     };
+    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("build world accel"),
+    });
+    enc.build_acceleration_structures(
+        std::iter::once(&wgpu::BlasBuildEntry {
+            blas,
+            geometry: wgpu::BlasGeometries::AabbGeometries(vec![wgpu::BlasAabbGeometry {
+                size: &size_desc,
+                stride: std::mem::size_of::<GpuAabb>() as wgpu::BufferAddress,
+                aabb_buffer: aabb_buf,
+                primitive_offset: 0,
+            }]),
+        }),
+        std::iter::once(tlas),
+    );
+    queue.submit(Some(enc.finish()));
+}
+
+/// DMA the enumerated primitives into the persistent buffers (degenerate-padding
+/// any shrink delta so the fixed-size BLAS build never sees stale reals), then
+/// re-build the BLAS + TLAS on the GPU. Shared by creation and every streaming
+/// rebuild - ONE upload path. Takes ownership of the vecs and parks them back in
+/// the accel as scratch for the next rebuild.
+fn upload_and_build(
+    accel: &mut WorldAccel,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    mut aabbs: Vec<GpuAabb>,
+    map: Vec<u32>,
+) {
+    let count = aabbs.len() as u32;
+    debug_assert!(count <= accel.capacity);
+    let t0 = std::time::Instant::now();
+    let write_len = count.max(accel.high_water) as usize;
+    aabbs.resize(write_len, DEGENERATE_AABB);
+    if write_len > 0 {
+        queue.write_buffer(&accel.aabb_buf, 0, bytemuck::cast_slice(&aabbs[..write_len]));
+    }
+    if count > 0 {
+        queue.write_buffer(&accel.brick_map, 0, bytemuck::cast_slice(&map[..count as usize]));
+    }
+    let t_write = t0.elapsed();
+    encode_accel_build(device, queue, &accel.blas, &accel.tlas, &accel.aabb_buf, accel.capacity);
+    let t_encode = t0.elapsed() - t_write;
+    if (t_write + t_encode).as_secs_f64() > 0.002 {
+        log::info!(
+            "  upload_and_build: write {:.2} ms ({} entries), encode+submit {:.2} ms",
+            t_write.as_secs_f64() * 1000.0,
+            write_len,
+            t_encode.as_secs_f64() * 1000.0
+        );
+    }
+    accel.aabb_count = count;
+    accel.high_water = count;
+    accel.aabb_scratch = aabbs;
+    accel.map_scratch = map;
+}
+
+/// Create the capacity-sized GPU objects and build them from `aabbs`/`map`
+/// (whose length is the live count; the tail up to `capacity` is degenerate).
+fn create_accel_at_capacity(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    aabbs: Vec<GpuAabb>,
+    map: Vec<u32>,
+    capacity: u32,
+) -> WorldAccel {
+    let aabb_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("world aabb primitives"),
+        size: capacity as u64 * std::mem::size_of::<GpuAabb>() as u64,
+        usage: wgpu::BufferUsages::BLAS_INPUT
+            | wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let brick_map_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("aabb primitive -> brick map"),
+        size: capacity as u64 * 4,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
     let blas = device.create_blas(
         &wgpu::CreateBlasDescriptor {
             label: Some("world blas"),
@@ -139,7 +232,10 @@ pub fn build_world_accel(device: &wgpu::Device, queue: &wgpu::Queue, world: &Wor
             update_mode: wgpu::AccelerationStructureUpdateMode::Build,
         },
         wgpu::BlasGeometrySizeDescriptors::AABBs {
-            descriptors: vec![size_desc.clone()],
+            descriptors: vec![wgpu::BlasAABBGeometrySizeDescriptor {
+                primitive_count: capacity,
+                flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
+            }],
         },
     );
     let mut tlas = device.create_tlas(&wgpu::CreateTlasDescriptor {
@@ -157,30 +253,79 @@ pub fn build_world_accel(device: &wgpu::Device, queue: &wgpu::Queue, world: &Wor
     ];
     tlas[0] = Some(wgpu::TlasInstance::new(&blas, identity, 0, 0xff));
 
-    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("build world accel"),
-    });
-    enc.build_acceleration_structures(
-        std::iter::once(&wgpu::BlasBuildEntry {
-            blas: &blas,
-            geometry: wgpu::BlasGeometries::AabbGeometries(vec![wgpu::BlasAabbGeometry {
-                size: &size_desc,
-                stride: std::mem::size_of::<GpuAabb>() as wgpu::BufferAddress,
-                aabb_buffer: &aabb_buf,
-                primitive_offset: 0,
-            }]),
-        }),
-        std::iter::once(&tlas),
-    );
-    queue.submit(Some(enc.finish()));
-
-    WorldAccel {
+    // high_water = capacity: the freshly-created buffer is unwritten, so the
+    // first upload must cover the whole range (reals + degenerate tail).
+    let mut accel = WorldAccel {
         blas,
         tlas,
         brick_map: brick_map_buf,
         aabb_buf,
-        aabb_count: count,
+        aabb_count: 0,
+        capacity,
+        high_water: capacity,
+        aabb_scratch: Vec::new(),
+        map_scratch: Vec::new(),
+    };
+    upload_and_build(&mut accel, device, queue, aabbs, map);
+    accel
+}
+
+/// Capacity policy: half again over the live count so ordinary streaming churn
+/// never grows, rounded up to a 4096 block, floored so small test worlds still
+/// get room to edit into.
+fn capacity_for(count: u32) -> u32 {
+    let want = count + count / 2;
+    want.max(16_384).div_ceil(4096) * 4096
+}
+
+/// Build the world acceleration structure. The device MUST have been created
+/// with `EXPERIMENTAL_RAY_QUERY` + `ExperimentalFeatures::enabled()` and the
+/// acceleration-structure limits raised (they default to 0; the renderer passes
+/// `adapter.limits()` for the RT device, see `Renderer::new`).
+pub fn build_world_accel(device: &wgpu::Device, queue: &wgpu::Queue, world: &World) -> WorldAccel {
+    let mut aabbs = Vec::new();
+    let mut map = Vec::new();
+    enumerate_non_empty(&world.tile_mask, world.world_origin_voxel(), &mut aabbs, &mut map);
+    let capacity = capacity_for(aabbs.len() as u32);
+    create_accel_at_capacity(device, queue, aabbs, map, capacity)
+}
+
+/// Streaming rebuild, IN PLACE: re-enumerate (mask-driven, sub-ms), DMA the
+/// changed prefix (plus degenerates over any shrink delta), and re-build the
+/// BLAS + TLAS on the GPU. No allocation, and the buffers - and therefore the
+/// render bind group - survive. Returns `true` if the capacity had to grow
+/// (buffers recreated: the caller must remake its bind group).
+pub fn rebuild_world_accel(
+    accel: &mut WorldAccel,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    tile_mask: &[u64],
+    world_origin: glam::IVec3,
+) -> bool {
+    let t0 = std::time::Instant::now();
+    let mut aabbs = std::mem::take(&mut accel.aabb_scratch);
+    let mut map = std::mem::take(&mut accel.map_scratch);
+    enumerate_non_empty(tile_mask, world_origin, &mut aabbs, &mut map);
+    let t_enum = t0.elapsed();
+    let count = aabbs.len() as u32;
+
+    if count > accel.capacity {
+        let capacity = capacity_for(count);
+        *accel = create_accel_at_capacity(device, queue, aabbs, map, capacity);
+        return true;
     }
+
+    upload_and_build(accel, device, queue, aabbs, map);
+    let total = t0.elapsed();
+    if total.as_secs_f64() > 0.002 {
+        log::info!(
+            "accel rebuild breakdown: enumerate {:.2} ms ({} prims), upload+build {:.2} ms",
+            t_enum.as_secs_f64() * 1000.0,
+            count,
+            (total - t_enum).as_secs_f64() * 1000.0
+        );
+    }
+    false
 }
 
 #[cfg(test)]
@@ -266,7 +411,16 @@ mod tests {
     /// space (== world space for an unshifted world).
     fn probe(device: &wgpu::Device, queue: &wgpu::Queue, world: &World, rays: &[GpuRay]) -> Vec<GpuHit> {
         let accel = build_world_accel(device, queue, world);
+        probe_with_accel(device, queue, world, &accel, rays)
+    }
 
+    fn probe_with_accel(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        world: &World,
+        accel: &WorldAccel,
+        rays: &[GpuRay],
+    ) -> Vec<GpuHit> {
         let bricks_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("probe bricks"),
             contents: bytemuck::cast_slice(&world.bricks),
@@ -295,7 +449,8 @@ mod tests {
         // (resolve_brick), then the probe body - the same resolve_brick the
         // render shader's RT path uses.
         let probe_src = format!(
-            "enable wgpu_ray_query;\n{}\n{}",
+            "enable wgpu_ray_query;\n{}\n{}\n{}",
+            include_str!(concat!(env!("OUT_DIR"), "/world_consts.wgsl")),
             include_str!("../shaders/rt_voxel_query.wgsl"),
             include_str!("../shaders/accel_probe.wgsl"),
         );
@@ -601,6 +756,81 @@ mod tests {
         assert!(floor > 0 && pillar > 0, "clean streamed hits must cover floor ({floor}) and pillars ({pillar})");
         assert!(grazing < clean, "grazing majority under streaming ({grazing} >= {clean})");
         eprintln!("accel_matches_cpu_streaming: origin (96,160) - {clean} clean hits match CPU exactly (floor {floor}, pillar {pillar}); {grazing} grazing over {total}");
+    }
+
+    #[test]
+    fn accel_rebuild_in_place_matches_cpu() {
+        // The streaming rebuild path: mask-driven re-enumeration + prefix DMA +
+        // GPU BVH re-build into the SAME buffers. Grow the world (new pillar),
+        // shrink it (carve a hole), and stream the origin - after each in-place
+        // rebuild the RT probe must agree with the CPU raycaster, and stale
+        // primitives from the previous (larger) build must be gone.
+        let Some((device, queue, _gpu)) = rt_device() else {
+            eprintln!("accel_rebuild_in_place_matches_cpu: no RT adapter, skipping");
+            return;
+        };
+        let mut world = flat_floor(8, 8, 56); // top solid layer y=60
+        let mut accel = build_world_accel(&device, &queue, &world);
+        let count0 = accel.aabb_count;
+        assert!(count0 > 0, "flat floor produced no primitives");
+
+        // -- grow in place: raise a 3x3 pillar and rebuild --
+        for y in 61..75u32 {
+            for dz in 0..3u32 {
+                for dx in 0..3u32 {
+                    world.set_voxel(30 + dx, y, 30 + dz, MAT_STONE);
+                }
+            }
+        }
+        let grew = rebuild_world_accel(&mut accel, &device, &queue, &world.tile_mask, world.world_origin_voxel());
+        assert!(!grew, "a single pillar must fit the initial capacity (in-place path must run)");
+        assert!(accel.aabb_count > count0, "pillar did not add primitives");
+        let wo = world.world_origin_voxel();
+        // A ray at pillar height must hit the pillar's side face.
+        let eye = Vec3::new(20.0, 70.0, 31.5);
+        let dir = Vec3::new(1.0, 0.0, 0.0);
+        let h = &probe_with_accel(&device, &queue, &world, &accel, &[GpuRay::new(eye, dir)])[0];
+        let oracle = raycast(eye + Vec3::new(wo.x as f32, wo.y as f32, wo.z as f32), dir, &world, wo)
+            .expect("CPU must hit the new pillar");
+        assert_eq!(h.hit, 1, "RT missed the pillar added by the in-place rebuild");
+        assert_eq!([h.vx + wo.x, h.vy + wo.y, h.vz + wo.z], oracle.voxel, "pillar hit voxel mismatch");
+
+        // -- shrink in place: remove the pillar again --
+        let with_pillar = accel.aabb_count;
+        for y in 61..75u32 {
+            for dz in 0..3u32 {
+                for dx in 0..3u32 {
+                    world.set_voxel(30 + dx, y, 30 + dz, crate::voxel::MAT_AIR);
+                }
+            }
+        }
+        let grew = rebuild_world_accel(&mut accel, &device, &queue, &world.tile_mask, world.world_origin_voxel());
+        assert!(!grew);
+        assert!(accel.aabb_count < with_pillar, "shrink did not drop primitives");
+        // The same ray must now sail over the floor and MISS: proves the dead
+        // range was degenerate-padded, not left holding the stale pillar.
+        let h = &probe_with_accel(&device, &queue, &world, &accel, &[GpuRay::new(eye, dir)])[0];
+        assert_eq!(h.hit, 0, "stale pillar primitive survived the in-place shrink");
+
+        // -- streamed rebuild: shift the window origin and rebuild in place --
+        world.shift_origin(glam::IVec2::new(2, 3));
+        world.process_pending_gen_blocking();
+        rebuild_world_accel(&mut accel, &device, &queue, &world.tile_mask, world.world_origin_voxel());
+        let wo = world.world_origin_voxel();
+        // Straight down onto regenerated terrain: RT and CPU must agree.
+        let eye = Vec3::new(40.0, 140.0, 40.0);
+        let dir = Vec3::new(0.001, -1.0, 0.001).normalize();
+        let h = &probe_with_accel(&device, &queue, &world, &accel, &[GpuRay::new(eye, dir)])[0];
+        let oracle = raycast(eye + Vec3::new(wo.x as f32, wo.y as f32, wo.z as f32), dir, &world, wo);
+        match (h.hit == 1, oracle) {
+            (true, Some(pk)) => {
+                assert_eq!([h.vx + wo.x, h.vy + wo.y, h.vz + wo.z], pk.voxel,
+                    "streamed in-place rebuild: RT vs CPU voxel mismatch");
+            }
+            (false, None) => {}
+            (rt, cpu) => panic!("streamed rebuild disagreement: RT hit={rt} CPU hit={}", cpu.is_some()),
+        }
+        eprintln!("accel_rebuild_in_place_matches_cpu: grow/shrink/stream all agree (counts {count0} -> {with_pillar} -> {})", accel.aabb_count);
     }
 
     #[test]

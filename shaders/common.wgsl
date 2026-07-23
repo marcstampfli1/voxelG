@@ -20,7 +20,10 @@ struct Camera {
     // be two alignment pads - zero layout growth.
     wind_x: f32,
     world_origin: vec3<i32>,
-    _pad4: i32,
+    // Rotating GI-probe update round: the probe cache updates 1/GI_UPDATE_DIV of
+    // its probes each frame (strided by this counter), so the expensive gather is
+    // amortized instead of paid in full every frame.
+    gi_round: i32,
     jitter: vec2<f32>,
     taa_blend: f32,
     reproject_lighting: f32,

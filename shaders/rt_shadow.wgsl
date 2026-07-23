@@ -22,6 +22,21 @@ struct RtAabb {
 @group(1) @binding(1) var<storage, read> rt_brick_map: array<u32>;
 @group(1) @binding(2) var<storage, read> rt_aabbs: array<RtAabb>;
 
+// Live-brick gate for RT candidates: the BVH may briefly be STALE (rebuilds
+// land asynchronously off the frame thread), but the tile occupancy mask is
+// updated the same frame a slot is recycled or installed. One bit test makes a
+// stale primitive render as sky exactly like the software DDA - correctness
+// never depends on BVH freshness, only coverage of NEW bricks does (they
+// appear when the async rebuild lands).
+fn rt_brick_active(bi: i32) -> bool {
+    let bx = bi % WORLD_BRICKS_X;
+    let by = (bi / WORLD_BRICKS_X) % WORLD_BRICKS_Y;
+    let bz = bi / (WORLD_BRICKS_X * WORLD_BRICKS_Y);
+    let ti = world_tile_idx(bx >> 2, by >> 2, bz >> 2);
+    let lin = (bx & 3) + (bz & 3) * 4 + (by & 3) * 16;
+    return tile_has_child(ti, lin);
+}
+
 // March a candidate brick's 4^3 voxels (window-local o/dir) and return true if
 // any solid voxel actually occludes per `shadow_voxel_occludes`. Unlike
 // resolve_brick (first solid wins, for primary hits) this visits EVERY solid
@@ -86,10 +101,12 @@ fn rt_occluded(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> bool {
         let c = rayQueryGetCandidateIntersection(&rq);
         if (c.kind == RAY_QUERY_INTERSECTION_AABB) {
             let bi = i32(rt_brick_map[c.primitive_index]);
-            let a = rt_aabbs[c.primitive_index];
-            let bmin = vec3<f32>(a.min_x, a.min_y, a.min_z);
-            if (rt_brick_occludes(bi, bmin, o, origin, dir, max_dist)) {
-                return true;
+            if (rt_brick_active(bi)) {
+                let a = rt_aabbs[c.primitive_index];
+                let bmin = vec3<f32>(a.min_x, a.min_y, a.min_z);
+                if (rt_brick_occludes(bi, bmin, o, origin, dir, max_dist)) {
+                    return true;
+                }
             }
         }
     }

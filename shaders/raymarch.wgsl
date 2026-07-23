@@ -64,11 +64,24 @@ struct PlayersBuf {
 @group(0) @binding(14) var cloud_out: texture_storage_2d<rgba16float, write>;
 
 // Reprojected shadow/AO cache (#12). light_in = previous frame's G-buffer
-// (xyz = hit pos relative to world_origin, w = pack2x16float(shadow, ao));
+// (xyz = hit pos relative to world_origin, w = packed shadow/ao/sun-altitude);
 // light_out = this frame's. cs_main reprojects each hit into last frame's screen
 // and reuses the cached shadow/AO when the stored position matches (else traces).
 @group(0) @binding(15) var light_in: texture_2d<f32>;
 @group(0) @binding(16) var light_out: texture_storage_2d<rgba32float, write>;
+
+// Light-cache word: 8-bit shadow + 8-bit AO + f16 sun altitude. The altitude
+// records which sun the SHADOW was traced against: AO is geometric (always
+// reusable on a position match), but a cached shadow goes stale as the sun
+// moves - each pixel re-traces its shadow when the sun has drifted past its own
+// jittered threshold, so refreshes scatter as fine dither instead of frame-wide
+// re-traces (or worse, shadows frozen until the camera moves).
+fn pack_light_cache(shadow: f32, ao: f32, sun_y: f32) -> u32 {
+    let s8 = u32(round(clamp(shadow, 0.0, 1.0) * 255.0));
+    let a8 = u32(round(clamp(ao, 0.0, 1.0) * 255.0));
+    let sy = pack2x16float(vec2<f32>(sun_y, 0.0)) & 0xFFFFu;
+    return (s8 << 24u) | (a8 << 16u) | sy;
+}
 
 // Deferred transparent pass (#16). cs_main records each transparent (water-top /
 // glass) hit here as (t_hit, mat_code, normal_code, flag) and writes a cheap
@@ -87,6 +100,14 @@ struct PlayersBuf {
 //       code (encode_face_normal)
 //   w = spare (0)
 @group(0) @binding(17) var<storage, read_write> transp_buf: array<vec4<u32>>;
+
+// Reflection history region of transp_buf (third region, after the per-pixel
+// records and the half-res god-ray scratch): rgb (f16x3) + the water surface
+// point that produced it, for reuse validation.
+fn refl_hist_idx(px: vec2<i32>, res: vec2<i32>) -> i32 {
+    let half_res = (res + vec2<i32>(1)) / 2;
+    return res.x * res.y + half_res.x * half_res.y + px.y * res.x + px.x;
+}
 
 const TR_NONE:       u32 = 0u;
 const TR_WATER_TOP:  u32 = 1u;
@@ -316,6 +337,17 @@ fn sky(dir: vec3<f32>) -> vec3<f32> {
 /// Sky-like colour with **no stars, sun disc, or cloud emitters** — used for
 /// the fog blend on distant terrain so far-away blocks don't visibly show
 /// pinpoint stars through them at night.
+// Atmospheric fog amount at hit distance t. Clear out to FOG-start, then a
+// linear ramp saturating by ~350: the old t/280-from-zero curve hazed the
+// whole midfield ("everything looks a bit foggy"); this keeps the near/mid
+// field crisp while still saturating before the 400+ water/LOD switches so
+// fog keeps hiding them. ONE curve for terrain, water, glass AND clouds -
+// the horizon melts consistently (clouds previously stayed fully crisp while
+// the ground fogged out).
+fn fog_amount(t: f32) -> f32 {
+    return clamp((t - 60.0) / 340.0, 0.0, 0.85);
+}
+
 fn fog_atmospheric(dir: vec3<f32>) -> vec3<f32> {
     let s = sun_dir();
     let day_t = sun_intensity(s);
@@ -353,8 +385,24 @@ fn ign(x: f32, y: f32, frame: f32) -> f32 {
 // Profiling toggles (const-folded out when false): PROFILE_FLAT skips all
 // shading to isolate traversal cost; PROFILE_NO_L4 skips the L4/chunk coarse
 // skips. Both off for normal rendering.
+override PROFILE_FLAT_F: f32 = 0.0;
 const PROFILE_FLAT: bool = false;
 const PROFILE_NO_L4: bool = false;
+
+// Diagnostic override (flicker rig): freeze the per-frame shading-noise
+// phase (shadow cone jitter, GI sample jitter) on a static camera. The TAA
+// camera sub-pixel jitter is separate and unaffected. Default = live
+// behaviour.
+override JIT_PHASE_FREEZE: f32 = 0.0;
+
+// Transparent-pass cost-split toggles (timing-only, const-folded out in
+// normal builds): each disables one component of water shading so the
+// harness attributes transp milliseconds by differencing runs. Never
+// shipped on - the outputs they produce are placeholders.
+override PROF_TRANSP_NO_REFL: f32 = 0.0;
+override PROF_TRANSP_NO_REFR: f32 = 0.0;
+override PROF_TRANSP_REFL_FLATSHADE: f32 = 0.0;
+override PROF_TRANSP_REFR_FLATSHADE: f32 = 0.0;
 
 // Reprojected shadow/AO cache (#12). Set false to fall back to tracing shadow+AO
 // every frame (e.g. if reprojection ghosting is ever observed). REPROJ_EPS2 is
@@ -380,6 +428,12 @@ fn ray_dir_uv(uv: vec2<f32>) -> vec3<f32> {
 // looking away from / parallel to the slab). Used to reapply terrain occlusion
 // to the precomputed half-res clouds without re-marching.
 fn cloud_slab_near(dir: vec3<f32>) -> f32 {
+    // Camera INSIDE the slab: every direction starts in cloud immediately. The
+    // horizontal-ray epsilon below must not fire here - it carved a 1-2 px "no
+    // cloud" band at the exact horizon, seen as a dark line THROUGH the clouds
+    // when flying inside them.
+    if (camera.origin.y >= CLOUD_BASE && camera.origin.y <= CLOUD_TOP) { return 0.0; }
+    // Outside the slab, a near-horizontal ray never reaches it.
     if (abs(dir.y) < 1e-3) { return 1e9; }
     let inv_dy = 1.0 / dir.y;
     var t_in  = (CLOUD_BASE - camera.origin.y) * inv_dy;
@@ -493,7 +547,7 @@ fn cs_transparent(@builtin(global_invocation_id) gid: vec3<u32>) {
         // ONE shade_water_top call site: it inlines the reflection and
         // refraction traces, and duplicating it doubles cs_transparent's
         // code size (measured ~+1.8 ms on the water scenario).
-        col = shade_water_top(hit, camera.origin, dir);
+        col = shade_water_top(hit, camera.origin, dir, vec2<i32>(i32(gid.x), i32(gid.y)));
     } else {
         hit.mat = MAT_GLASS;
         hit.normal = decode_face_normal(rec.z);
@@ -520,7 +574,14 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if ((tile_dirty[word] & (1u << u32(bit))) == 0u) { return; }
 
     // Per-pixel + per-frame jitter, threaded through shading.
-    let pix_jitter = ign(f32(gid.x), f32(gid.y), camera.time * 60.0);
+    // Per-frame-varying jitter ONLY while TAA accumulates (static camera):
+    // unaveraged time-varying jitter is pure shimmer on a moving camera, so
+    // motion freezes the phase - every pixel samples the same cone offset each
+    // frame (temporally rock-solid, spatially soft-dithered penumbra), and the
+    // time-varying softness resumes the moment the camera rests.
+    let jit_phase = select(select(0.0, camera.time * 60.0, camera.taa_blend > 0.0),
+                           0.0, JIT_PHASE_FREEZE > 0.5);
+    let pix_jitter = ign(f32(gid.x), f32(gid.y), jit_phase);
 
     // Sub-pixel jitter for temporal anti-aliasing (zero unless accumulating).
     let uv = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5) + camera.jitter) / camera.resolution;
@@ -544,12 +605,12 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // the empty-space traversal. Off by default; falls through to the software
     // beam + hierarchical DDA below.
     var rt_done = false;
-    hit = rt_primary_or_none(camera.origin, dir, &rt_done);
+    hit = rt_primary_or_none(camera.origin, dir, cam_in_water, &rt_done);
     if (!rt_done) {
         if (cam_in_water) {
             // Skip beam-skip when underwater — beam pre-pass doesn't know about
             // the camera being inside water and may have advanced past real geo.
-            hit = trace_no_water(camera.origin, dir);
+            hit = trace_no_water(camera.origin, dir, MAX_RAY_DIST);
         } else {
             hit = trace(ray_origin, dir);
             if (hit.hit) {
@@ -558,7 +619,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
     var col: vec3<f32>;
-    if (PROFILE_FLAT) {
+    if (PROFILE_FLAT || PROFILE_FLAT_F > 0.5) {
         col = select(sky(dir), palette[hit.mat].rgb, hit.hit);
         textureStore(output_tex, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(col, 1.0));
         return;
@@ -591,8 +652,14 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             // only oblique sub-voxel hits (grass/flower cross-quads) re-trace.
             let hitpos_rel = (camera.origin - vec3<f32>(camera.world_origin)) + dir * hit.t_hit;
             let cacheable = hit.last_axis >= 0;
+            let sun_y_now = sun_dir().y;
             var light = vec2<f32>(0.0);
-            var reuse = false;
+            var reuse_ao = false;
+            var reuse_shadow = false;
+            // Sun altitude the cached shadow was traced at (kept on reuse so
+            // staleness accumulates to the refresh threshold; a fresh trace
+            // stores the current sun).
+            var shadow_sun_y = sun_y_now;
             if (REPROJECT_LIGHTING && cacheable && camera.reproject_lighting > 0.5) {
                 let abs_pos = hitpos_rel + vec3<f32>(camera.world_origin);
                 let d = abs_pos - camera.prev_origin;
@@ -609,18 +676,41 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         let g = textureLoad(light_in, pc, 0);
                         let dpos = g.xyz - hitpos_rel;
                         if (dot(dpos, dpos) < REPROJ_EPS2) {
-                            light = unpack2x16float(bitcast<u32>(g.w));
-                            reuse = true;
+                            let bits = bitcast<u32>(g.w);
+                            light = vec2<f32>(f32(bits >> 24u) / 255.0,
+                                              f32((bits >> 16u) & 0xFFu) / 255.0);
+                            // AO is geometric: always reusable on a position
+                            // match. The shadow was traced against the sun
+                            // recorded in the cache word - reuse it only while
+                            // the sun hasn't drifted past this pixel's own
+                            // (stable, hash-jittered) threshold, so a moving
+                            // sun refreshes shadows as scattered per-pixel
+                            // dither, a few % of pixels per frame.
+                            reuse_ao = true;
+                            let cached_sy = unpack2x16float(bits & 0xFFFFu).x;
+                            // Tight thresholds: at sun speed ~0.025/s this is a
+                            // 0.03-0.10 s refresh lag, so a standing-still shadow
+                            // tracks the sun near-continuously and a camera move
+                            // has no accumulated error to flush (no edge "jump"),
+                            // and the per-pixel spread stays small enough that
+                            // neighbouring pixels agree (no wide dither band at
+                            // moving shadow edges). ~10-20% of pixels re-trace
+                            // per frame while the sun moves; 0% when it is still.
+                            let thr = 0.0008 + 0.0017 * ign(f32(gid.x), f32(gid.y), 0.0);
+                            reuse_shadow = abs(sun_y_now - cached_sy) < thr;
+                            if (reuse_shadow) { shadow_sun_y = cached_sy; }
                         }
                     }
                 }
             }
             let gi_p = camera.origin + dir * hit.t_hit;
             let indirect = indirect_light(gi_p, hit.normal, pix_jitter,
-                                          vec2<i32>(i32(gid.x), i32(gid.y)), hit.t_hit);
-            col = shade(hit, camera.origin, dir, pix_jitter, reuse, &light, indirect);
+                                          vec2<i32>(i32(gid.x), i32(gid.y)), hit.t_hit, dir);
+            let blend_shadow = reuse_ao && !reuse_shadow;
+            col = shade(hit, camera.origin, dir, pix_jitter, reuse_shadow, reuse_ao, blend_shadow, &light, indirect);
             if (cacheable) {
-                gbuf = vec4<f32>(hitpos_rel, bitcast<f32>(pack2x16float(light)));
+                gbuf = vec4<f32>(hitpos_rel,
+                                 bitcast<f32>(pack_light_cache(light.x, light.y, shadow_sun_y)));
             }
         }
     } else {
@@ -687,7 +777,18 @@ fn cs_compose(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (t_hit < 1.0e8) {
         let s = sun_dir();
         let s_int = sun_intensity(s);
-        if (s_int > 0.0 && s.y > 0.05) {
+        // Low-sun fade: the tap positions scale as 1/s.y, so near the horizon
+        // they RACE horizontally (d/ds ~ 1/s.y^2) and the cloud pattern sweeps
+        // the ground as accelerating waves of light ("rings washing over the
+        // land at sunset"). Physically a near-grazing sun through a cloud layer
+        // is extinct and diffuse - no crisp travelling shadows - so the term
+        // fades out smoothly before the sweep regime instead of hard-cutting.
+        // Fade window raised twice: residual rings were still visible in the
+        // old 0.10-0.30 band, where partial-strength taps still race (and the
+        // higher, denser clouds made both the sweep faster and the shade
+        // stronger). Below 0.22 the term is fully OFF.
+        let horiz_fade = smoothstep(0.22, 0.42, s.y);
+        if (s_int > 0.0 && horiz_fade > 0.0) {
             let p_ground = camera.origin + dir * t_hit;
             let st_in = (CLOUD_BASE - p_ground.y) / s.y;
             let st_out = (CLOUD_TOP - p_ground.y) / s.y;
@@ -695,26 +796,57 @@ fn cs_compose(@builtin(global_invocation_id) gid: vec3<u32>) {
             // `dir` carries the TAA sub-pixel jitter, so a hard occluded/not
             // boolean flips frame-to-frame at shadow edges and the cloud
             // shade JITTERS while standing still (TAA never settles). Roofed
-            // surfaces are instead kept dark by sky_access() in the shading,
-            // so an ungated cloud multiply over them is negligible.
+            // surfaces are instead kept dim by the probe GI (less skylight
+            // reaches them), so an ungated cloud multiply over them is negligible.
             if (st_in > 0.0) {
                 var d = 0.0;
-                d = d + cloud_density(p_ground + s * mix(st_in, st_out, 0.2), camera.time);
-                d = d + cloud_density(p_ground + s * mix(st_in, st_out, 0.5), camera.time);
-                d = d + cloud_density(p_ground + s * mix(st_in, st_out, 0.8), camera.time);
+                d = d + cloud_density_coarse(p_ground + s * mix(st_in, st_out, 0.2), camera.sun_time);
+                d = d + cloud_density_coarse(p_ground + s * mix(st_in, st_out, 0.5), camera.sun_time);
+                d = d + cloud_density_coarse(p_ground + s * mix(st_in, st_out, 0.8), camera.sun_time);
                 let occl = 1.0 - exp(-d * 1.1);
-                col = col * (1.0 - occl * 0.42 * s_int);
+                col = col * (1.0 - occl * 0.42 * s_int * horiz_fade);
             }
         }
     }
 
     let uv_cloud = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5)) / camera.resolution;
     let clouds = textureSampleLevel(cloud_in, cloud_samp, uv_cloud, 0.0);
-    if (t_hit >= cloud_slab_near(dir)) {
-        col = col * (1.0 - clouds.a) + clouds.rgb;
+    let t_cloud = cloud_slab_near(dir);
+    if (t_hit >= t_cloud) {
+        // Same distance-haze curve as terrain: far clouds melt into the horizon
+        // instead of hanging crisp over fogged-out ground.
+        let cf = 1.0 - fog_amount(t_cloud);
+        col = col * (1.0 - clouds.a * cf) + clouds.rgb * cf;
     }
 
-    col += god_rays(camera.origin, dir, min(t_hit, 200.0), vec2<f32>(f32(gid.x), f32(gid.y)));
+    // God rays: depth-weighted 4-tap upsample of the half-res occlusion
+    // fraction (cs_godrays); colour and phase are exact per pixel, so the
+    // shared half-res part is only the smooth occlusion field - no haloing
+    // across silhouettes thanks to the depth weights.
+    {
+        let s = sun_dir();
+        let s_int = sun_intensity(s);
+        let cos_sun = dot(dir, s);
+        let phase = phase_hg(cos_sun, 0.7) * 4.0;
+        if (s_int > 0.0 && phase >= 0.05) {
+            let half_res = (res + vec2<i32>(1)) / 2;
+            let base_idx = res.x * res.y;
+            let hx = clamp(i32(gid.x) / 2, 0, half_res.x - 2);
+            let hy = clamp(i32(gid.y) / 2, 0, half_res.y - 2);
+            let t_ref = min(t_hit, 200.0);
+            var fsum = 0.0;
+            var wsum = 0.0;
+            for (var k: i32 = 0; k < 4; k = k + 1) {
+                let rec = transp_buf[base_idx + (hy + (k >> 1)) * half_res.x + hx + (k & 1)];
+                let f = bitcast<f32>(rec.x);
+                let d = min(bitcast<f32>(rec.y), 200.0);
+                let wd = 1.0 / (1.0 + abs(d - t_ref) * 0.15);
+                fsum = fsum + f * wd;
+                wsum = wsum + wd;
+            }
+            col += sun_color(s) * (fsum / max(wsum, 1e-4)) * phase * 0.22 * s_int;
+        }
+    }
 
     if (camera_in_water()) {
         let t_eye = min(t_hit, 80.0);
@@ -794,10 +926,22 @@ fn wind_dir_now() -> vec2<f32> {
 // [0.25, 1.0]. This is what stops the whole map swaying in lockstep - a
 // gust visibly travels across a field. Long wavelengths keep neighbouring
 // blocks coherent (one tree never tears apart).
+// SHADOW rays sample the foliage cutouts at a FROZEN wind phase: one shadow
+// sample per pixel per frame cannot resolve moving blades - the binary dapple
+// churns, then the staleness cache pops it ("small shadows jumping around").
+// Primary rays keep full animation (trees visibly wave); the dapple pattern
+// still drifts with the SUN, it just stops boiling. Set around the cutout
+// tests in shadow_voxel_occludes only.
+var<private> shadow_wind_freeze: bool = false;
+
+fn wind_time() -> f32 {
+    return select(camera.time, 41.7, shadow_wind_freeze);
+}
+
 fn wind_gust(p_xz: vec2<f32>, wdir: vec2<f32>) -> f32 {
     let s = dot(p_xz, wdir);
-    let front  = 0.5 + 0.5 * sin(s * 0.020 - camera.time * 0.9);
-    let ripple = 0.5 + 0.5 * sin(s * 0.11  - camera.time * 2.1);
+    let front  = 0.5 + 0.5 * sin(s * 0.020 - wind_time() * 0.9);
+    let ripple = 0.5 + 0.5 * sin(s * 0.11  - wind_time() * 2.1);
     return 0.25 + 0.75 * front * (0.6 + 0.4 * ripple);
 }
 
@@ -807,7 +951,7 @@ fn wind_offset(voxel_min: vec3<f32>, phase: f32, base_amp: f32) -> vec2<f32> {
     // tuft quads of one block share a single shear (the anti-X-split
     // contract in sprite_cross_hit).
     let strength = base_amp * wind_gust(voxel_min.xz, wdir)
-        * (0.70 + 0.30 * sin(camera.time * 0.55 + phase));
+        * (0.70 + 0.30 * sin(wind_time() * 0.55 + phase));
     return wdir * strength;
 }
 
@@ -1566,35 +1710,133 @@ fn vnoise3(p: vec3<f32>) -> f32 {
 // so the sky has discrete clumps with empty regions between (not haze). The
 // height-falloff bell concentrates density mid-slab — flat bottoms and
 // rounded tops, like real cumulus.
+// Coverage-and-envelope-only density for the GROUND cloud-shade taps: shadows
+// need the cloud MASS silhouette, not worley florets or tower fields, and
+// these taps run 3x per full-res pixel every frame - the full field there cost
+// ~1.5 ms of compose. Deliberate second implementation for a hot path (the
+// full field stays the one source of the RENDERED cloud).
+// Base-lift sample coordinate: xz only (the underside is a heightfield, not
+// volumetric), matched between the full and coarse density fields.
+fn vec2p_base(pa: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(pa.x * 2.3, 17.0, pa.z * 2.3);
+}
+
+fn cloud_density_coarse(p: vec3<f32>, t: f32) -> f32 {
+    let pa = p * 0.0055 + vec3<f32>(t * 0.06, 0.0, t * 0.035);
+    let cov_lo = vnoise3(pa * 1.05);
+    let cov_mid = vnoise3(pa * 2.6);
+    let cov = smoothstep(0.55, 0.65, cov_lo * 0.60 + cov_mid * 0.40);
+    if (cov <= 0.0) { return 0.0; }
+    let h = clamp((p.y - CLOUD_BASE) / max(1.0, CLOUD_TOP - CLOUD_BASE), 0.0, 1.0);
+    let base_lift = vnoise3(vec2p_base(pa)) * 0.14;
+    let envelope = smoothstep(base_lift, base_lift + 0.05, h) * (1.0 - smoothstep(0.45, 1.0, h));
+    return clamp((cov * 0.8 - 0.25) * 9.0 * envelope, 0.0, 1.0);
+}
+
+fn hash33(p: vec3<f32>) -> vec3<f32> {
+    var q = fract(p * vec3<f32>(0.1031, 0.1030, 0.0973));
+    q = q + dot(q, q.yxz + 33.33);
+    return fract((q.xxy + q.yxx) * q.zyx);
+}
+
+// 8-cell 3D Worley F1 (distance to nearest jittered feature point, ~0..1).
+// The 2x2x2 neighbourhood picks the cells nearest to p per axis - accurate
+// enough for cloud florets at a third of the 27-cell cost. Worley is THE
+// floret maker: its iso-surfaces are spheres around the feature points, so
+// eroding a density field with it leaves round convex lobes (cauliflower),
+// where value-noise erosion just leaves mush.
+fn worley3f(p: vec3<f32>) -> f32 {
+    let ip = floor(p);
+    let fp = p - ip;
+    let shift = vec3<i32>(
+        select(-1, 0, fp.x > 0.5),
+        select(-1, 0, fp.y > 0.5),
+        select(-1, 0, fp.z > 0.5),
+    );
+    var dmin = 4.0;
+    for (var k: i32 = 0; k < 8; k = k + 1) {
+        let o = vec3<i32>(k & 1, (k >> 1) & 1, (k >> 2) & 1) + shift;
+        let fo = vec3<f32>(o);
+        let feat = fo + hash33(ip + fo);
+        let dv = feat - fp;
+        dmin = min(dmin, dot(dv, dv));
+    }
+    return clamp(sqrt(dmin), 0.0, 1.0);
+}
+
+// `t` is the DAY clock (camera.sun_time): equal to render time in normal play,
+// pinned by --freeze-time so frozen scenes freeze their clouds (and the
+// rigid-ground temporal guard isolates rogue shading fields from legit drift).
 fn cloud_density(p: vec3<f32>, t: f32) -> f32 {
     let pa = p * 0.0055 + vec3<f32>(t * 0.06, 0.0, t * 0.035);
     // Cumulus coverage: a low-freq clump field carved by a smoothstep
     // threshold into DISTINCT clouds with genuinely clear sky between -
     // never a linear coverage ramp, which spreads a translucent stratus
     // veil everywhere. The mid-freq term keeps clump outlines irregular.
-    let cov_lo = vnoise3(pa * 0.70);
-    let cov_mid = vnoise3(pa * 2.1);
-    let cov = smoothstep(0.54, 0.66, cov_lo * 0.75 + cov_mid * 0.25);
+    // Smaller clumps (higher coverage frequency), and a strong mid-frequency
+    // term so each cloud reads as a CLUSTER of round masses packed together
+    // (the ice-cream-scoop look) instead of one amorphous blot.
+    let cov_lo = vnoise3(pa * 1.05);
+    let cov_mid = vnoise3(pa * 2.6);
+    let covf = cov_lo * 0.60 + cov_mid * 0.40;
+    let cov = smoothstep(0.55, 0.65, covf);
     if (cov <= 0.0) { return 0.0; }
     // Body: 4 octaves of fbm. Vertical noise is scaled finer so a horizontal
     // slice doesn't look like a flat layer when viewed sideways.
     let pb = vec3<f32>(pa.x, pa.y * 3.5, pa.z);
+    // Scoop shape comes from the COVERAGE peaks (round columns capped by the
+    // dome), NOT from carving iso-shells out of body noise - that made curled
+    // ribbons. Body is a smooth two-octave fullness modulation only.
     let n1 = vnoise3(pb);
     let n2 = vnoise3(pb * 2.7);
-    let n3 = vnoise3(pb * 6.3);
-    let n4 = vnoise3(pb * 13.1);
-    let body = n1 * 0.50 + n2 * 0.28 + n3 * 0.15 + n4 * 0.07;
+    let body = n1 * 0.65 + n2 * 0.35;
+    // Cauliflower surface: WORLEY-F1 erosion near the density boundary only
+    // (full strength at the surface, none deep inside). Worley removes the
+    // material BETWEEN feature points, leaving round convex lobes bulging
+    // outward - two octaves give big florets carrying small ones, the real
+    // cumulus fractal.
+    let det = worley3f(pb * 4.6) * 0.68 + worley3f(pb * 10.3) * 0.32;
     // Cumulus profile: sharp flat bottom, and TOWERS - a second noise field
     // picks where each clump billows upward, so cores rise as rounded
     // cauliflower heads (weak coverage stays a low base layer near the
     // slab bottom, strong tower spots climb toward CLOUD_TOP). Vertical
     // development, not just wider clumps.
     let h = clamp((p.y - CLOUD_BASE) / max(1.0, CLOUD_TOP - CLOUD_BASE), 0.0, 1.0);
-    let bottom_fade = smoothstep(0.0, 0.06, h);
-    let tower = cov * (0.40 + 0.60 * vnoise3(pa * 1.6 + vec3<f32>(31.0, 0.0, 17.0)));
-    let dome = 1.0 - smoothstep(0.10 + 0.80 * tower, 1.0, h);
+    // Lumpy underside: the base onset height varies per region with the
+    // wildcard field (mostly near-level like a real condensation base, but
+    // never a geometric plane), and the worley erosion then sculpts what the
+    // onset exposes.
+    let base_lift = vnoise3(vec2p_base(pa)) * 0.14;
+    let bottom_fade = smoothstep(base_lift, base_lift + 0.05, h);
+    // Height varies INSIDE a cloud, not one cap per clump:
+    //  - `interior` grows from the clump's edge toward its core (the raw
+    //    coverage field past the carve threshold), so edges stay low and puffy
+    //    while the middle billows - no more uniform-height slabs.
+    //  - `tn` adds mid-frequency bumps (~55 voxels) so one big cloud carries
+    //    several cauliflower heads at different heights.
+    // Every clump keeps a CHUNKY opaque base (dome floor 0.30 - capping lower
+    // squashed them into translucent wisps); strong interior cores climb the
+    // whole taller slab.
+    let interior = smoothstep(0.56, 0.84, covf);
+    let tn = vnoise3(pa * 3.2 + vec3<f32>(31.0, 0.0, 17.0));
+    // TENDENCY, not rule: the edge->core gradient carries most of the cap
+    // height (edges flatter, middles taller), but an independent low-freq
+    // field adds +-0.17 so SOME edges still billow and SOME cores stay low -
+    // a strict dome-per-clump read as artificial.
+    let wildcard = vnoise3(pa * 1.1 + vec3<f32>(7.0, 0.0, 43.0));
+    let tower = clamp(interior * (0.30 + 0.70 * tn * tn) + (wildcard - 0.5) * 0.35, 0.0, 1.0);
+    let dome = 1.0 - smoothstep(0.30 + 0.70 * tower, 1.0, h);
     let envelope = bottom_fade * dome;
-    let d = (body - 0.32) * cov * 5.0 * envelope;
+    // Full round masses: coverage bounds the scoop, body only modulates its
+    // fullness; the steep scale saturates cores to opaque white. The edge
+    // factor (1 at the boundary, 0 deep inside) applies the floret erosion.
+    // ORDER MATTERS (the Nubis lesson): erode the GRADUAL shape field first,
+    // sharpen after. Eroding an already-hard field acts on a razor-thin shell
+    // and cannot sculpt lobes; eroding the soft shell carves floret-sized
+    // spheres, then the final remap restores the crisp opaque edge.
+    let shape = clamp(cov * (0.50 + 0.50 * body) * envelope, 0.0, 1.0);
+    let eroded = shape - det * det * (1.0 - shape) * 0.62;
+    let d = (eroded - 0.20) * 9.0;
     return clamp(d, 0.0, 1.0);
 }
 
@@ -2066,7 +2308,19 @@ fn water_subvoxel_far(
     if (p0.y <= s0 + 1e-4) {
         out.hit = true;
         out.t_hit = t_entry;
-        out.normal = entry_n;
+        // A SIDE entry below the surface out here is a crack between two
+        // INDEPENDENT facets (the far tiers have no corner connection), not a
+        // real waterfall - and shading it with the vertical face normal painted
+        // jittery dark lines along cell edges across distant water. Present it
+        // as the surface (facet normal, y ~ 0.96 > the TR_WATER_TOP gate): a
+        // genuine 1-voxel terrace wall subtends under a pixel beyond
+        // WATER_NEAR_T, so nothing legitimate is lost. Top/bottom entries keep
+        // the true face normal (underside shading stays correct).
+        if (abs(entry_n.y) < 0.5) {
+            out.normal = normalize(vec3<f32>(-slope.x, 1.0, -slope.y));
+        } else {
+            out.normal = entry_n;
+        }
         return out;
     }
     let denom = dir.y - slope.x * dir.x - slope.y * dir.z;
@@ -2504,7 +2758,7 @@ fn dda_step(
     }
 }
 
-fn trace_no_water(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
+fn trace_no_water(origin: vec3<f32>, dir: vec3<f32>, t_cap: f32) -> Hit {
     var out: Hit;
     out.hit = false;
     out.mat = 0u;
@@ -2529,6 +2783,7 @@ fn trace_no_water(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
     var last_axis: i32 = -1;
     var t_cur: f32 = t_enter;
     for (var s: i32 = 0; s < 1024; s = s + 1) {
+        if (t_cur > t_cap) { return out; }
         let rel = voxel - camera.world_origin;
         if (rel.x < 0 || rel.x >= WORLD_VOXELS_X
          || rel.y < 0 || rel.y >= WORLD_VOXELS_Y
@@ -2587,7 +2842,7 @@ fn trace_no_water(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
     return out;
 }
 
-fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
+fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>, px: vec2<i32>) -> vec3<f32> {
     let p_hit = origin + dir * hit.t_hit;
     // The plate/wall normal is real (quantised) geometry now — shading uses it
     // directly instead of a per-pixel Gerstner fake. Every pixel of a plate
@@ -2608,12 +2863,61 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     // and sky rather than the surface's own neighbouring plates.
     let refl_dir = reflect(dir, n);
     let refl_origin = p_hit + n * 0.01;
-    let refl_hit = trace_no_water(refl_origin, refl_dir);
+    // Temporal reflection accumulation (converging, TAA-family): on a STATIC
+    // camera the reflected scene per pixel varies only with the animated wave
+    // normal, so blending history converges to the cone-filtered (glossy)
+    // reflection - and lets half the pixels per frame skip the trace + full
+    // hit shading entirely (the two largest water costs). Reuse is validated
+    // against the stored surface point; motion traces fresh every frame as
+    // before. History always updates, so stopping the camera never reads
+    // stale content.
+    let res_i = vec2<i32>(camera.resolution);
+    let hidx = refl_hist_idx(px, res_i);
+    let hist = transp_buf[hidx];
+    let hist_p = vec3<f32>(bitcast<f32>(hist.z), unpack2x16float(hist.y).y, bitcast<f32>(hist.w));
+    let hist_dp = hist_p - p_hit;
+    let hist_ok = camera.taa_blend > 0.0 && dot(hist_dp, hist_dp) < 0.35;
+    // 8x8-BLOCK stagger, not per-pixel: a pixel checkerboard leaves every
+    // SIMT warp with both tracing and skipping threads, so the warp pays the
+    // trace latency anyway (measured: zero gain). Whole workgroups skipping
+    // coherently is what converts skipped work into time.
+    let stagger_trace = (((px.x >> 3) ^ (px.y >> 3) ^ i32(camera.gi_round)) & 1) == 0;
     var refl_col: vec3<f32>;
-    if (refl_hit.hit) {
-        refl_col = shade(refl_hit, refl_origin, refl_dir, jit, false, &no_cache, vec3<f32>(0.0));
-    } else {
+    if (PROF_TRANSP_NO_REFL > 0.5) {
+        // Cost-split probe: whole reflection component off (trace, shade,
+        // history traffic).
         refl_col = sky(refl_dir);
+    } else if (hist_ok && !stagger_trace) {
+        let rg = unpack2x16float(hist.x);
+        refl_col = vec3<f32>(rg.x, rg.y, unpack2x16float(hist.y).x);
+    } else {
+        let refl_hit = trace_secondary(refl_origin, refl_dir, SECONDARY_MAX_T);
+        var fresh: vec3<f32>;
+        if (refl_hit.hit) {
+            if (PROF_TRANSP_REFL_FLATSHADE > 0.5) {
+                // Cost-split probe: trace kept, hit shading replaced by a
+                // palette read.
+                fresh = palette[refl_hit.mat].rgb;
+            } else {
+                fresh = shade(refl_hit, refl_origin, refl_dir, jit, false, false, false, &no_cache, vec3<f32>(0.0));
+            }
+        } else {
+            fresh = sky(refl_dir);
+        }
+        if (hist_ok) {
+            let rg = unpack2x16float(hist.x);
+            refl_col = mix(fresh, vec3<f32>(rg.x, rg.y, unpack2x16float(hist.y).x), 0.55);
+        } else {
+            refl_col = fresh;
+        }
+    }
+    if (PROF_TRANSP_NO_REFL < 0.5) {
+        transp_buf[hidx] = vec4<u32>(
+            pack2x16float(refl_col.rg),
+            pack2x16float(vec2<f32>(refl_col.b, p_hit.y)),
+            bitcast<u32>(p_hit.x),
+            bitcast<u32>(p_hit.z),
+        );
     }
 
     // ---- refraction: primary ray bent into the water, trace through it ----
@@ -2623,15 +2927,46 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     // Total internal reflection would return zero; fall back to dir.
     if (length(refr_dir) < 0.01) { refr_dir = dir; }
     let refr_origin = p_hit + dir * 0.001; // step inside the water column
-    let under = trace_no_water(refr_origin, refr_dir);
+    // Refraction routes through the SOFTWARE DDA even in RT builds: these rays
+    // hit the bed within a few voxels, and a hardware ray query's fixed setup
+    // (init + traversal state + candidate handshake) never amortizes on rays
+    // that short - measured as RT transp trailing software by ~0.9 ms on
+    // water-close. Long rays (reflections, shadows, primaries, GI) stay on
+    // the RT cores where the hardware wins.
     var under_col: vec3<f32>;
-    if (under.hit) {
-        under_col = shade(under, refr_origin, refr_dir, jit, false, &no_cache, vec3<f32>(0.0));
+    var depth = 4.0;
+    // Hoisted for the shore-foam block below (the trace lives in the else
+    // scope so the cost-split probe can skip it).
+    var under_hit = false;
+    var under_t = 1.0e9;
+    if (PROF_TRANSP_NO_REFR > 0.5) {
+        // Cost-split probe: whole refraction component off.
+        under_col = vec3<f32>(0.05, 0.15, 0.20);
     } else {
-        under_col = sky(refr_dir) * 0.6;
+        let under = trace_no_water(refr_origin, refr_dir, SECONDARY_MAX_T);
+        under_hit = under.hit;
+        under_t = under.t_hit;
+        if (under.hit) {
+            if (PROF_TRANSP_REFR_FLATSHADE > 0.5) {
+                // Cost-split probe: trace kept, hit shading replaced by a
+                // palette read.
+                under_col = palette[under.mat].rgb;
+            } else {
+                // PROVEN constant: the refracted hit lies UNDER the surface and water
+                // occludes shadow rays (shadow_voxel_occludes falls through to true),
+                // so its sun-shadow ray always terminates in the water column above -
+                // shadow_term is 0 by construction. Feed the constant through the
+                // reuse path instead of tracing a per-pixel ray for a known answer.
+                // AO stays computed (reuse_ao = false). Image-identical.
+                var known_dark = vec2<f32>(0.0, 0.0);
+                under_col = shade(under, refr_origin, refr_dir, jit, true, false, false, &known_dark, vec3<f32>(0.0));
+            }
+        } else {
+            under_col = sky(refr_dir) * 0.6;
+        }
+        // Beer-Lambert absorption — red and green are eaten faster than blue.
+        depth = max(0.0, under.t_hit);
     }
-    // Beer-Lambert absorption — red and green are eaten faster than blue.
-    let depth = max(0.0, under.t_hit);
     let absorb = vec3<f32>(0.55, 0.25, 0.10); // per-unit-distance attenuation
     let transmittance = exp(-absorb * depth);
     // Water tint modulated by ambient + a bit of sun colour, so the water
@@ -2649,7 +2984,11 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     let h = normalize(s - dir);
     let spec = pow(max(0.0, dot(n, h)), 256.0);
     var shadow = 0.0;
-    if (sun_intensity(s) > 0.0 && dot(n, s) > 0.0) {
+    // Glint gate: the pow-256 highlight covers a few percent of water pixels,
+    // yet every pixel traced this shadow ray. Below spec 0.002 the composite
+    // contribution (sc * spec * 1.4 <= ~0.004) is under one colour LSB -
+    // skipping the trace there is invisible by bound.
+    if (spec > 0.002 && sun_intensity(s) > 0.0 && dot(n, s) > 0.0) {
         // The hit sits inside the water cell (plate below the cube top), and
         // water voxels count as solid for trace_any — a shadow ray from p_hit
         // would self-occlude. Lift the origin to just above the cell's top
@@ -2662,8 +3001,8 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     // The closer the underwater hit, the brighter the white foam contribution.
     // Wave-crest noise modulates so foam looks like spray, not a flat ring.
     var foam = 0.0;
-    if (under.hit && under.t_hit < 1.6) {
-        let shore = 1.0 - clamp(under.t_hit / 1.6, 0.0, 1.0);
+    if (under_hit && under_t < 1.6) {
+        let shore = 1.0 - clamp(under_t / 1.6, 0.0, 1.0);
         // Crest-driven ONLY (no constant term): calm shallow water - a
         // filling pool, a thin lake - must NOT foam. Froth appears only
         // where a positive wave crest breaks over the shallow bottom, so
@@ -2689,7 +3028,7 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     // sun tint, at noon it's bright white, at night it fades into ambient.
     let foam_col = ambient_color() * 1.5 + sc * 0.50;
     col = mix(col, foam_col, foam);
-    let fog_t = clamp(hit.t_hit / 280.0, 0.0, 0.85);
+    let fog_t = fog_amount(hit.t_hit);
     return mix(col, fog_atmospheric(dir), fog_t);
 }
 
@@ -2753,9 +3092,11 @@ fn blended_palette(p_hit: vec3<f32>, voxel: vec3<i32>, m: u32) -> vec3<f32> {
 // Pulled in from 120 so fewer pixels pay for GI (perf).
 const GI_MAX_T: f32 = 90.0;
 
+
 fn shade(
     hit: Hit, origin: vec3<f32>, dir: vec3<f32>, pix_jit: f32,
-    reuse_light: bool, light: ptr<function, vec2<f32>>, indirect: vec3<f32>,
+    reuse_shadow: bool, reuse_ao: bool, blend_shadow: bool,
+    light: ptr<function, vec2<f32>>, indirect: vec3<f32>,
 ) -> vec3<f32> {
     let p_hit = origin + dir * hit.t_hit;
     // Terrain top faces near the camera cross-fade their palette colour into
@@ -2782,20 +3123,16 @@ fn shade(
     let skip_ao = hit.last_axis < 0 || hit.t_hit > AO_DIST
         || is_leaf_block_mat(hit.mat) || hit.mat == MAT_LEAF_FRINGE;
     var ao: f32;
-    if (reuse_light) { ao = (*light).y; }
+    if (reuse_ao) { ao = (*light).y; }
     else {
         ao = select(compute_ao(hit, origin, dir), 1.0, skip_ao);
-        // Sky-access: attenuate the skylight ambient by how much open sky
-        // this surface can actually reach, so caves, sealed rooms and water
-        // under a roof go dark (the engine has no GI, so ambient is
-        // otherwise applied in full everywhere). Folded into ao, so it rides
-        // the light cache. Restricted to SOLID cube faces (last_axis >= 0):
-        // sub-voxel foliage cards are dense and already carry canopy AO, so
-        // paying a ray per leaf pixel is not worth it. Skipped far away
-        // where fog hides it.
-        if (hit.last_axis >= 0 && hit.t_hit < 200.0) {
-            ao = ao * sky_access(p_hit, hit.normal);
-        }
+        // NOTE: the old sky_access() hack (a straight-up + 4 side shadow rays to
+        // fake sky occlusion) is GONE. The sky is not a hard overhead light - it
+        // is the sun scattered by the atmosphere, a dim diffuse area source. The
+        // world-space probe GI models exactly that: it integrates the sun-lit sky
+        // over the whole hemisphere, so under-canopy goes softly dim without the
+        // harsh straight-down leaf shadows sky_access projected. Only geometric
+        // contact AO (compute_ao) remains here.
     }
 
     // ---- swaying foliage ----
@@ -2819,8 +3156,8 @@ fn shade(
             (p_hit.z - wd.y * t * 2.2) * 0.9,
             t * 0.8,
         )) * 2.0 - 1.0;
-        let amp = select(0.35, 0.45, hit.mat == MAT_FLOWER || hit.mat == MAT_TALL_GRASS
-                                   || hit.mat == MAT_TALL_GRASS_DRY);
+        let amp = select(0.0, 0.0, hit.mat == MAT_FLOWER || hit.mat == MAT_TALL_GRASS
+                                   || hit.mat == MAT_TALL_GRASS_DRY); // EXPERIMENT: flutter off
         n.x += sway * amp;
         n.z += sway * amp * 0.7;
         n = normalize(n);
@@ -2844,7 +3181,7 @@ fn shade(
         n_dot_l = mix(n_dot_l, max(0.0, s.y), 0.45);
     }
     var shadow_term = 0.0;
-    if (reuse_light) {
+    if (reuse_shadow) {
         shadow_term = (*light).x;
     } else if (n_dot_l > 0.0 && s_int > 0.0) {
         // ONE jittered shadow ray (was 2). The per-pixel + per-frame jitter
@@ -2853,6 +3190,12 @@ fn shade(
         // Shadows are the single most expensive per-pixel term, so this is the
         // biggest shading win.
         let golden = 2.39996323; // 137.5° in radians
+        // One wide penumbra cone in ALL states: with the lighting cache now
+        // reprojecting during motion, a traced sample persists across frames
+        // (only the staleness dither refreshes it), so fresh samples are sparse
+        // and the accumulated soft look stays consistent moving or still. A
+        // state-switched cone made shadows visibly change character on
+        // stop/start.
         let cone = 0.07;
         let theta = pix_jit * golden;
         let radius = cone * sqrt(pix_jit * 0.5);
@@ -2867,8 +3210,16 @@ fn shade(
         let ss = normalize(s + off);
         shadow_term = select(0.0, 1.0, !shadow_occluded(p_off, ss, SHADOW_MAX_DIST));
     }
-    // Hand the freshly-computed terms back so the caller can cache them.
-    if (!reuse_light) { *light = vec2<f32>(shadow_term, ao); }
+    // Sun-staleness refresh: the sun moved a hair, so the TRUE change is a
+    // penumbra edge sweeping - fade toward the fresh sample instead of letting
+    // the binary trace flip outright (single-pixel pops read as "little
+    // shadows jumping around"). Converges in 2-3 refreshes (~0.3-0.9 s), the
+    // physical sweep speed.
+    if (blend_shadow) {
+        shadow_term = mix(shadow_term, (*light).x, 0.6);
+    }
+    // Hand the (fresh or reused) terms back so the caller re-caches them.
+    *light = vec2<f32>(shadow_term, ao);
 
     let direct = sun_color(s) * (n_dot_l * shadow_term);
     let ambient = ambient_color() * ao;
@@ -2876,7 +3227,7 @@ fn shade(
     // cs_main for the RT variant; 0 for software and for secondary rays).
     let lit = base * (direct + ambient + indirect);
 
-    let fog_t = clamp(hit.t_hit / 280.0, 0.0, 0.85);
+    let fog_t = fog_amount(hit.t_hit);
     return mix(lit, fog_atmospheric(dir), fog_t);
 }
 
@@ -2897,7 +3248,7 @@ fn shade_glass(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     let refl_hit = trace(refl_origin, refl_dir);
     var refl_col: vec3<f32>;
     if (refl_hit.hit) {
-        refl_col = shade(refl_hit, refl_origin, refl_dir, jit, false, &no_cache, vec3<f32>(0.0));
+        refl_col = shade(refl_hit, refl_origin, refl_dir, jit, false, false, false, &no_cache, vec3<f32>(0.0));
     } else {
         refl_col = sky(refl_dir);
     }
@@ -2918,7 +3269,7 @@ fn shade_glass(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     // Total internal reflection on any channel → fall back to the reflection.
     let tir = length(refr_dir_g) < 0.01;
     if (tir) {
-        let fog_t = clamp(hit.t_hit / 280.0, 0.0, 0.85);
+        let fog_t = fog_amount(hit.t_hit);
         return mix(refl_col, fog_atmospheric(dir), fog_t);
     }
     if (length(refr_dir_r) < 0.01) { refr_dir_r = refr_dir_g; }
@@ -2928,20 +3279,20 @@ fn shade_glass(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     var glass_col: vec3<f32>;
     if (cos_theta_pre > 0.92) {
         // Near head-on: dispersion invisible — single trace, save 2/3 cost.
-        let under = trace_no_water(refr_origin, refr_dir_g);
+        let under = trace_secondary(refr_origin, refr_dir_g, SECONDARY_MAX_T);
         var under_col: vec3<f32>;
-        if (under.hit) { under_col = shade(under, refr_origin, refr_dir_g, jit, false, &no_cache, vec3<f32>(0.0)); }
+        if (under.hit) { under_col = shade(under, refr_origin, refr_dir_g, jit, false, false, false, &no_cache, vec3<f32>(0.0)); }
         else { under_col = sky(refr_dir_g); }
         let depth = max(0.0, under.t_hit);
         let tint = vec3<f32>(0.05, 0.02, 0.02) * depth;
         glass_col = under_col * exp(-tint);
     } else {
-        let ur = trace_no_water(refr_origin, refr_dir_r);
-        let ug = trace_no_water(refr_origin, refr_dir_g);
-        let ub = trace_no_water(refr_origin, refr_dir_b);
-        var cr = select(sky(refr_dir_r).r, shade(ur, refr_origin, refr_dir_r, jit, false, &no_cache, vec3<f32>(0.0)).r, ur.hit);
-        var cg = select(sky(refr_dir_g).g, shade(ug, refr_origin, refr_dir_g, jit, false, &no_cache, vec3<f32>(0.0)).g, ug.hit);
-        var cb = select(sky(refr_dir_b).b, shade(ub, refr_origin, refr_dir_b, jit, false, &no_cache, vec3<f32>(0.0)).b, ub.hit);
+        let ur = trace_secondary(refr_origin, refr_dir_r, SECONDARY_MAX_T);
+        let ug = trace_secondary(refr_origin, refr_dir_g, SECONDARY_MAX_T);
+        let ub = trace_secondary(refr_origin, refr_dir_b, SECONDARY_MAX_T);
+        var cr = select(sky(refr_dir_r).r, shade(ur, refr_origin, refr_dir_r, jit, false, false, false, &no_cache, vec3<f32>(0.0)).r, ur.hit);
+        var cg = select(sky(refr_dir_g).g, shade(ug, refr_origin, refr_dir_g, jit, false, false, false, &no_cache, vec3<f32>(0.0)).g, ug.hit);
+        var cb = select(sky(refr_dir_b).b, shade(ub, refr_origin, refr_dir_b, jit, false, false, false, &no_cache, vec3<f32>(0.0)).b, ub.hit);
         let depth_g = max(0.0, ug.t_hit);
         let tint = vec3<f32>(0.05, 0.02, 0.02) * depth_g;
         glass_col = vec3<f32>(cr, cg, cb) * exp(-tint);
@@ -2952,7 +3303,7 @@ fn shade_glass(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     let h_vec = normalize(s - dir);
     let spec = pow(max(0.0, dot(n, h_vec)), 200.0);
     var shadow = 0.0;
-    if (sun_intensity(s) > 0.0 && dot(n, s) > 0.0) {
+    if (spec > 0.002 && sun_intensity(s) > 0.0 && dot(n, s) > 0.0) {
         shadow = select(1.0, 0.0, shadow_occluded(refl_origin, s, SHADOW_MAX_DIST));
     }
 
@@ -2960,7 +3311,7 @@ fn shade_glass(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     let f0 = 0.04;
     let fresnel = f0 + (1.0 - f0) * pow(1.0 - cos_theta, 5.0);
 
-    let fog_t = clamp(hit.t_hit / 280.0, 0.0, 0.85);
+    let fog_t = fog_amount(hit.t_hit);
     let combined = mix(glass_col, refl_col, fresnel) + sc * spec * shadow * 1.2;
     return mix(combined, fog_atmospheric(dir), fog_t);
 }
@@ -2972,22 +3323,48 @@ fn shade_glass(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
 // Slab must stay inside the world's vertical extent (Y = 256, 64 bricks
 // of 4) so rays under a cloud that also cross terrain keep a consistent
 // depth story; 165..235 leaves headroom for the tower tops.
-const CLOUD_BASE: f32 = 165.0;
-const CLOUD_TOP:  f32 = 235.0;
+const CLOUD_BASE: f32 = 190.0;
+const CLOUD_TOP:  f32 = 290.0;
 
 fn render_clouds(origin: vec3<f32>, dir: vec3<f32>, t_terrain: f32, pix: vec2<f32>) -> vec4<f32> {
-    // Slab intersection. A horizontal ray (|dir.y| ~ 0) gets nothing because
-    // the slab is thin compared to the marchable distance.
-    if (abs(dir.y) < 1e-3) { return vec4<f32>(0.0); }
-    let inv_dy = 1.0 / dir.y;
-    var t_in  = (CLOUD_BASE - origin.y) * inv_dy;
-    var t_out = (CLOUD_TOP  - origin.y) * inv_dy;
-    if (t_in > t_out) { let tmp = t_in; t_in = t_out; t_out = tmp; }
+    // Slab intersection. A horizontal ray (|dir.y| ~ 0) is parallel to the
+    // slab: OUTSIDE it never enters; INSIDE it stays in cloud for the whole
+    // marchable range. (The old unconditional early-out here carved a dark
+    // horizon line straight through the clouds when flying inside them.)
+    var t_in: f32;
+    var t_out: f32;
+    if (abs(dir.y) < 1e-3) {
+        if (origin.y < CLOUD_BASE || origin.y > CLOUD_TOP) { return vec4<f32>(0.0); }
+        t_in = 0.0;
+        t_out = 1.0e9;
+    } else {
+        let inv_dy = 1.0 / dir.y;
+        t_in  = (CLOUD_BASE - origin.y) * inv_dy;
+        t_out = (CLOUD_TOP  - origin.y) * inv_dy;
+        if (t_in > t_out) { let tmp = t_in; t_in = t_out; t_out = tmp; }
+    }
     let t_start = max(t_in, 0.0);
     let t_end   = min(t_out, t_terrain);
     if (t_end <= t_start + 0.5) { return vec4<f32>(0.0); }
+    // Clamp the march to the STREAMED world window in XZ: clouds otherwise
+    // hang over the unrendered void past the window edge, flagging exactly
+    // where the world ends. Hidden there, the sky fades to horizon haze the
+    // same way the missing terrain does.
+    // Inflated by half the window span per side: clouds reach out to DOUBLE
+    // the distance the streamed world does, then stop (no clouds over the
+    // deep void, but no hard cut at the exact terrain edge either).
+    let wspan = vec2<f32>(f32(WORLD_VOXELS_X), f32(WORLD_VOXELS_Z));
+    let wmin = vec2<f32>(f32(camera.world_origin.x), f32(camera.world_origin.z)) - wspan * 0.5;
+    let wmax = wmin + wspan * 2.0;
+    var t_win = 1.0e9;
+    if (abs(dir.x) > 1e-5) {
+        t_win = min(t_win, max((wmin.x - origin.x) / dir.x, (wmax.x - origin.x) / dir.x));
+    }
+    if (abs(dir.z) > 1e-5) {
+        t_win = min(t_win, max((wmin.y - origin.z) / dir.z, (wmax.y - origin.z) / dir.z));
+    }
     // Distance-clamp the slab — beyond this clouds blend into atmospheric fog.
-    let t_far_clamp = min(t_end, t_start + 600.0);
+    let t_far_clamp = min(t_end, min(t_start + 600.0, t_win));
 
     let s = sun_dir();
     let sc = sun_color(s);
@@ -2996,8 +3373,10 @@ fn render_clouds(origin: vec3<f32>, dir: vec3<f32>, t_terrain: f32, pix: vec2<f3
     // temporally accumulates the result on a static camera, so the lower
     // per-frame sample count is upsampled over time instead of in one frame
     // (checklist: clouds at reduced res + temporal upsample).
-    // 8 steps: the tower-height slab (70 units) at 6 was visibly banded.
-    let N: i32 = 8;
+    // 16 steps: the worley florets (~30 voxels) need finer sampling than the
+    // slab-scale march that covered smooth clouds - undersampled florets read
+    // as rough lines instead of round masses. Half-res keeps this cheap.
+    let N: i32 = 16;
     let step_t = (t_far_clamp - t_start) / f32(N);
     // Per-frame time-varying jitter, averaged by TAA into a smooth march.
     // History: this was once time-varying, then made spatial-only because
@@ -3027,16 +3406,19 @@ fn render_clouds(origin: vec3<f32>, dir: vec3<f32>, t_terrain: f32, pix: vec2<f3
     for (var i: i32 = 0; i < N; i = i + 1) {
         let t = t_start + (f32(i) + h) * step_t;
         let p = origin + dir * t;
-        let d = cloud_density(p, camera.time);
+        let d = cloud_density(p, camera.sun_time);
         if (d < 0.01) { continue; }
 
-        // 2 cone samples toward the sun for self-shadowing (TAA accumulates).
+        // 3 NON-UNIFORM jittered cone samples toward the sun: two same-spaced
+        // taps quantize the self-shadow into iso-bands that crawl with the
+        // camera ("shadow lines across the clouds"); staggered distances plus
+        // the per-frame jitter break the banding, and the near tap keeps the
+        // floret-scale contrast that makes lobes read as volumetric balls.
         var sun_dens: f32 = 0.0;
-        for (var j: i32 = 1; j <= 2; j = j + 1) {
-            let pj = p + s * f32(j) * 9.0;
-            sun_dens = sun_dens + cloud_density(pj, camera.time);
-        }
-        let sun_t = exp(-sun_dens * 0.85);
+        sun_dens = sun_dens + cloud_density(p + s * ((h - 0.5) * 2.0 + 3.5), camera.sun_time);
+        sun_dens = sun_dens + cloud_density(p + s * ((h - 0.5) * 3.0 + 8.0), camera.sun_time);
+        sun_dens = sun_dens + cloud_density(p + s * ((h - 0.5) * 5.0 + 14.0), camera.sun_time);
+        let sun_t = exp(-sun_dens * 0.60);
         let local_col = ambient + sc * sun_t * phase;
 
         let sample_t = exp(-d * step_t * 0.14);
@@ -3063,20 +3445,19 @@ fn phase_hg(cos_th: f32, g: f32) -> f32 {
 // "halo gets brighter as you look closer to the sun" falloff. IGN jitter is
 // reused so adjacent pixels get well-distributed offsets — important for
 // noise that the temporal-differential pass can average away.
-fn god_rays(origin: vec3<f32>, dir: vec3<f32>, t_far: f32, pix: vec2<f32>) -> vec3<f32> {
+// Occlusion fraction of the god-ray march (0 = fully shadowed shafts, 1 =
+// clear path). Computed at HALF RESOLUTION by cs_godrays - the shadow_occluded
+// march is the priciest per-pixel term in compose - and upsampled per full-res
+// pixel with exact per-pixel colour/phase terms.
+fn god_ray_frac(origin: vec3<f32>, dir: vec3<f32>, t_far: f32, pix: vec2<f32>) -> f32 {
     let s = sun_dir();
-    let s_int = sun_intensity(s);
-    if (s_int <= 0.0) { return vec3<f32>(0.0); }
-    let cos_sun = dot(dir, s);
-    // Normalize HG phase to a 0..~1 scale at g=0.7 — peak ≈ 0.65 forward, ≈ 0.014 back.
-    let phase = phase_hg(cos_sun, 0.7) * 4.0;
-    if (phase < 0.05) { return vec3<f32>(0.0); }
-
+    if (sun_intensity(s) <= 0.0) { return 0.0; }
+    let phase = phase_hg(dot(dir, s), 0.7) * 4.0;
+    if (phase < 0.05) { return 0.0; }
     let t_max = min(t_far, 140.0);
-    if (t_max <= 1.0) { return vec3<f32>(0.0); }
-    // Sample count scales with phase — looking right at the sun gets denser
+    if (t_max <= 1.0) { return 0.0; }
+    // Sample count scales with phase - looking right at the sun gets denser
     // sampling for a smooth halo; off-axis stays cheap.
-    // Reduced step count; TAA accumulates the god-ray term across frames.
     let N: i32 = select(3, 6, phase > 0.40);
     let step_t = t_max / f32(N);
     let h = ign(pix.x, pix.y, camera.time * 60.0);
@@ -3084,15 +3465,36 @@ fn god_rays(origin: vec3<f32>, dir: vec3<f32>, t_far: f32, pix: vec2<f32>) -> ve
     for (var i: i32 = 0; i < N; i = i + 1) {
         let t = (f32(i) + h) * step_t;
         let p = origin + dir * t;
-        // God-ray shafts only need NEARBY occluders — a short occlusion cap lets
+        // God-ray shafts only need NEARBY occluders - a short occlusion cap lets
         // the hierarchical trace bail out far sooner than a full shadow ray.
         if (!shadow_occluded(p + s * 0.5, s, GOD_RAY_OCCL_DIST)) {
             // Distance-weighted contribution: nearer scatter looks brighter.
             sum = sum + exp(-t * 0.008);
         }
     }
-    let frac = sum / f32(N);
-    return sun_color(s) * frac * phase * 0.22 * s_int;
+    return sum / f32(N);
+}
+
+// Half-res god-ray pass: one occlusion march per 2x2 block, written (with the
+// source depth for the bilateral upsample) into the TAIL of transp_buf - the
+// per-pixel transparent records there were already consumed by cs_transparent
+// this frame, so the scratch reuse needs no extra binding. Runs between
+// cs_transparent and cs_compose.
+@compute @workgroup_size(8, 8, 1)
+fn cs_godrays(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let res = vec2<i32>(camera.resolution);
+    let half_res = (res + vec2<i32>(1)) / 2;
+    if (i32(gid.x) >= half_res.x || i32(gid.y) >= half_res.y) { return; }
+    let px = min(vec2<i32>(i32(gid.x) * 2, i32(gid.y) * 2), res - vec2<i32>(1));
+    let t_hit = textureLoad(depth_in, px, 0).r;
+    let uv = (vec2<f32>(px) + vec2<f32>(1.0)) / camera.resolution;
+    let dir = ray_dir_uv(uv);
+    let frac = god_ray_frac(camera.origin, dir, min(t_hit, 200.0),
+                            vec2<f32>(f32(px.x), f32(px.y)));
+    // Scratch tail lives BEYOND the per-pixel records (disjoint by
+    // construction - records persist across frames under tile-gating).
+    let hidx = res.x * res.y + i32(gid.y) * half_res.x + i32(gid.x);
+    transp_buf[hidx] = vec4<u32>(bitcast<u32>(frac), bitcast<u32>(t_hit), 0u, 0u);
 }
 
 // Stripped-down DDA — same hierarchy as `trace()` but returns the moment we
@@ -3113,7 +3515,10 @@ fn shadow_voxel_occludes(voxel: vec3<i32>, m: u32, t_cur: f32, origin: vec3<f32>
         // tuft is 90% air and blocking it as a solid cube stamps a square shadow
         // per tuft across every meadow, so far decorations don't block.
         if (t_cur <= FOLIAGE_NEAR_T) {
-            return foliage_subvoxel(voxel, origin, dir, m).hit;
+            shadow_wind_freeze = true;
+            let occ = foliage_subvoxel(voxel, origin, dir, m).hit;
+            shadow_wind_freeze = false;
+            return occ;
         }
         return false;
     }
@@ -3121,7 +3526,10 @@ fn shadow_voxel_occludes(voxel: vec3<i32>, m: u32, t_cur: f32, origin: vec3<f32>
         // Leaves: far canopies block as solid cubes (they really are dense);
         // near ones pay the cutout test.
         if (t_cur > FOLIAGE_NEAR_T) { return true; }
-        return foliage_subvoxel(voxel, origin, dir, m).hit;
+        shadow_wind_freeze = true;
+        let occ = foliage_subvoxel(voxel, origin, dir, m).hit;
+        shadow_wind_freeze = false;
+        return occ;
     }
     return true;
 }
@@ -3197,37 +3605,6 @@ fn trace_any(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> bool {
 // bilinear-interpolate. Each corner samples 3 neighbours (two side voxels
 // and the diagonal) — classic "Minecraft" AO formula, but every lookup is a
 // hierarchical bit test rather than a struct fetch.
-const SKY_ACCESS_DIST: f32 = 48.0;
-
-// Fraction of the upper hemisphere from which open sky is reachable. The
-// engine has no global illumination, so every surface otherwise receives
-// the FULL skylight ambient regardless of whether the sky can reach it -
-// which is why a sealed room, a cave, or water under a roof stays lit
-// instead of going dark. Trace five FIXED rays (no jitter, TAA-stable)
-// toward the sky; the fraction that escape without hitting terrain within
-// SKY_ACCESS_DIST scales the ambient. Rays escape through open air in a
-// few hierarchical steps, or hit a roof immediately, so it is cheap in
-// both the open and the enclosed case. Floored at 0.03 so a fully-sealed
-// space is near-black, not a flat 0 (keeps a hint of surface detail).
-fn sky_access(p: vec3<f32>, n: vec3<f32>) -> f32 {
-    // How open the upper hemisphere is. Open sky directly overhead ->
-    // outdoors, fully lit (the common case, ONE ray via the early-out).
-    // If a roof blocks straight up, sample four upper-side rays: a covered
-    // spot with open SIDES still gets indirect skylight and reads DIM, not
-    // black - only a space sealed on every side goes near-black. (This
-    // still misses light bouncing in through a LOW opening; the correct
-    // mechanism is a propagated per-voxel sky-light field, O(1) and
-    // bounce-aware - noted as the scalable upgrade.)
-    let o = p + n * 0.02;
-    if (!shadow_occluded(o, vec3<f32>(0.0, 1.0, 0.0), SKY_ACCESS_DIST)) { return 1.0; }
-    var open = 0.0;
-    let c = 0.643; let e = 0.766;
-    if (!shadow_occluded(o, vec3<f32>( e, c, 0.0), SKY_ACCESS_DIST)) { open += c; }
-    if (!shadow_occluded(o, vec3<f32>(-e, c, 0.0), SKY_ACCESS_DIST)) { open += c; }
-    if (!shadow_occluded(o, vec3<f32>(0.0, c,  e), SKY_ACCESS_DIST)) { open += c; }
-    if (!shadow_occluded(o, vec3<f32>(0.0, c, -e), SKY_ACCESS_DIST)) { open += c; }
-    return max(open / (1.0 + 4.0 * c), 0.04);
-}
 
 fn compute_ao(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> f32 {
     let p_hit = origin + dir * hit.t_hit;
@@ -3314,6 +3691,11 @@ const TILE_LOD_T: f32 = 520.0;
 // terrain) and so empty rays don't waste steps. Comfortably covers the loaded
 // window (the camera sits at its centre).
 const MAX_RAY_DIST: f32 = 700.0;
+// Secondary rays (water reflection/refraction, glass) stop here: fog is 41%
+// by 200 and the fresnel-weighted reflection of far geometry is
+// indistinguishable from the sky it fades into - while traversal cost scales
+// with range. Applied identically to the software and RT secondary paths.
+const SECONDARY_MAX_T: f32 = 200.0;
 
 // Beyond this distance, sub-voxel foliage (sprite cross-quads, leaf cutout
 // faces) is treated as a solid cube rather than ray-marched. Authored-sprite
@@ -3334,6 +3716,78 @@ const AO_DIST: f32 = 64.0;
 // God-ray occlusion cap: shafts only need nearby occluders, so the per-step
 // occlusion test bails out much sooner than a full-length shadow ray.
 const GOD_RAY_OCCL_DIST: f32 = 160.0;
+
+// Resolve ONE solid voxel the primary ray reached: decide whether it is a real
+// visible hit and, if so, fill `out`. Shared by the software DDA (trace) and the
+// hardware-RT primary (trace_rt) so both render leaves/decoration cutouts, water
+// sub-voxel surfaces and opaque cubes IDENTICALLY. `en_*` is the entry face
+// (from entry_normal_and_t), `entry_last_axis` the cube last_axis, `t_exit_cell`
+// the cell exit t. Returns false when the ray should keep going (cutout miss,
+// far decoration, above the water patch).
+// The single source of truth for "this voxel resolves to a plain opaque cube at
+// this distance" - i.e. none of the sub-voxel branches below fire. Used both by
+// resolve_solid_voxel (its opaque case) and by the RT primary's fast path, which
+// takes the cube hit directly and skips the slot/brick-pos setup + this call when
+// the answer is already a cube (the ~90% opaque-pixel case). Glass counts as an
+// opaque cube here: the cube face is the primary hit, refraction is a shade pass.
+fn resolves_as_opaque_cube(m: u32, t_cur: f32) -> bool {
+    return !(is_foliage_mat(m) && t_cur <= FOLIAGE_NEAR_T)
+        && !is_decoration_mat(m)
+        && !(is_water_mat(m) && t_cur <= WATER_FAR_T);
+}
+
+fn resolve_solid_voxel(voxel: vec3<i32>, m: u32, slot_v: vec3<i32>, bp: vec3<i32>, bi: i32,
+                       t_cur: f32, origin: vec3<f32>, dir: vec3<f32>,
+                       en_n: vec3<f32>, en_t: f32, entry_last_axis: i32, t_exit_cell: f32,
+                       out: ptr<function, Hit>) -> bool {
+    // Opaque cube (the common case): entry face + t straight through.
+    if (resolves_as_opaque_cube(m, t_cur)) {
+        (*out).hit = true;
+        (*out).mat = m;
+        (*out).normal = en_n;
+        (*out).voxel = voxel;
+        (*out).last_axis = entry_last_axis;
+        (*out).t_hit = en_t;
+        return true;
+    }
+    // Near foliage/decoration: per-blade procedural cutout. Far foliage falls to
+    // the opaque cube branch (canopies survive); far decoration is invisible.
+    if (is_foliage_mat(m) && t_cur <= FOLIAGE_NEAR_T) {
+        let fh = foliage_subvoxel(voxel, origin, dir, m);
+        if (fh.hit) {
+            (*out).hit = true;
+            (*out).mat = m;
+            (*out).normal = fh.normal;
+            (*out).voxel = voxel;
+            (*out).last_axis = axis_from_face_normal(fh.normal);
+            (*out).t_hit = fh.t_hit;
+            var tint = fh.color_tint;
+            if ((is_leaf_block_mat(m) || m == MAT_LEAF_FRINGE) && fh.t_hit < AO_DIST) {
+                tint = tint * leaf_canopy_ao(voxel, slot_v, bp, bi);
+            }
+            (*out).tint = tint;
+            return true;
+        }
+        return false; // cutout missed
+    }
+    if (is_decoration_mat(m)) {
+        return false; // far decoration invisible
+    }
+    // The only remaining case is near water (resolves_as_opaque_cube ruled out
+    // opaque, foliage and decoration above).
+    let wh = water_subvoxel(voxel, origin, dir, m, en_n, en_t, t_exit_cell, slot_v, bp, bi);
+    if (wh.hit) {
+        (*out).hit = true;
+        (*out).mat = m;
+        (*out).normal = wh.normal;
+        (*out).voxel = voxel;
+        (*out).last_axis = -1; // sub-voxel hit (water is always deferred)
+        (*out).t_hit = wh.t_hit;
+        water_grad_rest = wh.grad_rest;
+        return true;
+    }
+    return false; // ray passed above the patch
+}
 
 fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
     water_grad_rest = vec2<f32>(0.0);
@@ -3499,65 +3953,14 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
         let vi = brick_voxel_idx(local.x, local.y, local.z);
         if (brick_voxel_solid(bi, vi)) {
             let m = brick_voxel_material(bi, vi);
-            // Near foliage gets the full per-blade procedural cutout. Far
-            // foliage: leaves become solid cubes (the else branch) so canopies
-            // survive, but ground decoration (flowers / tall grass) is skipped
-            // entirely — drawing it as a solid cube is the "pink blocks" bug.
-            if (is_foliage_mat(m) && t_cur <= FOLIAGE_NEAR_T) {
-                let fh = foliage_subvoxel(voxel, origin, dir, m);
-                if (fh.hit) {
-                    out.hit = true;
-                    out.mat = m;
-                    out.normal = fh.normal;
-                    out.voxel = voxel;
-                    // Leaf cutout hits are stable cube faces (axis >= 0): they
-                    // get cube AO + the lighting cache. Cross-quad sprites
-                    // return oblique normals -> -1, as before.
-                    out.last_axis = axis_from_face_normal(fh.normal);
-                    out.t_hit = fh.t_hit;
-                    var tint = fh.color_tint;
-                    // Canopy occupancy AO (primary rays only - shadow rays
-                    // must not pay for it). Tuft quads previously had ZERO
-                    // occlusion; cube faces switch from the generic cube AO,
-                    // which counted the invisible fringe shell as solid.
-                    if ((is_leaf_block_mat(m) || m == MAT_LEAF_FRINGE) && fh.t_hit < AO_DIST) {
-                        tint = tint * leaf_canopy_ao(voxel, slot_v, bp, bi);
-                    }
-                    out.tint = tint;
-                    return out;
-                }
-                // cutout missed → fall through to the DDA step below.
-            } else if (is_decoration_mat(m)) {
-                // Far decoration → invisible; fall through to the DDA step.
-            } else if (is_water_mat(m) && t_cur <= WATER_FAR_T) {
-                // Near water: sub-voxel patch surface. A miss means the ray
-                // passed above the patch — keep stepping.
-                let en = entry_normal_and_t(last_axis, step, t_max, t_delta, t_enter, tmin3);
-                let t_exit_cell = min(t_max.x, min(t_max.y, t_max.z));
-                let wh = water_subvoxel(voxel, origin, dir, m, en.n, en.t_hit, t_exit_cell,
-                                        slot_v, bp, bi);
-                if (wh.hit) {
-                    out.hit = true;
-                    out.mat = m;
-                    out.normal = wh.normal;
-                    out.voxel = voxel;
-                    out.last_axis = -1; // sub-voxel hit (water is always deferred)
-                    out.t_hit = wh.t_hit;
-                    water_grad_rest = wh.grad_rest;
-                    return out;
-                }
-            } else {
-                let en = entry_normal_and_t(last_axis, step, t_max, t_delta, t_enter, tmin3);
-                let n = en.n;
-                let t_hit = en.t_hit;
-                out.hit = true;
-                out.mat = m;
-                out.normal = n;
-                out.voxel = voxel;
-                out.last_axis = last_axis_after_entry(last_axis, tmin3);
-                out.t_hit = t_hit;
+            let en = entry_normal_and_t(last_axis, step, t_max, t_delta, t_enter, tmin3);
+            let t_exit_cell = min(t_max.x, min(t_max.y, t_max.z));
+            let ela = last_axis_after_entry(last_axis, tmin3);
+            if (resolve_solid_voxel(voxel, m, slot_v, bp, bi, t_cur, origin, dir,
+                                    en.n, en.t_hit, ela, t_exit_cell, &out)) {
                 return out;
             }
+            // cutout / far-decoration / above-water miss -> keep stepping.
         }
 
         dda_step(&voxel, &slot_v, &t_max, &t_cur, &last_axis, step, t_delta);

@@ -53,3 +53,9 @@ png = "0.17"
 [[bench]]
 name = "trace"
 harness = false
+
+# TEMP: local wgpu fork with the acceleration-structure scratch-buffer cache
+# (prepared upstream PR); remove when the PR lands upstream.
+[patch."https://github.com/gfx-rs/wgpu"]
+wgpu = { path = "/home/parrot/wgpu-contrib/wgpu" }
+naga = { path = "/home/parrot/wgpu-contrib/naga" }

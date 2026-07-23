@@ -27,11 +27,14 @@ fn gi_trace(o: vec3<f32>, dir: vec3<f32>, hv: ptr<function, vec3<i32>>,
         let c = rayQueryGetCandidateIntersection(&rq);
         if (c.kind == RAY_QUERY_INTERSECTION_AABB) {
             let bi = i32(rt_brick_map[c.primitive_index]);
+            if (!rt_brick_active(bi)) { continue; }
             let a = rt_aabbs[c.primitive_index];
             let bmin = vec3<f32>(a.min_x, a.min_y, a.min_z);
             var fv = vec3<i32>(0);
             var fnrm = vec3<i32>(0);
-            let t = resolve_brick(bi, bmin, o, dir, 0.0, best_t, &fv, &fnrm);
+            // GI rays see through water/glass (same contract as the probe
+            // gather in gi_probes.wgsl).
+            let t = resolve_brick(bi, bmin, o, dir, 0.0, best_t, true, &fv, &fnrm);
             if (t >= 0.0) {
                 rayQueryGenerateIntersection(&rq, t);
                 if (t < best_t) {
@@ -114,15 +117,27 @@ fn rt_gather_indirect(p: vec3<f32>, n: vec3<f32>, seed: f32) -> vec3<f32> {
 // one-bounce indirect, so RT still matches the software frame there.
 override GI_ENABLE: f32 = 1.0;
 
+// 1 = sample the world-space irradiance probe cache (O(1)/pixel, converges in the
+// probes, works while moving); 0 = the legacy per-pixel bounce ray + screen-space
+// temporal reproject. The game runs probe mode; the A/B harness flips it.
+override GI_PROBE_MODE: f32 = 1.0;
+
 // Accumulated one-bounce indirect at world point `p` (surface normal `n`) for
 // output pixel `px`, hit distance `t`. Traces ONE fresh bounce this frame and
 // blends it with the reprojected previous-frame value.
-fn indirect_light(p: vec3<f32>, n: vec3<f32>, seed: f32, px: vec2<i32>, t: f32) -> vec3<f32> {
+fn indirect_light(p: vec3<f32>, n: vec3<f32>, seed: f32, px: vec2<i32>, t: f32, v: vec3<f32>) -> vec3<f32> {
     if (GI_ENABLE < 0.5 || t >= GI_MAX_T) {
         textureStore(gi_out, px, vec4<f32>(0.0));
         return vec3<f32>(0.0);
     }
     let fade = 1.0 - smoothstep(GI_MAX_T * 0.6, GI_MAX_T, t);
+    // Probe cache: one cheap trilinear sample, no per-pixel ray or reproject
+    // (the probes carry the temporal accumulation and are motion-invariant).
+    if (GI_PROBE_MODE > 0.5) {
+        let gi = sample_probes(p, n, v) * (GI_STRENGTH * fade);
+        textureStore(gi_out, px, vec4<f32>(gi, 1.0));
+        return gi;
+    }
     var acc = rt_gather_indirect(p, n, seed) * fade;
 
     // Reproject into last frame; reuse the accumulated GI on a position match.

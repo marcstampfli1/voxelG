@@ -50,7 +50,7 @@ const ANIM_REFRESH_SPREAD: usize = 8;
 /// 8-tap sub-pixel jitter pattern (Halton(2,3), centred to [-0.5, 0.5]) for
 /// temporal anti-aliasing. Applied only while the camera is static so the
 /// accumulation converges to an anti-aliased image.
-const JITTER_PATTERN: [[f32; 2]; 8] = [
+pub(crate) const JITTER_PATTERN: [[f32; 2]; 8] = [
     [0.0, -0.166_666_7],
     [-0.25, 0.166_666_7],
     [0.25, -0.388_888_9],
@@ -108,6 +108,12 @@ pub struct App {
     last_camera_pose: Option<(Vec3, f32, f32, f32)>,
     /// Monotonic frame counter, used to index the TAA jitter pattern.
     frame_counter: u64,
+    /// CPU frame-time accumulators (logged under VOXELG_GPU_PROFILE): the GPU
+    /// can sit at 500 fps while the CPU loop caps the real rate - this shows
+    /// where the CPU milliseconds go. [pre(net+input), world-lock(stream+dirty+
+    /// upload), render(acquire+encode+submit+present), whole frame] seconds.
+    cpu_prof: [f64; 4],
+    cpu_prof_n: u32,
     /// Rotating animation-refresh phase: each frame ~1/ANIM_REFRESH_SPREAD of
     /// the (otherwise clean) tiles are re-traced so sky/water/foliage keep
     /// animating on a still camera — spread evenly instead of one hard full
@@ -188,6 +194,8 @@ impl App {
             start_time: Instant::now(),
             last_camera_pose: None,
             frame_counter: 0,
+            cpu_prof: [0.0; 4],
+            cpu_prof_n: 0,
             refresh_phase: 0,
             opts,
             leaf_sim: std::env::var("VOXELG_NO_LEAVES")
@@ -416,6 +424,7 @@ impl App {
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32().min(1.0 / 30.0);
         self.last_frame = now;
+        let cpu_t0 = now;
 
         // Pump network in/out before re-borrowing renderer.
         self.maybe_reconnect(now);
@@ -428,6 +437,7 @@ impl App {
         let u = (self.keys.up as i32 - self.keys.down as i32) as f32;
         self.camera.translate_local(dt, f * speed, r * speed, u * speed);
 
+        let cpu_t1 = Instant::now();
         // Streaming (brief world lock): keep the window centred with a
         // hysteresis deadband so boundary oscillation doesn't thrash regen.
         {
@@ -517,12 +527,35 @@ impl App {
                         );
                     }
                 }
-                // #2: rotating animation refresh — re-trace ~1/ANIM_REFRESH_SPREAD
-                // of the tiles each frame so sky/water/foliage keep animating.
-                let mut idx = self.refresh_phase as usize;
-                while idx < n_tiles {
-                    self.tile_dirty_mask[idx >> 5] |= 1u32 << (idx & 31);
-                    idx += ANIM_REFRESH_SPREAD;
+                // #2: rotating animation refresh — re-trace ~1/spread of the
+                // tiles each frame so sky/water/foliage keep animating and the
+                // per-pixel shadow-staleness dither can actually fire. The
+                // refreshed set is HASH-SCATTERED, never a fixed stride: a
+                // stride aligns the freshly-relit tiles into repeating rows, so
+                // during any fast lighting change (sunset darkening, shadow
+                // edges sweeping) the stale/fresh boundary reads as visible
+                // LINES / ticking blocks. Scattered updates read as fine noise
+                // that TAA averages. During the dawn/dusk transition the
+                // rotation runs 2x (1/4 per frame) because per-frame lighting
+                // change is largest exactly there; freeze-time keeps the calm
+                // cadence (the sun cannot move).
+                let sun_moving = self.opts.freeze_time.is_none();
+                let sy = crate::camera::sun_dir_at(sun_t).y;
+                let spread = if sun_moving && sy > -0.15 && sy < 0.35 {
+                    ANIM_REFRESH_SPREAD / 2
+                } else {
+                    ANIM_REFRESH_SPREAD
+                };
+                let phase = self.refresh_phase as usize % spread;
+                let tw = tiles_w as usize;
+                for ti in 0..n_tiles {
+                    let tx = ti % tw;
+                    let ty = ti / tw;
+                    let h = (tx.wrapping_mul(73856093) ^ ty.wrapping_mul(19349663))
+                        .wrapping_mul(2654435761);
+                    if (h >> 8) % spread == phase {
+                        self.tile_dirty_mask[ti >> 5] |= 1u32 << (ti & 31);
+                    }
                 }
                 self.refresh_phase = (self.refresh_phase + 1) % ANIM_REFRESH_SPREAD as u32;
             }
@@ -560,6 +593,7 @@ impl App {
         if any_dirty {
             renderer.upload_tile_dirty(&self.tile_dirty_mask);
         }
+        let cpu_t2 = Instant::now();
         match renderer.render(any_dirty) {
             Ok(()) => {}
             // Transient surface states: reconfigure and try again next frame.
@@ -575,6 +609,23 @@ impl App {
             // Success/Suboptimal are consumed inside render() and never returned as Err.
             Err(wgpu::CurrentSurfaceTexture::Success(_)
                 | wgpu::CurrentSurfaceTexture::Suboptimal(_)) => {}
+        }
+        if std::env::var("VOXELG_GPU_PROFILE").is_ok() {
+            let cpu_t3 = Instant::now();
+            self.cpu_prof[0] += (cpu_t1 - cpu_t0).as_secs_f64();
+            self.cpu_prof[1] += (cpu_t2 - cpu_t1).as_secs_f64();
+            self.cpu_prof[2] += (cpu_t3 - cpu_t2).as_secs_f64();
+            self.cpu_prof[3] += (cpu_t3 - cpu_t0).as_secs_f64();
+            self.cpu_prof_n += 1;
+            if self.cpu_prof_n == 120 {
+                let m = |i: usize| self.cpu_prof[i] * 1000.0 / 120.0;
+                log::info!(
+                    "cpu frame ms: pre {:.2}  world+upload {:.2}  render(acquire+submit+present) {:.2}  | total {:.2}",
+                    m(0), m(1), m(2), m(3)
+                );
+                self.cpu_prof = [0.0; 4];
+                self.cpu_prof_n = 0;
+            }
         }
         self.last_camera_pose = Some(cur_pose);
         self.first_frame = false;

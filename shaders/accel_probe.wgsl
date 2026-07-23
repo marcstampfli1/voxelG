@@ -92,7 +92,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let bmin = vec3<f32>(a.min_x, a.min_y, a.min_z);
             var fv = vec3<i32>(0);
             var fnrm = vec3<i32>(0);
-            let t = resolve_brick(bi, bmin, o, d, 0.0, best_t, &fv, &fnrm);
+            // No transparent skip: the CPU oracle checks the exact first
+            // occupied voxel, water included.
+            let t = resolve_brick(bi, bmin, o, d, 0.0, best_t, false, &fv, &fnrm);
             if (t >= 0.0) {
                 rayQueryGenerateIntersection(&rq, t);
                 if (t < best_t) {
