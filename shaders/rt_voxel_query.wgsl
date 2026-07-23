@@ -34,7 +34,9 @@ fn rt_face_normal(axis: i32, d: vec3<f32>) -> vec3<i32> {
 // accel_probe validation module, which does not include the render shader
 // (same reason accel_probe.wgsl carries its own brick_voxel_solid).
 fn rt_is_transparent_mat(m: u32) -> bool {
-    return (m >= 5u && m <= 12u) || m == 18u;
+    // 35 = MAT_TURF: blade cells are 90% air - GI/RT rays pass through and
+    // bounce off the grass block below instead.
+    return (m >= 5u && m <= 12u) || m == 18u || m == 35u;
 }
 
 fn resolve_brick(bi: i32, bmin: vec3<f32>, o: vec3<f32>, d: vec3<f32>,

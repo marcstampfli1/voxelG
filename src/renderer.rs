@@ -237,6 +237,7 @@ fn default_palette() -> [PaletteEntry; PALETTE_SIZE] {
     // case any debug path samples it.
     p[crate::voxel::MAT_LEAF_FRINGE as usize] = PaletteEntry([0.30, 0.58, 0.20, 1.0]);
     p[MAT_TALL_GRASS_DRY as usize] = PaletteEntry([0.78, 0.68, 0.38, 1.0]); // pale straw
+    p[crate::voxel::MAT_TURF as usize] = PaletteEntry([0.34, 0.66, 0.22, 1.0]); // ground blades
     p
 }
 
@@ -348,6 +349,16 @@ pub struct Renderer {
     leaf_bgl: wgpu::BindGroupLayout,
     leaf_pipeline: wgpu::RenderPipeline,
     leaf_bg: wgpu::BindGroup,
+
+    // GPU grass blade field (src/grass.rs + shaders/grass.wgsl).
+    grass_cells_buf: wgpu::Buffer,
+    grass_bgl: wgpu::BindGroupLayout,
+    grass_pipelines: [wgpu::RenderPipeline; 3],
+    grass_bg: wgpu::BindGroup,
+    grass_depth_view: wgpu::TextureView,
+    grass_counts: [u32; 3],
+    grass_offsets: [u32; 3],
+    grass_version: u64,
 
     // Half-res volumetric (cloud) pass. The texture handle is dropped after
     // creation — its views keep the GPU resource alive.
@@ -743,6 +754,12 @@ impl Renderer {
 
         let leaf_bg = make_leaf_bg(&device, &leaf_bgl, &camera_buf, &leaves_buf, &sprites_buf, &depth_view);
 
+        let grass_cells_buf = create_grass_cells_buf(&device);
+        let grass_bgl = create_grass_bgl(&device);
+        let grass_pipelines = create_grass_pipelines(&device, &grass_bgl);
+        let (_grass_depth_tex, grass_depth_view) = create_grass_depth(&device, width, height);
+        let grass_bg = make_grass_bg(&device, &grass_bgl, &camera_buf, &grass_cells_buf, &depth_view, &light_out_view);
+
         let godray_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("godray pipeline"),
             layout: Some(&compute_pl),
@@ -1072,6 +1089,8 @@ impl Renderer {
             geom_tex, geom_view, dummy_depth_tex, dummy_depth_view,
             compose_pipeline, compose_bg,
             leaves_buf, leaf_count: 0, leaf_bgl, leaf_pipeline, leaf_bg,
+            grass_cells_buf, grass_bgl, grass_pipelines, grass_bg, grass_depth_view,
+            grass_counts: [0; 3], grass_offsets: [0; 3], grass_version: 0,
             bricks_buf_b, physics_pipeline, physics_bg, gpu_physics: gpu_physics_enabled,
             cloud_bgl, cloud_pipeline, cloud_bg, cloud_sampled_view, cloud_storage_view,
             light_out_tex, light_out_view, light_hist_tex, light_hist_view,
@@ -1129,6 +1148,12 @@ impl Renderer {
         self.leaf_bg = make_leaf_bg(
             &self.device, &self.leaf_bgl, &self.camera_buf, &self.leaves_buf,
             &self.sprites_buf, &self.depth_view,
+        );
+        let (_gdt, gdv) = create_grass_depth(&self.device, rw, rh);
+        self.grass_depth_view = gdv;
+        self.grass_bg = make_grass_bg(
+            &self.device, &self.grass_bgl, &self.camera_buf, &self.grass_cells_buf,
+            &self.depth_view, &self.light_out_view,
         );
 
         self.compute_bg = make_compute_bg(
@@ -1444,6 +1469,31 @@ impl Renderer {
         self.leaf_count = n as u32;
     }
 
+    /// Upload the grass cell lists when the field was rebuilt (version
+    /// change). The three LOD bands pack back-to-back into one buffer;
+    /// draws use instance ranges into it.
+    pub fn upload_grass(&mut self, field: &crate::grass::GrassField) {
+        if field.version == self.grass_version {
+            return;
+        }
+        self.grass_version = field.version;
+        let mut off = 0u32;
+        for lod in 0..3 {
+            let cells = &field.cells[lod];
+            let n = cells.len().min(MAX_GRASS_CELLS - off as usize);
+            if n > 0 {
+                self.queue.write_buffer(
+                    &self.grass_cells_buf,
+                    (off as usize * std::mem::size_of::<crate::grass::GrassCell>()) as u64,
+                    bytemuck::cast_slice(&cells[..n]),
+                );
+            }
+            self.grass_offsets[lod] = off;
+            self.grass_counts[lod] = n as u32;
+            off += n as u32;
+        }
+    }
+
     pub fn render(&mut self, any_dirty: bool) -> Result<(), wgpu::CurrentSurfaceTexture> {
         // wgpu 30 replaced the `Result<SurfaceTexture, SurfaceError>` return with the
         // `CurrentSurfaceTexture` enum. `Suboptimal` still yields a usable frame (historical
@@ -1599,6 +1649,46 @@ impl Renderer {
             // (temporal GI needs no copy: the gi textures ping-pong via the two
             // rt bind groups selected by frame parity.)
             // (stamp 6 covers compose + the gi_out->gi_in copy)
+            // ---- grass blade field: BEFORE the TAA resolve, so the thin
+            // ribbons are temporally anti-aliased like everything raymarched
+            // (its GPU time lands in the taa profiler bucket). ----
+            if self.grass_counts.iter().any(|&c| c > 0) {
+                let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("grass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.output_view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &self.grass_depth_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(0.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                for lod in 0..3 {
+                    if self.grass_counts[lod] == 0 {
+                        continue;
+                    }
+                    rp.set_pipeline(&self.grass_pipelines[lod]);
+                    rp.set_bind_group(0, &self.grass_bg, &[]);
+                    let off = self.grass_offsets[lod];
+                    rp.draw(
+                        0..crate::grass::verts_per_cell(lod),
+                        off..off + self.grass_counts[lod],
+                    );
+                }
+            }
             // ---- TAA resolve: raymarch output + history -> resolve ----
             {
                 let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1947,6 +2037,175 @@ fn make_leaf_bg(
             wgpu::BindGroupEntry { binding: 1, resource: leaves_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 2, resource: sprites_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(depth_view) },
+        ],
+    })
+}
+
+// ---- grass: GPU blade field (Ghost-of-Tsushima pipeline, src/grass.rs) ----
+
+pub(crate) fn grass_source() -> String {
+    format!("{}\n{}", COMMON_WGSL, include_str!("../shaders/grass.wgsl"))
+}
+
+pub(crate) const MAX_GRASS_CELLS: usize = 32768;
+
+fn create_grass_cells_buf(device: &wgpu::Device) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("grass cells"),
+        size: (MAX_GRASS_CELLS * std::mem::size_of::<crate::grass::GrassCell>()) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+/// Blade-vs-blade occlusion: a real depth attachment local to the grass
+/// pass (reversed z = 0.05/view_z, cleared to 0, compare Greater). The
+/// blade-vs-world test stays manual against the raymarch depth texture.
+fn create_grass_depth(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture, wgpu::TextureView) {
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("grass depth"),
+        size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Depth32Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+    (tex, view)
+}
+
+fn create_grass_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("grass bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+fn create_grass_pipelines(
+    device: &wgpu::Device,
+    bgl: &wgpu::BindGroupLayout,
+) -> [wgpu::RenderPipeline; 3] {
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("grass shader"),
+        source: wgpu::ShaderSource::Wgsl(grass_source().into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("grass pl"),
+        bind_group_layouts: &[Some(bgl)],
+        immediate_size: 0,
+    });
+    let mk = |lod: usize| {
+        let (blades, segs) = crate::grass::LOD_SHAPE[lod];
+        let width_mul = [1.0f64, 1.6, 2.6][lod];
+        let consts: Vec<(&str, f64)> = vec![
+            ("GRASS_BLADES", blades as f64),
+            ("GRASS_SEGS", segs as f64),
+            ("GRASS_WIDTH_MUL", width_mul),
+            ("GRASS_FAR_T", crate::grass::GRASS_LOD2_T as f64),
+        ];
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("grass pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs_grass"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &consts,
+                    ..Default::default()
+                },
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs_grass"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &consts,
+                    ..Default::default()
+                },
+            }),
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Greater),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        })
+    };
+    [mk(0), mk(1), mk(2)]
+}
+
+fn make_grass_bg(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    camera_buf: &wgpu::Buffer,
+    cells_buf: &wgpu::Buffer,
+    depth_view: &wgpu::TextureView,
+    light_view: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("grass bg"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: camera_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: cells_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(depth_view) },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(light_view) },
         ],
     })
 }
@@ -2515,6 +2774,12 @@ mod shader_tests {
     }
 
     #[test]
+    fn grass_wgsl_valid() {
+        let src = super::grass_source();
+        validate("grass.wgsl", &src);
+    }
+
+    #[test]
     fn leaves_wgsl_valid() {
         let src = super::leaves_source();
         validate("leaves.wgsl", &src);
@@ -2672,6 +2937,16 @@ mod gpu_render_tests {
     fn render_rgba_full(
         world: &World, cam: &Camera, w: u32, h: u32, leaves: &[crate::leaffall::LeafInstance],
         t: f32, sun_t: f32,
+    ) -> Option<Vec<u8>> {
+        render_rgba_full_opts(world, cam, w, h, leaves, t, sun_t, true)
+    }
+
+    /// `draw_grass: false` renders without the raster blade field - for
+    /// probes that assert on SHADING stability of rigid geometry, where
+    /// legitimately wind-moving blade geometry is out of scope by design.
+    fn render_rgba_full_opts(
+        world: &World, cam: &Camera, w: u32, h: u32, leaves: &[crate::leaffall::LeafInstance],
+        t: f32, sun_t: f32, draw_grass: bool,
     ) -> Option<Vec<u8>> {
         let (device, queue, _gpu) = headless_device()?;
         let wo = world.world_origin_voxel();
@@ -2848,6 +3123,66 @@ mod gpu_render_tests {
             cp.set_pipeline(&compose_pipeline);
             cp.set_bind_group(0, &bg_compose, &[]);
             cp.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
+        }
+        // Grass blade field: scan the test world around the camera (wide
+        // fixed y-range covers hand-built lab platforms) and draw exactly
+        // like the live renderer does between compose and TAA.
+        if draw_grass {
+            let mut field = crate::grass::GrassField::new();
+            let cy = cam.pos.y as i32;
+            field.maybe_rebuild(world, cam.pos, Some((cy - 48, cy + 16)));
+            let n_cells: usize = field.cells.iter().map(|c| c.len()).sum();
+            if n_cells > 0 {
+                let grass_bgl = create_grass_bgl(&device);
+                let grass_pipes = create_grass_pipelines(&device, &grass_bgl);
+                let cells_buf = create_grass_cells_buf(&device);
+                let mut off = 0u32;
+                let mut ranges = [(0u32, 0u32); 3];
+                for lod in 0..3 {
+                    let cells = &field.cells[lod];
+                    let n = cells.len().min(MAX_GRASS_CELLS - off as usize);
+                    if n > 0 {
+                        queue.write_buffer(
+                            &cells_buf,
+                            (off as usize * std::mem::size_of::<crate::grass::GrassCell>()) as u64,
+                            bytemuck::cast_slice(&cells[..n]),
+                        );
+                    }
+                    ranges[lod] = (off, n as u32);
+                    off += n as u32;
+                }
+                let (_gdt, gdv) = create_grass_depth(&device, w, h);
+                let grass_bg = make_grass_bg(&device, &grass_bgl, &camera_buf, &cells_buf, &depth_view, &light_out_view);
+                let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("test grass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &output_view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &gdv,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(0.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                for lod in 0..3 {
+                    let (o, n) = ranges[lod];
+                    if n == 0 {
+                        continue;
+                    }
+                    rp.set_pipeline(&grass_pipes[lod]);
+                    rp.set_bind_group(0, &grass_bg, &[]);
+                    rp.draw(0..crate::grass::verts_per_cell(lod), o..o + n);
+                }
+            }
         }
         if !leaves.is_empty() {
             let leaves_buf = storage(&device, "leaves", bytemuck::cast_slice(leaves));
@@ -4545,6 +4880,47 @@ mod gpu_render_tests {
         }
     }
 
+    /// Turf lookdev: a grass platform with the continuous MAT_TURF blade
+    /// layer above every block - analytic 3D blades out of the ground, the
+    /// combed sheen shading between and beyond them - at a day and an
+    /// evening sun, walking and grazing cameras.
+    #[test]
+    #[ignore]
+    fn dump_turf() {
+        use crate::voxel::{MAT_DIRT, MAT_GRASS};
+        let mut world = World::new();
+        for z in 150u32..300 {
+            for x in 150u32..300 {
+                world.set_voxel(x, 63, z, MAT_DIRT);
+                world.set_voxel(x, 64, z, MAT_GRASS);
+            }
+        }
+        let views: [(&str, glam::Vec3, f32, f32, f32); 4] = [
+            ("turf_day_walk", glam::Vec3::new(225.0, 67.0, 225.0), 0.8, -0.35, 30.0),
+            ("turf_day_graze", glam::Vec3::new(225.0, 65.8, 218.0), 0.6, -0.10, 30.0),
+            ("turf_eve_walk", glam::Vec3::new(225.0, 67.0, 225.0), 0.8, -0.35, 68.0),
+            ("turf_eve_graze", glam::Vec3::new(225.0, 65.8, 218.0), 0.6, -0.10, 68.0),
+        ];
+        std::fs::create_dir_all("target/lookdev").unwrap();
+        for (name, pos, yaw, pitch, sun_t) in views {
+            let mut cam = Camera::new();
+            cam.pos = pos;
+            cam.yaw = yaw;
+            cam.pitch = pitch;
+            let Some(rgba) = render_rgba_time_sun(&world, &cam, 1920, 1080, 30.0, sun_t) else {
+                eprintln!("no GPU - skipping");
+                return;
+            };
+            let path = format!("target/lookdev/{name}.png");
+            let file = std::fs::File::create(&path).unwrap();
+            let mut enc = png::Encoder::new(std::io::BufWriter::new(file), 1920, 1080);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            enc.write_header().unwrap().write_image_data(&rgba).unwrap();
+            eprintln!("wrote {path}");
+        }
+    }
+
     /// Continuous-carpet prototype (Marc's "continuous grass everywhere,
     /// higher and lower"): a 150x150 platform with EVERY cell decorated
     /// (grass carpet + dry patches + scattered flowers), heights rolling on
@@ -4600,13 +4976,13 @@ mod gpu_render_tests {
             cam.pos = pos;
             cam.yaw = yaw;
             cam.pitch = pitch;
-            let Some(rgba) = render_rgba(&carpet_world, &cam, 960, 540) else {
+            let Some(rgba) = render_rgba(&carpet_world, &cam, 1920, 1080) else {
                 eprintln!("no GPU - skipping");
                 return;
             };
             let path = format!("target/lookdev/{name}.png");
             let file = std::fs::File::create(&path).unwrap();
-            let mut enc = png::Encoder::new(std::io::BufWriter::new(file), 960, 540);
+            let mut enc = png::Encoder::new(std::io::BufWriter::new(file), 1920, 1080);
             enc.set_color(png::ColorType::Rgba);
             enc.set_depth(png::BitDepth::Eight);
             enc.write_header().unwrap().write_image_data(&rgba).unwrap();
@@ -4761,13 +5137,13 @@ mod gpu_render_tests {
             cam.pos = pos;
             cam.yaw = yaw;
             cam.pitch = pitch;
-            let Some(rgba) = render_rgba(&world, &cam, 960, 540) else {
+            let Some(rgba) = render_rgba(&world, &cam, 1920, 1080) else {
                 eprintln!("no GPU - skipping");
                 return;
             };
             let path = format!("target/lookdev/{name}.png");
             let file = std::fs::File::create(&path).unwrap();
-            let mut enc = png::Encoder::new(std::io::BufWriter::new(file), 960, 540);
+            let mut enc = png::Encoder::new(std::io::BufWriter::new(file), 1920, 1080);
             enc.set_color(png::ColorType::Rgba);
             enc.set_depth(png::BitDepth::Eight);
             enc.write_header().unwrap().write_image_data(&rgba).unwrap();
@@ -4789,13 +5165,13 @@ mod gpu_render_tests {
         cam.pos = glam::Vec3::new(clamp_anchor(leaf_anchor.x) - 40.0, leaf_ground as f32 + 4.0, clamp_anchor(leaf_anchor.y) + 30.0);
         cam.yaw = 2.3;
         cam.pitch = -0.12;
-        let Some(rgba) = render_rgba_at_time(&world, &cam, 960, 540, 30.0) else {
+        let Some(rgba) = render_rgba_at_time(&world, &cam, 1920, 1080, 30.0) else {
             eprintln!("no GPU — skipping");
             return;
         };
         let path = "target/lookdev/day_meadow.png".to_string();
         let file = std::fs::File::create(&path).unwrap();
-        let mut enc = png::Encoder::new(std::io::BufWriter::new(file), 960, 540);
+        let mut enc = png::Encoder::new(std::io::BufWriter::new(file), 1920, 1080);
         enc.set_color(png::ColorType::Rgba);
         enc.set_depth(png::BitDepth::Eight);
         enc.write_header().unwrap().write_image_data(&rgba).unwrap();
@@ -4918,11 +5294,11 @@ mod gpu_render_tests {
         cam.yaw = 0.0;
         cam.pitch = -0.5;
         let (w, h) = (960usize, 540usize);
-        let Some(a) = render_rgba_time_sun(&world, &cam, w as u32, h as u32, 30.0, 30.0) else {
+        let Some(a) = render_rgba_full_opts(&world, &cam, w as u32, h as u32, &[], 30.0, 30.0, false) else {
             eprintln!("no GPU adapter — skipping luma-wave probe");
             return;
         };
-        let b = render_rgba_time_sun(&world, &cam, w as u32, h as u32, 32.0, 30.0).unwrap();
+        let b = render_rgba_full_opts(&world, &cam, w as u32, h as u32, &[], 32.0, 30.0, false).unwrap();
         let luma = |f: &[u8], x: usize, y: usize| {
             let i = (y * w + x) * 4;
             (f[i] as f32 + f[i + 1] as f32 + f[i + 2] as f32) / (3.0 * 255.0)

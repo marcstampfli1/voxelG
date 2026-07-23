@@ -9,6 +9,7 @@ pub mod voxel;
 pub mod sprites;
 pub mod camera;
 pub mod leaffall;
+pub mod grass;
 pub mod raycast;
 pub mod accel;
 pub mod physics;

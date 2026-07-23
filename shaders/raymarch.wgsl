@@ -251,34 +251,45 @@ fn brick_voxel_material(bi: i32, vi: i32) -> u32 {
 fn brick_topmost_material(bi: i32) -> u32 {
     let b = bricks[bi];
     // Brick layout: voxel idx = x + z*4 + y*16. So y=3 layer = bits 48..63.
-    // Walk from top y=3 layer down.
+    // Walk from top y=3 layer down. MAT_TURF (the continuous blade layer on
+    // every grass top) is skipped like air: from LOD distance the surface IS
+    // the grass block under it, and reporting turf here would disable the
+    // brick/tile LOD fast paths across every meadow. A brick holding ONLY
+    // turf still reports turf, and its callers fall through to the per-voxel
+    // descent (whose beyond-TURF_T dispatcher miss steps to the ground).
     let occ_hi = b.occ_hi;
     let occ_lo = b.occ_lo;
     // y=3 layer is occ_hi >> 16 (16 bits at bit 48..63).
     let y3 = (occ_hi >> 16u) & 0xFFFFu;
     if (y3 != 0u) {
         let bit = firstTrailingBit(y3);
-        return brick_voxel_material(bi, i32(48u + bit));
+        let m = brick_voxel_material(bi, i32(48u + bit));
+        if (m != MAT_TURF) { return m; }
     }
     // y=2 layer = occ_hi & 0xFFFF (bits 32..47).
     let y2 = occ_hi & 0xFFFFu;
     if (y2 != 0u) {
         let bit = firstTrailingBit(y2);
-        return brick_voxel_material(bi, i32(32u + bit));
+        let m = brick_voxel_material(bi, i32(32u + bit));
+        if (m != MAT_TURF) { return m; }
     }
     // y=1 layer = occ_lo >> 16 (bits 16..31).
     let y1 = (occ_lo >> 16u) & 0xFFFFu;
     if (y1 != 0u) {
         let bit = firstTrailingBit(y1);
-        return brick_voxel_material(bi, i32(16u + bit));
+        let m = brick_voxel_material(bi, i32(16u + bit));
+        if (m != MAT_TURF) { return m; }
     }
     // y=0 layer = occ_lo & 0xFFFF (bits 0..15).
     let y0 = occ_lo & 0xFFFFu;
     if (y0 != 0u) {
         let bit = firstTrailingBit(y0);
-        return brick_voxel_material(bi, i32(bit));
+        let m = brick_voxel_material(bi, i32(bit));
+        if (m != MAT_TURF) { return m; }
     }
-    return 0u;
+    // Occupied but nothing except turf: report turf (callers' foliage guard
+    // then takes the per-voxel descent). NEVER 0 here - a mat-0 LOD cube.
+    return select(0u, MAT_TURF, (occ_lo | occ_hi) != 0u);
 }
 
 fn is_voxel_solid(world_v: vec3<i32>) -> bool {
@@ -871,6 +882,7 @@ const MAT_FLOWER:          u32 = 30u;
 const MAT_TALL_GRASS:      u32 = 31u;
 const MAT_LEAF_FRINGE:     u32 = 33u;
 const MAT_TALL_GRASS_DRY:  u32 = 34u;
+const MAT_TURF:            u32 = 35u;
 
 fn is_water_mat(m: u32) -> bool {
     return m >= MAT_WATER_L1 && m <= MAT_WATER_L8;
@@ -886,7 +898,8 @@ fn is_foliage_mat(m: u32) -> bool {
     return m == MAT_LEAVES || m == MAT_LEAVES_BIRCH
         || m == MAT_LEAVES_PINE || m == MAT_LEAVES_AUTUMN
         || m == MAT_FLOWER || m == MAT_TALL_GRASS
-        || m == MAT_LEAF_FRINGE || m == MAT_TALL_GRASS_DRY;
+        || m == MAT_LEAF_FRINGE || m == MAT_TALL_GRASS_DRY
+        || m == MAT_TURF;
 }
 fn is_leaf_block_mat(m: u32) -> bool {
     return m == MAT_LEAVES || m == MAT_LEAVES_BIRCH
@@ -898,7 +911,7 @@ fn is_leaf_block_mat(m: u32) -> bool {
 // don't disappear.
 fn is_decoration_mat(m: u32) -> bool {
     return m == MAT_FLOWER || m == MAT_TALL_GRASS || m == MAT_LEAF_FRINGE
-        || m == MAT_TALL_GRASS_DRY;
+        || m == MAT_TALL_GRASS_DRY || m == MAT_TURF;
 }
 
 struct SubHit {
@@ -1735,8 +1748,203 @@ fn flora_clump_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32
     return out;
 }
 
+// Continuous turf (MAT_TURF, the cell above every grass block): ANALYTIC
+// tapered blade segments - real 3D grass rising out of the ground, not
+// sprite cards. A 3x3 rooted lattice per cell, each blade a closest-
+// approach ray/segment test with a radius tapering root->tip, bent by a
+// per-blade lean and the shared wind (tip-weighted, frozen-phase safe via
+// wind_offset). Misses fall through to the grass top below, whose combed
+// sheen shading is the between-blades and beyond-TURF_T look.
+const TURF_T: f32 = 48.0;
+
+// One flat tapered ribbon piece: closest approach of the (unit) ray to the
+// segment a->b, accepted when the perpendicular offset decomposes into
+// less-than-halfwidth across the blade's wide axis and less-than-thickness
+// through it. s01 receives the position along the segment.
+struct RibbonHit {
+    hit: bool,
+    t: f32,
+    s01: f32,
+    lat: f32,       // lateral position across the width, -1..1
+    perp: vec3<f32>, // perpendicular offset vector (ray point - axis point)
+}
+
+fn ribbon_seg_hit(
+    origin: vec3<f32>, dir: vec3<f32>, a: vec3<f32>, b: vec3<f32>,
+    wide3: vec3<f32>, hw0: f32, hw1: f32, t_cap: f32,
+) -> RibbonHit {
+    var r: RibbonHit;
+    r.hit = false;
+    let u = b - a;
+    let w0 = origin - a;
+    let bb = dot(dir, u);
+    let c = dot(u, u);
+    let d0 = dot(dir, w0);
+    let e0 = dot(u, w0);
+    let den = max(c - bb * bb, 1e-6);
+    let s = clamp((e0 - bb * d0) / den, 0.0, 1.0);
+    let t = s * bb - d0;
+    if (t <= 0.0 || t >= t_cap) { return r; }
+    let perp = w0 + dir * t - u * s;
+    let hw = mix(hw0, hw1, s);
+    let wid = dot(perp, wide3);
+    if (abs(wid) > hw) { return r; }
+    let thick = perp - wide3 * wid;
+    if (dot(thick, thick) > 0.0009) { return r; } // ~0.03 thickness
+    r.hit = true;
+    r.t = t;
+    r.s01 = s;
+    r.lat = wid / hw;
+    r.perp = perp;
+    return r;
+}
+
+fn turf_blade_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>) -> SubHit {
+    var out: SubHit;
+    out.hit = false;
+    out.color_tint = vec3<f32>(1.0);
+    let voxel_min = vec3<f32>(f32(voxel.x), f32(voxel.y), f32(voxel.z));
+    let vh = hash3f(voxel_min);
+    let field = flora_field(voxel_min.xz + vec2<f32>(0.5));
+    let phase = voxel_min.x * 0.40 + voxel_min.z * 0.55 + vh * 6.28;
+    let wind = wind_offset(voxel_min, phase, 0.22);
+
+    // ---- Clump (Worley cells ~2.5 voxels): blades share facing, height
+    // and colour with their clump, jittered per blade - uniform randomness
+    // reads as noise, clumps read as a field (the GoT distribution rule).
+    // Sampled once per cell; clump borders quantise to voxels, invisible at
+    // blade scale.
+    let w = worley2(voxel_min.xz * 0.4);
+    let clump_ang = fract(w.id * 7.13) * 6.2832;
+    let clump_h = 0.70 + 0.55 * fract(w.id * 3.71);
+    let clump_bright = 0.82 + 0.34 * fract(w.id * 5.23);
+    let clump_hue = mix(vec3<f32>(1.0), vec3<f32>(1.22, 1.06, 0.58),
+                        fract(w.id * 9.77) * 0.45);
+
+    // Distance LOD: near = 16 curved 2-segment blades; mid = 9 single-
+    // segment blades widened to keep coverage (fewer-but-wider, the GoT
+    // density-compensation trick).
+    let cd = length(voxel_min + vec3<f32>(0.5) - origin);
+    let near = cd < 16.0;
+    let n_blades = select(9, 16, near);
+    let wide_mul = select(1.9, 1.0, near);
+
+    let ground = mix(vec3<f32>(1.0),
+                     palette[MAT_GRASS].rgb / max(palette[MAT_TURF].rgb, vec3<f32>(1e-3)),
+                     0.6);
+
+    var best_t: f32 = 1e30;
+    var best_n = vec3<f32>(0.0, 1.0, 0.0);
+    var tint = vec3<f32>(1.0);
+
+    for (var i: i32 = 0; i < n_blades; i = i + 1) {
+        let gx = f32(i % 4);
+        let gz = f32(i / 4);
+        let bh = hash3f(voxel_min + vec3<f32>(gx * 13.1 + 1.7, 5.3, gz * 17.9 + 0.9));
+        let root2 = vec2<f32>(
+            (gx + 0.10 + 0.80 * fract(bh * 7.0)) / 4.0,
+            (gz + 0.10 + 0.80 * fract(bh * 11.0)) / 4.0);
+        // Facing: the clump's direction plus per-blade spread.
+        let fa = clump_ang + (fract(bh * 5.0) - 0.5) * 1.7;
+        let fdir = vec2<f32>(cos(fa), sin(fa));
+        let h = field * clump_h * (0.32 + 0.40 * fract(bh * 3.0));
+        // The Bezier arc, approximated by two chained segments: the tip
+        // falls over along the facing (curved blades ARE the grass look;
+        // straight spikes are the plastic look). Wind adds curvature, so
+        // gusts bend blades instead of tilting them rigidly.
+        let curve = 0.45 + 0.55 * fract(bh * 13.0);
+        let arc2 = fdir * curve * h + wind * h * 1.6;
+        let arc_len = length(arc2);
+        // Arc-over: the more the blade bends, the lower its tip sits.
+        let droop = clamp(arc_len * 0.9, 0.0, 0.70);
+        // Quadratic Bezier: P0 root, P1 above-root leaning half the arc,
+        // P2 the fallen-over tip. Sampled at t = 0.45 / 0.75 / 1.0 into a
+        // 3-segment polyline (near tier) - a 2-segment blade shows a paper
+        // fold at its single elbow, three read as a smooth curve.
+        let cp0 = vec3<f32>(root2.x, 0.0, root2.y);
+        let cp1 = vec3<f32>(root2.x + arc2.x * 0.5, h * 0.85, root2.y + arc2.y * 0.5);
+        let cp2 = vec3<f32>(root2.x + arc2.x, h * (1.0 - droop), root2.y + arc2.y);
+        let q0 = voxel_min + cp0;
+        // B(0.45), B(0.75), B(1.0) of the quadratic, xz crowded into the cell.
+        var b1 = cp0 * 0.3025 + cp1 * 0.495 + cp2 * 0.2025;
+        var b2 = cp0 * 0.0625 + cp1 * 0.375 + cp2 * 0.5625;
+        let q1 = voxel_min + vec3<f32>(clamp(b1.x, 0.02, 0.98), b1.y, clamp(b1.z, 0.02, 0.98));
+        let q2 = voxel_min + vec3<f32>(clamp(b2.x, 0.02, 0.98), b2.y, clamp(b2.z, 0.02, 0.98));
+        let q3 = voxel_min + vec3<f32>(clamp(cp2.x, 0.02, 0.98), cp2.y, clamp(cp2.z, 0.02, 0.98));
+        // Twist: the ribbon's wide axis rotates along the blade, so faces
+        // present at varying angles instead of one uniform tape direction.
+        let tw0 = (fract(bh * 31.0) - 0.5) * 0.7;
+        let hw_r = 0.013 * wide_mul * (0.8 + 0.4 * fract(bh * 17.0));
+
+        var rh: RibbonHit;
+        rh.hit = false;
+        var sblade = 0.0;
+        var seg_a = q0;
+        var seg_b = q1;
+        var wide_hit = vec3<f32>(0.0);
+        // Segment bounds in blade-param space and width taper per node.
+        for (var k: i32 = 0; k < 3; k = k + 1) {
+            if (!near && k > 1) { break; } // mid LOD: 2 segments
+            var a = q0; var bq = q1; var s0 = 0.0; var s1 = 0.45;
+            var w0 = hw_r; var w1 = hw_r * 0.70;
+            if (k == 1) { a = q1; bq = q2; s0 = 0.45; s1 = 0.75; w0 = hw_r * 0.70; w1 = hw_r * 0.30; }
+            if (k == 2) { a = q2; bq = q3; s0 = 0.75; s1 = 1.0;  w0 = hw_r * 0.30; w1 = 0.001; }
+            let twa = tw0 + (s0 + s1) * 0.5 * 0.5;
+            let wf = vec2<f32>(cos(fa + twa), sin(fa + twa));
+            let wide3 = vec3<f32>(-wf.y, 0.0, wf.x);
+            let r = ribbon_seg_hit(origin, dir, a, bq, wide3, w0, w1,
+                                   select(best_t, rh.t, rh.hit));
+            if (r.hit) {
+                rh = r;
+                sblade = mix(s0, s1, r.s01);
+                seg_a = a;
+                seg_b = bq;
+                wide_hit = wide3;
+            }
+        }
+        if (!rh.hit) { continue; }
+
+        best_t = rh.t;
+        // Rounded normal: flat-face normal bowed across the width (fakes a
+        // curved blade cross-section - the small sharp speculars trick),
+        // then blended toward up along the height so tips catch the sky.
+        let tang = normalize(seg_b - seg_a);
+        var nf = normalize(rh.perp - tang * dot(rh.perp, tang));
+        nf = nf * select(1.0, -1.0, dot(nf, dir) > 0.0);
+        var n = normalize(nf + wide_hit * rh.lat * 0.7);
+        n = normalize(mix(n, vec3<f32>(0.0, 1.0, 0.0), 0.30 + 0.35 * sblade));
+        best_n = n;
+        // Colour: clump-coherent base (shared hue + brightness), root-dark
+        // quadratic self-shadow ramp, small per-blade spread on top.
+        tint = vec3<f32>(0.34 + 0.82 * sblade * sqrt(sblade))
+            * clump_bright * (0.90 + 0.20 * fract(bh * 23.0))
+            * ground * clump_hue;
+    }
+
+    if (best_t < 1e30) {
+        out.hit = true;
+        out.t_hit = best_t;
+        out.normal = best_n;
+        out.color_tint = tint;
+    }
+    return out;
+}
+
 fn foliage_subvoxel(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32) -> SubHit {
     var hit: SubHit;
+    if (mat == MAT_TURF) {
+        // Blades vanish (dithered) where they are sub-pixel; the grass-top
+        // sheen shading carries the field beyond.
+        let cd = length(vec3<f32>(voxel) + vec3<f32>(0.5) - origin);
+        let edge = TURF_T + (hash3f(vec3<f32>(voxel)) - 0.5) * 6.0;
+        if (cd < edge) {
+            hit = turf_blade_hit(voxel, origin, dir);
+        } else {
+            hit.hit = false;
+            hit.color_tint = vec3<f32>(1.0);
+        }
+        return hit;
+    }
     if (mat == MAT_TALL_GRASS || mat == MAT_TALL_GRASS_DRY) {
         // Tiered grass: volumetric blade clumps near, crossed quads beyond,
         // with a hash-dithered edge so no switching line forms. Ray-local
@@ -3257,6 +3465,10 @@ fn blended_palette(p_hit: vec3<f32>, voxel: vec3<i32>, m: u32) -> vec3<f32> {
 // Pulled in from 120 so fewer pixels pay for GI (perf).
 const GI_MAX_T: f32 = 90.0;
 
+// Shader-pure grass turf: micro-normal/sheen terms fade out by here (the
+// blade-scale detail is sub-pixel long before this).
+const GRASS_SHADE_T: f32 = 96.0;
+
 
 fn shade(
     hit: Hit, origin: vec3<f32>, dir: vec3<f32>, pix_jit: f32,
@@ -3275,6 +3487,13 @@ fn shade(
     // hit.tint carries the sub-voxel colour (leaf shade, blade gradient,
     // petal/stem); (1,1,1) for plain cube hits.
     var base = pal * tex * hit.tint;
+    // Soil under the blade sward: the ground between blades lives in their
+    // occlusion shadow (GoT grounds read dark under the grass). Constant
+    // (view- and distance-independent) so it can never read as a moving or
+    // camera-following artifact.
+    if (hit.mat == MAT_GRASS && hit.normal.y > 0.5) {
+        base *= 0.62;
+    }
     // Skip the cube-face AO for sub-voxel sphere hits (foliage). The curved
     // sphere normal already gives rim/falloff that reads as 3D.
     // AO (12 hierarchical neighbour lookups) only near the camera — its
@@ -3331,6 +3550,50 @@ fn shade(
     // time-varying shading on geometry that visibly cannot move reads as a
     // shadow passing over it. Grass motion is carried by the tall-grass
     // cross-quad geometry standing ON the block, never by the block face.
+
+    // ---- shader-pure grass turf (water-grade shading, zero geometry) ----
+    // Realism carried entirely by shading, like the water surface: a STATIC
+    // combed blade-direction field tilts the normal and feeds an anisotropic
+    // sheen, and blade-scale micro-normals make the turf sparkle under sun
+    // and TAA. Everything here is time-invariant (statics obey the no-luma-
+    // waves rule above: only gust-scale TRAVELING fields read as shadows);
+    // aliveness stays with the blade geometry standing on the turf.
+    var g_comb = vec2<f32>(0.0);
+    var g_fade = 0.0;
+    var g_streak = 0.5;
+    if (hit.mat == MAT_GRASS && hit.normal.y > 0.5 && hit.last_axis >= 0
+        && hit.t_hit < GRASS_SHADE_T) {
+        g_fade = 1.0 - smoothstep(GRASS_SHADE_T * 0.55, GRASS_SHADE_T, hit.t_hit);
+        // Comb: which way the turf lies, swirling over ~20 voxels.
+        let th = vnoise3(vec3<f32>(p_hit.x * 0.045, 9.1, p_hit.z * 0.045)) * 6.2832;
+        g_comb = vec2<f32>(cos(th), sin(th));
+        // Blade-scale micro-normal in the COMB FRAME: the noise domain is
+        // stretched ~3x along the lay and compressed across it, so the
+        // perturbation forms fine streaks (combed blades), not felt blobs.
+        // Two octaves; isotropic noise here reads as moss, streaks as grass.
+        let perp = vec2<f32>(-g_comb.y, g_comb.x);
+        let q = vec2<f32>(dot(p_hit.xz, g_comb) * 4.5, dot(p_hit.xz, perp) * 14.0);
+        let s1x = vnoise3(vec3<f32>(q.x, 4.2, q.y)) * 2.0 - 1.0;
+        let s1z = vnoise3(vec3<f32>(q.x, 8.9, q.y)) * 2.0 - 1.0;
+        let s2x = vnoise3(vec3<f32>(q.x * 2.7, 14.3, q.y * 2.7)) * 2.0 - 1.0;
+        let s2z = vnoise3(vec3<f32>(q.x * 2.7, 21.7, q.y * 2.7)) * 2.0 - 1.0;
+        let mnx = s1x * 0.24 + s2x * 0.17;
+        let mnz = s1z * 0.24 + s2z * 0.17;
+        // Streak mask reused to break the sheen into blade glints.
+        g_streak = vnoise3(vec3<f32>(q.x * 1.7, 31.9, q.y * 1.7));
+        n = normalize(n + vec3<f32>(g_comb.x, 0.0, g_comb.y) * 0.12
+                        + vec3<f32>(mnx, 0.0, mnz) * g_fade);
+    } else if (hit.mat == MAT_TURF && hit.t_hit < GRASS_SHADE_T) {
+        // Turf BLADE hits share the sheen + backlight terms (grass is shiny
+        // and translucent - the two foliage terms flat diffuse lacks). The
+        // blade already carries a real rounded normal, so no perturbation;
+        // the area comb stands in for the blade tangent (sheen is a field
+        // response, per-blade variation comes from the normals).
+        g_fade = 1.0 - smoothstep(GRASS_SHADE_T * 0.55, GRASS_SHADE_T, hit.t_hit);
+        let th = vnoise3(vec3<f32>(p_hit.x * 0.045, 9.1, p_hit.z * 0.045)) * 6.2832;
+        g_comb = vec2<f32>(cos(th), sin(th));
+        g_streak = 0.8; // blades ARE the streaks: full glint
+    }
 
     let s = sun_dir();
     let s_int = sun_intensity(s);
@@ -3390,7 +3653,30 @@ fn shade(
     let ambient = ambient_color() * ao;
     // One-bounce indirect passed in by the caller (temporally accumulated in
     // cs_main for the RT variant; 0 for software and for secondary rays).
-    let lit = base * (direct + ambient + indirect);
+    var lit = base * (direct + ambient + indirect);
+
+    // Grass turf specular terms (see the comb block above): Kajiya-Kay
+    // sheen along the combed blade tangent - the gloss real grass throws
+    // when sun, view and lay-direction line up - plus a warm translucent
+    // backlight when looking toward a low sun. Additive specular energy,
+    // not an albedo modulation.
+    if (g_fade > 0.0 && s_int > 0.0) {
+        let bt = normalize(vec3<f32>(g_comb.x * 0.45, 1.0, g_comb.y * 0.45));
+        let hv = normalize(s - dir);
+        let tdh = dot(bt, hv);
+        let sin_th = sqrt(max(0.0, 1.0 - tdh * tdh));
+        // Gloss grows at grazing view like every rough surface's fresnel.
+        let graze = pow(1.0 - max(0.0, dot(hit.normal, -dir)), 2.0);
+        // The streak mask splits the pooled highlight into blade glints:
+        // without it the sheen reads as caustic spots on a smooth surface.
+        let glint = 0.25 + 0.75 * smoothstep(0.35, 0.75, g_streak);
+        let sheen = pow(sin_th, 24.0) * (0.25 + 0.75 * graze) * glint;
+        let back = pow(max(0.0, dot(dir, s)), 6.0)
+            * clamp(1.0 - s.y * 1.4, 0.0, 1.0);
+        lit += sun_color(s) * g_fade * (0.3 + 0.7 * shadow_term)
+            * (sheen * 0.30 * vec3<f32>(1.0, 1.0, 0.85)
+               + back * 0.30 * vec3<f32>(0.55, 0.85, 0.30));
+    }
 
     let fog_t = fog_amount(hit.t_hit);
     return mix(lit, fog_atmospheric(dir), fog_t);
@@ -3671,8 +3957,10 @@ fn cs_godrays(@builtin(global_invocation_id) gid: vec3<u32>) {
 // distance along the ray. Shared by trace_any (software) and rt_brick_occludes
 // (hardware RT) - the ONE source of the shadow occluder rule.
 fn shadow_voxel_occludes(voxel: vec3<i32>, m: u32, t_cur: f32, origin: vec3<f32>, dir: vec3<f32>) -> bool {
-    if (m == MAT_LEAF_FRINGE) {
-        // Invisible canopy fringe never occludes shadow rays.
+    if (m == MAT_LEAF_FRINGE || m == MAT_TURF) {
+        // Invisible canopy fringe never occludes shadow rays; turf blades
+        // are below shadow scale (their root-dark ramp is the self-shadow)
+        // and testing them on every ground shadow ray would be pure cost.
         return false;
     }
     if (is_decoration_mat(m)) {

@@ -262,6 +262,7 @@ pub struct App {
     /// Falling-leaf simulation (None when VOXELG_NO_LEAVES is set).
     leaf_sim: Option<leaffall::LeafSim>,
     leaf_instances: Vec<leaffall::LeafInstance>,
+    grass: crate::grass::GrassField,
     tile_dirty_mask: Vec<u32>,
     first_frame: bool,
     current_material: u8,
@@ -342,6 +343,7 @@ impl App {
                 .is_err()
                 .then(|| leaffall::LeafSim::new(0x1eaf_5eed)),
             leaf_instances: Vec::new(),
+            grass: crate::grass::GrassField::new(),
             tile_dirty_mask: Vec::with_capacity(2048),
             first_frame: true,
             current_material: MAT_STONE,
@@ -739,11 +741,15 @@ impl App {
             if let Some(sim) = &mut self.leaf_sim {
                 sim.step(&world, self.camera.pos, dt, crate::camera::sun_dir_at(sun_t));
             }
+            // Grass blade field: rescan grass-top columns when the camera
+            // strays from the last scan centre (a few ms, rare).
+            self.grass.maybe_rebuild(&world, self.camera.pos, None);
         }
         if let Some(sim) = &self.leaf_sim {
             sim.write_instances(&mut self.leaf_instances);
             self.renderer.as_mut().unwrap().upload_leaves(&self.leaf_instances);
         }
+        self.renderer.as_mut().unwrap().upload_grass(&self.grass);
         // We always re-trace at least the rotating animation subset.
         let any_dirty = true;
 

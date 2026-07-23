@@ -143,6 +143,12 @@ pub const MAT_LEAF_FRINGE: u8 = 33;
 /// Dry straw tuft decoration for sand (desert/savanna) and snow (tundra)
 /// tops - same cross-quad renderer as tall grass, its own sprite + palette.
 pub const MAT_TALL_GRASS_DRY: u8 = 34;
+/// Continuous ground turf: fills the cell above every grass block. Rendered
+/// as analytic 3D blade segments near the camera (raymarch turf_blade_hit),
+/// invisible past ~48 voxels where the grass-top combed-sheen shading
+/// carries the field. Transparent to RT/GI rays (bounce comes from the
+/// grass block below); never occludes shadow rays.
+pub const MAT_TURF: u8 = 35;
 
 #[inline(always)]
 pub fn is_leaf_mat(m: u8) -> bool {
@@ -1408,6 +1414,8 @@ pub fn gen_slot_bricks(world_chunk: glam::IVec3, seed: u64) -> Vec<Brick> {
                             } else if v > 1.0 - fp - gp {
                                 MAT_TALL_GRASS
                             } else {
+                                // Bare grass tops grow the GPU blade field
+                                // (src/grass.rs), not a voxel layer.
                                 0u8
                             }
                         }
