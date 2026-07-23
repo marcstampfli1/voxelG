@@ -5151,6 +5151,33 @@ mod gpu_render_tests {
         }
     }
 
+    /// Golden-hour meadow in the REAL demo world (rolling terrain, trees,
+    /// long shadows): the staging every grass judgment should happen in -
+    /// a flat lab plane at noon can make any grass read as a tech demo.
+    #[test]
+    #[ignore]
+    fn dump_meadow_gold() {
+        std::fs::create_dir_all("target/lookdev").unwrap();
+        let mut world = World::new();
+        world.fill_demo_terrain();
+        let mut cam = Camera::new();
+        // The meadow bench anchor, eye height above the known-flat patch.
+        cam.pos = glam::Vec3::new(280.5, 72.5, 400.0);
+        cam.yaw = 2.9;
+        cam.pitch = -0.12;
+        let Some(rgba) = render_rgba_time_sun(&world, &cam, 1920, 1080, 30.0, 66.0) else {
+            eprintln!("no GPU - skipping");
+            return;
+        };
+        let path = "target/lookdev/meadow_gold.png";
+        let file = std::fs::File::create(path).unwrap();
+        let mut enc = png::Encoder::new(std::io::BufWriter::new(file), 1920, 1080);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header().unwrap().write_image_data(&rgba).unwrap();
+        eprintln!("wrote {path}");
+    }
+
     /// A plain daytime meadow view (high sun) to sanity-check overall brightness
     /// after removing the sky_access ambient darkening.
     #[test]
