@@ -4545,6 +4545,58 @@ mod gpu_render_tests {
         }
     }
 
+    /// Flora lab (docs/FLORA_PLAN.md): crafted rows of every decoration
+    /// variant on a flat grass platform, stills from side/top/grazing. Art
+    /// iterates here in seconds; world integration only after the lab
+    /// passes Marc's eye.
+    #[test]
+    #[ignore]
+    fn flora_lab() {
+        use crate::voxel::{MAT_DIRT, MAT_FLOWER, MAT_GRASS, MAT_TALL_GRASS, MAT_TALL_GRASS_DRY};
+        let mut world = World::new();
+        for z in 200u32..216 {
+            for x in 196u32..244 {
+                world.set_voxel(x, 63, z, MAT_DIRT);
+                world.set_voxel(x, 64, z, MAT_GRASS);
+            }
+        }
+        // Two rows of cells: three green tufts (different cell hashes),
+        // one dry tuft, five flowers (species varies by cell hash).
+        let cells: [(u32, u8); 9] = [
+            (204, MAT_TALL_GRASS), (208, MAT_TALL_GRASS), (212, MAT_TALL_GRASS),
+            (216, MAT_TALL_GRASS_DRY),
+            (220, MAT_FLOWER), (224, MAT_FLOWER), (228, MAT_FLOWER),
+            (232, MAT_FLOWER), (236, MAT_FLOWER),
+        ];
+        for (x, m) in cells {
+            world.set_voxel(x, 65, 206, m);
+            world.set_voxel(x, 65, 210, m);
+        }
+        let views: [(&str, glam::Vec3, f32, f32); 3] = [
+            ("flora_lab_side", glam::Vec3::new(220.0, 66.5, 199.0), 0.0, -0.10),
+            ("flora_lab_top", glam::Vec3::new(220.0, 76.0, 206.0), 0.0, -1.30),
+            ("flora_lab_grazing", glam::Vec3::new(198.0, 65.7, 208.0), 1.5708, -0.04),
+        ];
+        std::fs::create_dir_all("target/lookdev").unwrap();
+        for (name, pos, yaw, pitch) in views {
+            let mut cam = Camera::new();
+            cam.pos = pos;
+            cam.yaw = yaw;
+            cam.pitch = pitch;
+            let Some(rgba) = render_rgba(&world, &cam, 960, 540) else {
+                eprintln!("no GPU - skipping");
+                return;
+            };
+            let path = format!("target/lookdev/{name}.png");
+            let file = std::fs::File::create(&path).unwrap();
+            let mut enc = png::Encoder::new(std::io::BufWriter::new(file), 960, 540);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            enc.write_header().unwrap().write_image_data(&rgba).unwrap();
+            eprintln!("wrote {path}");
+        }
+    }
+
     /// A plain daytime meadow view (high sun) to sanity-check overall brightness
     /// after removing the sky_access ambient darkening.
     #[test]

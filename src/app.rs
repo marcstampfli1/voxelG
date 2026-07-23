@@ -122,6 +122,9 @@ impl BenchState {
             BenchSeg { name: "water_strafe", pos: Vec3::new(452.0, 70.0, 92.0), yaw: 0.6, pitch: -0.30, strafe: 12.0, dur: 6.0, warmup: 2.0 },
             BenchSeg { name: "terrain", pos: Vec3::new(256.0, 140.0, 96.0), yaw: 0.0, pitch: -0.55, strafe: 0.0, dur: 6.0, warmup: 2.0 },
             BenchSeg { name: "foliage", pos: Vec3::new(48.5, 104.0, 244.0), yaw: 0.0, pitch: -0.35, strafe: 0.0, dur: 6.0, warmup: 2.0 },
+            // Low over the flat treeless grass patch (the flora overhaul's
+            // standing gate: near-tier grass renders here at full density).
+            BenchSeg { name: "meadow", pos: Vec3::new(280.5, 74.0, 400.0), yaw: 0.0, pitch: -0.45, strafe: 0.0, dur: 6.0, warmup: 2.0 },
         ];
         Some(Self {
             segments: segs, idx: 0, seg_start: Instant::now(),
