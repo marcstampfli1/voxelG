@@ -70,6 +70,8 @@ fn main() {
     if std::env::var("VOXELG_BENCH").is_ok() {
         std::env::set_var("VOXELG_UNCAPPED", "1");
         std::env::set_var("VOXELG_RT", "1");
+        // Per-segment GPU-pass attribution rides the existing profiler.
+        std::env::set_var("VOXELG_GPU_PROFILE", "1");
         opts.freeze_time = Some(30.0);
     }
     match mode {

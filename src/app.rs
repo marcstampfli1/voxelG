@@ -69,6 +69,13 @@ pub(crate) struct BenchState {
     seg_start: Instant,
     dts: Vec<f32>,
     results: Vec<String>,
+    // Per-segment GPU-pass attribution, fed from the renderer's profiler
+    // samples (1 in 64 dirty frames), deduped by its report counter. The
+    // residual (segment frame ms - gpu total) exposes CPU/present cost.
+    gpu_acc: [f64; 9],
+    gpu_total: f64,
+    gpu_n: u32,
+    last_report_seen: u64,
 }
 
 impl BenchState {
@@ -116,7 +123,11 @@ impl BenchState {
             BenchSeg { name: "terrain", pos: Vec3::new(256.0, 140.0, 96.0), yaw: 0.0, pitch: -0.55, strafe: 0.0, dur: 6.0, warmup: 2.0 },
             BenchSeg { name: "foliage", pos: Vec3::new(48.5, 104.0, 244.0), yaw: 0.0, pitch: -0.35, strafe: 0.0, dur: 6.0, warmup: 2.0 },
         ];
-        Some(Self { segments: segs, idx: 0, seg_start: Instant::now(), dts: Vec::with_capacity(4096), results: Vec::new() })
+        Some(Self {
+            segments: segs, idx: 0, seg_start: Instant::now(),
+            dts: Vec::with_capacity(4096), results: Vec::new(),
+            gpu_acc: [0.0; 9], gpu_total: 0.0, gpu_n: 0, last_report_seen: 0,
+        })
     }
 
     /// Drive the camera for this frame; returns false when the bench is done.
@@ -140,7 +151,21 @@ impl BenchState {
                     "bench [{}]: avg {:.0} fps ({:.2} ms)  p1 {:.0}  p99 {:.0}  frames {}",
                     seg.name, 1.0 / mean, mean * 1000.0, 1.0 / p(0.99), 1.0 / p(0.01), d.len()
                 ));
+                if self.gpu_n > 0 {
+                    let n = self.gpu_n as f64;
+                    let mut line = format!("  gpu [{}]:", seg.name);
+                    for (i, l) in crate::renderer::GPU_PROFILE_LABELS.iter().enumerate() {
+                        line.push_str(&format!(" {l} {:.2}", self.gpu_acc[i] / n));
+                    }
+                    let gt = self.gpu_total / n;
+                    line.push_str(&format!("  | gpu {gt:.2}  residual {:.2}  (samples {})",
+                        (mean as f64) * 1000.0 - gt, self.gpu_n));
+                    self.results.push(line);
+                }
             }
+            self.gpu_acc = [0.0; 9];
+            self.gpu_total = 0.0;
+            self.gpu_n = 0;
             self.idx += 1;
             self.seg_start = now;
             if self.idx >= self.segments.len() {
@@ -550,6 +575,18 @@ impl App {
         self.camera.translate_local(dt, f * speed, r * speed, u * speed);
         // Benchmark mode: the script owns the camera (input overridden).
         if let Some(mut b) = self.bench.take() {
+            if let Some(r) = self.renderer.as_ref() {
+                if let Some(p) = &r.gpu_profiler {
+                    if p.reports != b.last_report_seen && p.reports > 0 {
+                        b.last_report_seen = p.reports;
+                        for i in 0..9 {
+                            b.gpu_acc[i] += p.last[i];
+                        }
+                        b.gpu_total += p.last_total;
+                        b.gpu_n += 1;
+                    }
+                }
+            }
             if b.step(&mut self.camera, dt) {
                 self.bench = Some(b);
             } else {
