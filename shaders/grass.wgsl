@@ -335,5 +335,7 @@ fn fs_grass(in: VsOut) -> @location(0) vec4<f32> {
     let fog = fog_amount_g(in.view_t);
     let haze = mix(vec3<f32>(0.60, 0.70, 0.85), vec3<f32>(0.75, 0.80, 0.95), 0.5) * (0.35 + 0.65 * s_int);
     col = mix(col, haze, fog);
-    return vec4<f32>(col, 1.0);
+    // Alpha 0 marks blade pixels for the TAA resolve: swaying thin blades
+    // must not inherit the terrain history behind them (ghost blades).
+    return vec4<f32>(col, 0.0);
 }

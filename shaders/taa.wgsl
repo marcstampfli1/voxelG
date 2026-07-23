@@ -23,7 +23,13 @@ fn cs_taa(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = vec2<i32>(i32(gid.x), i32(gid.y));
     if (p.x >= res.x || p.y >= res.y) { return; }
 
-    let cur = textureLoad(current_tex, p, 0).rgb;
+    let cur4 = textureLoad(current_tex, p, 0);
+    let cur = cur4.rgb;
+    // Grass-blade pixels (alpha marker 0): thin geometry sways every frame,
+    // so reprojected terrain history behind a blade bleeds THROUGH it at
+    // high blend weights - blades looked translucent. Same-pixel history
+    // at a much lower weight keeps them solid with some temporal smoothing.
+    let is_blade = cur4.a < 0.5;
 
     // Hard reset (first frame / after resize → taa_blend 0) or no valid
     // reprojection basis (origin shifted on a chunk cross → reproject_lighting 0)
@@ -40,7 +46,7 @@ fn cs_taa(@builtin(global_invocation_id) gid: vec3<u32>) {
     var hp = p; // history pixel
     let g = textureLoad(gbuffer, p, 0);
     // Sentinel position (1e9) marks sky/foliage/water — only terrain reprojects.
-    if (camera.reproject_lighting > 0.5 && g.x < 1e8) {
+    if (!is_blade && camera.reproject_lighting > 0.5 && g.x < 1e8) {
         let abs_pos = g.xyz + vec3<f32>(camera.world_origin);
         let d = abs_pos - camera.prev_origin;
         let pz = dot(d, camera.prev_forward);
@@ -72,6 +78,7 @@ fn cs_taa(@builtin(global_invocation_id) gid: vec3<u32>) {
     // (rejects ghosting/disocclusion) and blend.
     let hist = textureLoad(history_tex, hp, 0).rgb;
     let hist_clamped = clamp(hist, mn, mx);
-    let resolved = mix(cur, hist_clamped, camera.taa_blend);
+    let blend = select(camera.taa_blend, camera.taa_blend * 0.45, is_blade);
+    let resolved = mix(cur, hist_clamped, blend);
     textureStore(resolve_out, p, vec4<f32>(resolved, 1.0));
 }

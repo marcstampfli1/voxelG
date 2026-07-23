@@ -81,7 +81,8 @@ fn cs_post(@builtin(global_invocation_id) gid: vec3<u32>) {
     let res = vec2<i32>(camera.resolution);
     let p = vec2<i32>(gid.xy);
     if (p.x >= res.x || p.y >= res.y) { return; }
-    var hdr = textureLoad(hdr_tex, p, 0).rgb;
+    let hdr4 = textureLoad(hdr_tex, p, 0);
+    var hdr = hdr4.rgb;
     // Bilinear-upsampled bloom, additive with a restrained weight.
     let uv = (vec2<f32>(p) + vec2<f32>(0.5)) / camera.resolution;
     let bloom = textureSampleLevel(bloom_in, lin_sampler, uv, 0.0).rgb;
@@ -99,5 +100,6 @@ fn cs_post(@builtin(global_invocation_id) gid: vec3<u32>) {
     c *= vec3<f32>(1.0) + high_w * vec3<f32>(0.05, 0.02, -0.04);
     c = mix(vec3<f32>(luma), c, 1.12);
 
-    textureStore(ldr_out, p, vec4<f32>(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0));
+    // Alpha carries the grass-blade marker through to the TAA resolve.
+    textureStore(ldr_out, p, vec4<f32>(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)), hdr4.a));
 }
