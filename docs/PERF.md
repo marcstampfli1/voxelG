@@ -108,6 +108,17 @@ Live static frames (tile-gated): ~1.9-2.5 ms GPU total.
   flickered dappled shadows. (Foliage cost is PRIMARY-ray blade cutouts.)
 - Water secondary-shading LOD + refraction cap 40 + grazing reflection cap:
   perf ~neutral on water-close and damaged the look (user reverted).
+- Half-resolution reflection pass (cs_water_refl, quad-shared reflected
+  content): the largest measured win of the hunt - water_mid 93 -> 169 fps,
+  grazing 75 -> 155, strafe 63 -> 97 - but REJECTED BY MARC'S EYE and
+  reverted (906be0c): sharp upsample showed quad edges, 4-tap surface-aware
+  bilinear still edgy from distance, 9-tap tent read as blur. Per the
+  standing rule, lower internal resolution only counts as an optimization
+  when it is invisible; this was not. PARKED VARIANT (on Marc's ask only):
+  distance-GATED half-res - full-res beyond ~30 voxels (where the flaws
+  showed), half-res near where quads subtend less than a wave; would keep a
+  large share of the win invisibly. The revert keeps the committed pass
+  history for easy re-application.
 - Fog-bounded reflection range at grazing (cap skimming rays, resolve to
   fog): NULL on the bench pairs - grazing reflections mostly hit NEARBY
   terraced terrain, not distant geometry, so range caps save nothing. The
