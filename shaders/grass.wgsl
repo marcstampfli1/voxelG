@@ -286,7 +286,11 @@ fn fs_grass(in: VsOut) -> @location(0) vec4<f32> {
     // Cool sky ambient against the warm sun (the two-tone light contrast
     // stylized fields live on), scaled by the cached ground AO + sward.
     let sky_f = 0.25 + 0.75 * s_int;
-    let ambient = vec3<f32>(0.24, 0.32, 0.46) * 1.15 * sky_f * ao * sward;
+    // Cool sky term plus a green ground-bounce floor: grass in tree shade
+    // reads deep green, never black (the bounce is what real swards do).
+    let ambient = (vec3<f32>(0.24, 0.32, 0.46) * 1.15 * ao
+                   + vec3<f32>(0.10, 0.16, 0.06) * (0.4 + 0.6 * ao))
+        * sky_f * sward;
 
     let albedo = mix(in.albedo0, in.albedo1, sblade * sblade * 0.6 + sblade * 0.4);
     var col = albedo * (direct + ambient);

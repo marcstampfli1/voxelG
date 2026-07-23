@@ -360,6 +360,17 @@ pub struct Renderer {
     grass_offsets: [u32; 3],
     grass_version: u64,
 
+    // HDR post stack (shaders/post.wgsl): bloom + tonemap + grade.
+    ldr_view: wgpu::TextureView,
+    bloom_a_view: wgpu::TextureView,
+    bloom_b_view: wgpu::TextureView,
+    post_bgl: wgpu::BindGroupLayout,
+    post_pipes: PostStack,
+    post_bg_bright: wgpu::BindGroup,
+    post_bg_blur_h: wgpu::BindGroup,
+    post_bg_blur_v: wgpu::BindGroup,
+    post_bg_final: wgpu::BindGroup,
+
     // Half-res volumetric (cloud) pass. The texture handle is dropped after
     // creation — its views keep the GPU resource alive.
     cloud_bgl: wgpu::BindGroupLayout,
@@ -668,7 +679,10 @@ impl Renderer {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
-        let (output_tex, output_view) = create_output_texture(&device, width, height);
+        let (output_tex, output_view) = create_hdr_texture(&device, width, height);
+        let (_ldr_tex, ldr_view) = create_output_texture(&device, width, height);
+        let (_bloom_a, bloom_a_view) = create_hdr_texture(&device, width.div_ceil(2), height.div_ceil(2));
+        let (_bloom_b, bloom_b_view) = create_hdr_texture(&device, width.div_ceil(2), height.div_ceil(2));
         let (beam_tex, beam_view) = create_beam_texture(&device, width, height);
         // resolve_tex shares the output usage (storage write + sampled + copy
         // src); history_tex is sampled + copy dst.
@@ -700,7 +714,7 @@ impl Renderer {
         let (depth_tex, depth_view) = create_depth_texture(&device, width, height);
         // Geometry colour target for cs_main/cs_transparent; cs_compose
         // reads it and writes the final pre-TAA image into output_tex.
-        let (geom_tex, geom_view) = create_output_texture(&device, width, height);
+        let (geom_tex, geom_view) = create_hdr_texture(&device, width, height);
         // 1x1 dummy r32float storage: fills the depth-out slot in the
         // compose bind group, where the REAL depth is bound as a sampled
         // input and binding the same texture for write would be a usage
@@ -1064,7 +1078,14 @@ impl Renderer {
             compilation_options: Default::default(),
             cache: None,
         });
-        let taa_bg = make_taa_bg(&device, &taa_bgl, &camera_buf, &output_view, &history_view, &resolve_view, &light_out_view);
+        let taa_bg = make_taa_bg(&device, &taa_bgl, &camera_buf, &ldr_view, &history_view, &resolve_view, &light_out_view);
+
+        let post_bgl = create_post_bgl(&device);
+        let post_pipes = create_post_pipelines(&device, &post_bgl);
+        let post_bg_bright = make_post_bg(&device, &post_bgl, &camera_buf, &output_view, &bloom_b_view, &bloom_a_view, &ldr_view, &sampler);
+        let post_bg_blur_h = make_post_bg(&device, &post_bgl, &camera_buf, &output_view, &bloom_a_view, &bloom_b_view, &ldr_view, &sampler);
+        let post_bg_blur_v = make_post_bg(&device, &post_bgl, &camera_buf, &output_view, &bloom_b_view, &bloom_a_view, &ldr_view, &sampler);
+        let post_bg_final = make_post_bg(&device, &post_bgl, &camera_buf, &output_view, &bloom_a_view, &bloom_b_view, &ldr_view, &sampler);
 
         Ok(Self {
             device, queue, surface, config,
@@ -1091,6 +1112,8 @@ impl Renderer {
             leaves_buf, leaf_count: 0, leaf_bgl, leaf_pipeline, leaf_bg,
             grass_cells_buf, grass_bgl, grass_pipelines, grass_bg, grass_depth_view,
             grass_counts: [0; 3], grass_offsets: [0; 3], grass_version: 0,
+            ldr_view, bloom_a_view, bloom_b_view, post_bgl, post_pipes,
+            post_bg_bright, post_bg_blur_h, post_bg_blur_v, post_bg_final,
             bricks_buf_b, physics_pipeline, physics_bg, gpu_physics: gpu_physics_enabled,
             cloud_bgl, cloud_pipeline, cloud_bg, cloud_sampled_view, cloud_storage_view,
             light_out_tex, light_out_view, light_hist_tex, light_hist_view,
@@ -1117,7 +1140,7 @@ impl Renderer {
         self.config.height = h;
         self.surface.configure(&self.device, &self.config);
 
-        let (tex, view) = create_output_texture(&self.device, rw, rh);
+        let (tex, view) = create_hdr_texture(&self.device, rw, rh);
         self.output_tex = tex;
         self.output_view = view;
         let (btex, bview) = create_beam_texture(&self.device, rw, rh);
@@ -1142,7 +1165,7 @@ impl Renderer {
         let (dt, dv) = create_depth_texture(&self.device, rw, rh);
         self.depth_tex = dt;
         self.depth_view = dv;
-        let (gt, gv) = create_output_texture(&self.device, rw, rh);
+        let (gt, gv) = create_hdr_texture(&self.device, rw, rh);
         self.geom_tex = gt;
         self.geom_view = gv;
         self.leaf_bg = make_leaf_bg(
@@ -1151,6 +1174,16 @@ impl Renderer {
         );
         let (_gdt, gdv) = create_grass_depth(&self.device, rw, rh);
         self.grass_depth_view = gdv;
+        let (_lt, lv) = create_output_texture(&self.device, rw, rh);
+        self.ldr_view = lv;
+        let (_ba, bav) = create_hdr_texture(&self.device, rw.div_ceil(2), rh.div_ceil(2));
+        let (_bb, bbv) = create_hdr_texture(&self.device, rw.div_ceil(2), rh.div_ceil(2));
+        self.bloom_a_view = bav;
+        self.bloom_b_view = bbv;
+        self.post_bg_bright = make_post_bg(&self.device, &self.post_bgl, &self.camera_buf, &self.output_view, &self.bloom_b_view, &self.bloom_a_view, &self.ldr_view, &self.sampler);
+        self.post_bg_blur_h = make_post_bg(&self.device, &self.post_bgl, &self.camera_buf, &self.output_view, &self.bloom_a_view, &self.bloom_b_view, &self.ldr_view, &self.sampler);
+        self.post_bg_blur_v = make_post_bg(&self.device, &self.post_bgl, &self.camera_buf, &self.output_view, &self.bloom_b_view, &self.bloom_a_view, &self.ldr_view, &self.sampler);
+        self.post_bg_final = make_post_bg(&self.device, &self.post_bgl, &self.camera_buf, &self.output_view, &self.bloom_a_view, &self.bloom_b_view, &self.ldr_view, &self.sampler);
         self.grass_bg = make_grass_bg(
             &self.device, &self.grass_bgl, &self.camera_buf, &self.grass_cells_buf,
             &self.depth_view, &self.light_out_view,
@@ -1179,7 +1212,7 @@ impl Renderer {
             &self.device, &self.beam_bgl, &self.camera_buf, &self.chunk_mask_buf, &self.beam_view,
         );
         self.taa_bg = make_taa_bg(
-            &self.device, &self.taa_bgl, &self.camera_buf, &self.output_view, &self.history_view, &self.resolve_view,
+            &self.device, &self.taa_bgl, &self.camera_buf, &self.ldr_view, &self.history_view, &self.resolve_view,
             &self.light_out_view,
         );
         self.blit_bg = make_blit_bg(&self.device, &self.blit_bgl, &self.resolve_view, &self.sampler);
@@ -1689,6 +1722,26 @@ impl Renderer {
                     );
                 }
             }
+            // ---- HDR post stack: bloom + filmic tonemap + grade -> LDR ----
+            {
+                let hw = self.size.0.div_ceil(2);
+                let hh = self.size.1.div_ceil(2);
+                let stages: [(&wgpu::ComputePipeline, &wgpu::BindGroup, u32, u32); 4] = [
+                    (&self.post_pipes.bright, &self.post_bg_bright, hw, hh),
+                    (&self.post_pipes.blur_h, &self.post_bg_blur_h, hw, hh),
+                    (&self.post_pipes.blur_v, &self.post_bg_blur_v, hw, hh),
+                    (&self.post_pipes.post, &self.post_bg_final, self.size.0, self.size.1),
+                ];
+                for (pipe, bg, w, h) in stages {
+                    let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("post"),
+                        timestamp_writes: None,
+                    });
+                    cp.set_pipeline(pipe);
+                    cp.set_bind_group(0, bg, &[]);
+                    cp.dispatch_workgroups(w.div_ceil(8), h.div_ceil(8), 1);
+                }
+            }
             // ---- TAA resolve: raymarch output + history -> resolve ----
             {
                 let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1805,6 +1858,143 @@ impl Renderer {
         self.queue.present(frame);
         Ok(())
     }
+}
+
+/// HDR scene target: compose and the grass pass write it, the post stack
+/// (bloom + tonemap, shaders/post.wgsl) reads it down to LDR.
+fn create_hdr_texture(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture, wgpu::TextureView) {
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("hdr scene"),
+        size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::STORAGE_BINDING
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+    (tex, view)
+}
+
+pub(crate) fn post_source() -> String {
+    format!("{}\n{}", COMMON_WGSL, include_str!("../shaders/post.wgsl"))
+}
+
+fn create_post_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    let tex = |binding| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    };
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("post bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            tex(1),
+            tex(2),
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::WriteOnly,
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::WriteOnly,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 5,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    })
+}
+
+struct PostStack {
+    bright: wgpu::ComputePipeline,
+    blur_h: wgpu::ComputePipeline,
+    blur_v: wgpu::ComputePipeline,
+    post: wgpu::ComputePipeline,
+}
+
+fn create_post_pipelines(device: &wgpu::Device, bgl: &wgpu::BindGroupLayout) -> PostStack {
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("post shader"),
+        source: wgpu::ShaderSource::Wgsl(post_source().into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("post pl"),
+        bind_group_layouts: &[Some(bgl)],
+        immediate_size: 0,
+    });
+    let mk = |entry: &'static str| device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some(entry),
+        layout: Some(&layout),
+        module: &module,
+        entry_point: Some(entry),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    PostStack {
+        bright: mk("cs_bright"),
+        blur_h: mk("cs_blur_h"),
+        blur_v: mk("cs_blur_v"),
+        post: mk("cs_post"),
+    }
+}
+
+fn make_post_bg(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    camera_buf: &wgpu::Buffer,
+    hdr: &wgpu::TextureView,
+    bloom_in: &wgpu::TextureView,
+    bloom_out: &wgpu::TextureView,
+    ldr: &wgpu::TextureView,
+    sampler: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("post bg"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: camera_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(hdr) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(bloom_in) },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(bloom_out) },
+            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(ldr) },
+            wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(sampler) },
+        ],
+    })
 }
 
 fn create_output_texture(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture, wgpu::TextureView) {
@@ -2162,7 +2352,7 @@ fn create_grass_pipelines(
                 module: &module,
                 entry_point: Some("fs_grass"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    format: wgpu::TextureFormat::Rgba16Float,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -2297,7 +2487,7 @@ fn create_compute_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
             bgl_storage(2, true), // tile_mask
             bgl_storage(3, true), // chunk_mask
             bgl_uniform(4),       // palette
-            bgl_storage_tex(5, wgpu::TextureFormat::Rgba8Unorm), // output
+            bgl_storage_tex(5, wgpu::TextureFormat::Rgba16Float), // output (HDR)
             bgl_tex(6, false),    // beam depth texture
             bgl_storage(7, true),  // tile_dirty
             bgl_storage(8, true),  // players
@@ -2976,7 +3166,7 @@ mod gpu_render_tests {
         let tile_dirty_buf = storage(&device, "tile_dirty", bytemuck::cast_slice(&vec![u32::MAX; words]));
         let players_buf = storage(&device, "players", &vec![0u8; 16 + MAX_REMOTE_PLAYERS * 16]);
 
-        let (_otex, output_view) = create_output_texture(&device, w, h);
+        let (_otex, output_view) = create_hdr_texture(&device, w, h);
         let output_tex = _otex;
         let (_btex, beam_view) = create_beam_texture(&device, w, h);
         let (_ctex, cloud_sampled_view, cloud_storage_view) = create_cloud_texture(&device, w, h);
@@ -2993,7 +3183,7 @@ mod gpu_render_tests {
         let transp_buf = create_transp_buf(&device, w, h);
         let sprites_buf = storage(&device, "sprites", bytemuck::cast_slice(&crate::sprites::encoded()));
         let (_dtex, depth_view) = create_depth_texture(&device, w, h);
-        let (_gtex, geom_view) = create_output_texture(&device, w, h);
+        let (_gtex, geom_view) = create_hdr_texture(&device, w, h);
         let (_ddtex, dummy_depth_view) = create_depth_texture(&device, 1, 1);
         let bg = make_compute_bg(
             &device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
@@ -3184,6 +3374,38 @@ mod gpu_render_tests {
                 }
             }
         }
+        // HDR post stack (bloom + tonemap + grade), mirroring the live
+        // renderer; the readback and the leaf overlay consume the LDR.
+        let (_ldr_tex, ldr_view) = create_output_texture(&device, w, h);
+        let ldr_tex = _ldr_tex;
+        {
+            let (_ba, bav) = create_hdr_texture(&device, w.div_ceil(2), h.div_ceil(2));
+            let (_bb, bbv) = create_hdr_texture(&device, w.div_ceil(2), h.div_ceil(2));
+            let lin = device.create_sampler(&wgpu::SamplerDescriptor {
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                ..Default::default()
+            });
+            let post_bgl = create_post_bgl(&device);
+            let pp = create_post_pipelines(&device, &post_bgl);
+            let bg_bright = make_post_bg(&device, &post_bgl, &camera_buf, &output_view, &bbv, &bav, &ldr_view, &lin);
+            let bg_h = make_post_bg(&device, &post_bgl, &camera_buf, &output_view, &bav, &bbv, &ldr_view, &lin);
+            let bg_v = make_post_bg(&device, &post_bgl, &camera_buf, &output_view, &bbv, &bav, &ldr_view, &lin);
+            let bg_f = make_post_bg(&device, &post_bgl, &camera_buf, &output_view, &bav, &bbv, &ldr_view, &lin);
+            let (hw2, hh2) = (w.div_ceil(2), h.div_ceil(2));
+            let stages: [(&wgpu::ComputePipeline, &wgpu::BindGroup, u32, u32); 4] = [
+                (&pp.bright, &bg_bright, hw2, hh2),
+                (&pp.blur_h, &bg_h, hw2, hh2),
+                (&pp.blur_v, &bg_v, hw2, hh2),
+                (&pp.post, &bg_f, w, h),
+            ];
+            for (pipe, bg, pw, ph) in stages {
+                let mut cp = enc.begin_compute_pass(&Default::default());
+                cp.set_pipeline(pipe);
+                cp.set_bind_group(0, bg, &[]);
+                cp.dispatch_workgroups(pw.div_ceil(8), ph.div_ceil(8), 1);
+            }
+        }
         if !leaves.is_empty() {
             let leaves_buf = storage(&device, "leaves", bytemuck::cast_slice(leaves));
             let leaf_bgl = create_leaf_bgl(&device);
@@ -3192,7 +3414,7 @@ mod gpu_render_tests {
             let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("test leaves"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &output_view,
+                    view: &ldr_view,
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
@@ -3208,7 +3430,7 @@ mod gpu_render_tests {
         }
         enc.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
-                texture: &output_tex,
+                texture: &ldr_tex,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -3367,7 +3589,7 @@ mod gpu_render_tests {
         let words = ((tiles_w * tiles_h) as usize + 31) / 32;
         let tile_dirty_buf = storage(&device, "td", bytemuck::cast_slice(&vec![u32::MAX; words]));
         let players_buf = storage(&device, "pl", &vec![0u8; 16 + MAX_REMOTE_PLAYERS * 16]);
-        let (out_tex, output_view) = create_output_texture(&device, w, h);
+        let (out_tex, output_view) = create_hdr_texture(&device, w, h);
         let (_btex, beam_view) = create_beam_texture(&device, w, h);
         let (_ctex, cloud_sampled_view, _csv) = create_cloud_texture(&device, w, h);
         let cloud_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -3381,7 +3603,7 @@ mod gpu_render_tests {
         let transp_buf = create_transp_buf(&device, w, h);
         let sprites_buf = storage(&device, "spr", bytemuck::cast_slice(&crate::sprites::encoded()));
         let (_dtex, depth_view) = create_depth_texture(&device, w, h);
-        let (_gtex, geom_view) = create_output_texture(&device, w, h);
+        let (_gtex, geom_view) = create_hdr_texture(&device, w, h);
         let (_ddtex, dummy_depth_view) = create_depth_texture(&device, 1, 1);
         let bgl = create_compute_bgl(&device);
         // main flavour (writes geom+depth) and compose flavour (writes output,
@@ -4153,7 +4375,7 @@ mod gpu_render_tests {
         let words = (((w + 7) / 8 * ((h + 7) / 8)) as usize + 31) / 32;
         let tile_dirty_buf = storage(device, "tile_dirty", bytemuck::cast_slice(&vec![u32::MAX; words]));
         let players_buf = storage(device, "players", &vec![0u8; 16 + MAX_REMOTE_PLAYERS * 16]);
-        let (out_tex, output_view) = create_output_texture(device, w, h);
+        let (out_tex, output_view) = create_hdr_texture(device, w, h);
         let (_btex, beam_view) = create_beam_texture(device, w, h);
         let (_ctex, cloud_sampled_view, _cloud_storage_view) = create_cloud_texture(device, w, h);
         let cloud_sampler = device.create_sampler(&wgpu::SamplerDescriptor { label: None, mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
@@ -4162,7 +4384,7 @@ mod gpu_render_tests {
         let transp_buf = create_transp_buf(device, w, h);
         let sprites_buf = storage(device, "sprites", bytemuck::cast_slice(&crate::sprites::encoded()));
         let (_dtex, depth_view) = create_depth_texture(device, w, h);
-        let (_gtex, geom_view) = create_output_texture(device, w, h);
+        let (_gtex, geom_view) = create_hdr_texture(device, w, h);
         let (_ddtex, dummy_depth_view) = create_depth_texture(device, 1, 1);
         let bgl = create_compute_bgl(device);
         let bg = make_compute_bg(
@@ -4195,7 +4417,7 @@ mod gpu_render_tests {
         // must touch every probe each pass (no amortization striding).
         let update = mk("cs_gi_probe_update", &[("GI_ENABLE", 1.0), ("RT_PRIMARY", 1.0), ("GI_PROBE_MODE", 1.0), ("GI_UPDATE_DIV", 1.0)]);
 
-        let bpr = w * 4;
+        let bpr = w * 8; // rgba16float texels
         let render = |main: &wgpu::ComputePipeline, converge: u32| -> Vec<u8> {
             let mut enc = device.create_command_encoder(&Default::default());
             // Converge the probes (each pass = one frame of temporal accumulation).
@@ -4226,7 +4448,27 @@ mod gpu_render_tests {
             let slice = readback.slice(..);
             slice.map_async(wgpu::MapMode::Read, |_| {});
             device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-            slice.get_mapped_range().unwrap().to_vec()
+            let raw = slice.get_mapped_range().unwrap().to_vec();
+            // Fold rgba16float texels to the rgba8 layout the luma math uses.
+            let half_to_u8 = |bits: u16| -> u8 {
+                let exp = ((bits >> 10) & 0x1F) as i32;
+                let man = (bits & 0x3FF) as f32;
+                let mag = if exp == 0 {
+                    man / 1024.0 * (-14f32).exp2()
+                } else {
+                    (1.0 + man / 1024.0) * ((exp - 15) as f32).exp2()
+                };
+                let v = if bits & 0x8000 != 0 { -mag } else { mag };
+                (v.clamp(0.0, 1.0) * 255.0).round() as u8
+            };
+            let mut out = vec![0u8; (w * h * 4) as usize];
+            for i in 0..(w * h) as usize {
+                for c in 0..4 {
+                    let bits = u16::from_le_bytes([raw[i * 8 + c * 2], raw[i * 8 + c * 2 + 1]]);
+                    out[i * 4 + c] = half_to_u8(bits);
+                }
+            }
+            out
         };
 
         let a = render(&off, 0);          // GI off
@@ -4281,7 +4523,7 @@ mod gpu_render_tests {
         let words = ((tiles_w * tiles_h) as usize + 31) / 32;
         let tile_dirty_buf = storage(device, "tile_dirty", bytemuck::cast_slice(&vec![u32::MAX; words]));
         let players_buf = storage(device, "players", &vec![0u8; 16 + MAX_REMOTE_PLAYERS * 16]);
-        let (out_tex, output_view) = create_output_texture(device, w, h);
+        let (out_tex, output_view) = create_hdr_texture(device, w, h);
         let (_btex, beam_view) = create_beam_texture(device, w, h);
         let (_ctex, cloud_sampled_view, _cloud_storage_view) = create_cloud_texture(device, w, h);
         let cloud_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -4295,7 +4537,7 @@ mod gpu_render_tests {
         let transp_buf = create_transp_buf(device, w, h);
         let sprites_buf = storage(device, "sprites", bytemuck::cast_slice(&crate::sprites::encoded()));
         let (_dtex, depth_view) = create_depth_texture(device, w, h);
-        let (_gtex, geom_view) = create_output_texture(device, w, h);
+        let (_gtex, geom_view) = create_hdr_texture(device, w, h);
         let (_ddtex, dummy_depth_view) = create_depth_texture(device, 1, 1);
         let bgl = create_compute_bgl(device);
         let bg = make_compute_bg(
@@ -4353,7 +4595,20 @@ mod gpu_render_tests {
             cache: None,
         });
 
-        let bpr = w * 4;
+        // The output is HDR rgba16float now: read 8-byte texels and fold the
+        // halves back to the u8 space the comparison math was written for.
+        let bpr = w * 8;
+        let half_to_u8 = |bits: u16| -> u8 {
+            let exp = ((bits >> 10) & 0x1F) as i32;
+            let man = (bits & 0x3FF) as f32;
+            let mag = if exp == 0 {
+                man / 1024.0 * (-14f32).exp2()
+            } else {
+                (1.0 + man / 1024.0) * ((exp - 15) as f32).exp2()
+            };
+            let v = if bits & 0x8000 != 0 { -mag } else { mag };
+            (v.clamp(0.0, 1.0) * 255.0).round() as u8
+        };
         let render = |pipeline: &wgpu::ComputePipeline, rt: bool| -> Vec<u8> {
             let readback = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("readback"),
@@ -4386,7 +4641,15 @@ mod gpu_render_tests {
             let slice = readback.slice(..);
             slice.map_async(wgpu::MapMode::Read, |_| {});
             device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-            slice.get_mapped_range().unwrap().to_vec()
+            let raw = slice.get_mapped_range().unwrap().to_vec();
+            let mut out = vec![0u8; (w * h * 4) as usize];
+            for i in 0..(w * h) as usize {
+                for c in 0..4 {
+                    let bits = u16::from_le_bytes([raw[i * 8 + c * 2], raw[i * 8 + c * 2 + 1]]);
+                    out[i * 4 + c] = half_to_u8(bits);
+                }
+            }
+            out
         };
 
         let sw = render(&sw_pipeline, false);
@@ -4622,6 +4885,58 @@ mod gpu_render_tests {
     /// keep frame A's pixels, exactly like the rotating anim-refresh leaves
     /// most tiles stale each frame. Returns frame B. Any per-frame-varying
     /// term baked inside the tile-gated pass shows up as tile-aligned seams.
+    /// Read an rgba16float texture back and fold to rgba8-shaped bytes so
+    /// luma math written for 4-byte texels keeps working on HDR sources.
+    fn read_hdr_as_rgba8(
+        device: &wgpu::Device, queue: &wgpu::Queue, tex: &wgpu::Texture, w: u32, h: u32,
+    ) -> Vec<u8> {
+        let half_to_u8 = |bits: u16| -> u8 {
+            let exp = ((bits >> 10) & 0x1F) as i32;
+            let man = (bits & 0x3FF) as f32;
+            let mag = if exp == 0 {
+                man / 1024.0 * (-14f32).exp2()
+            } else {
+                (1.0 + man / 1024.0) * ((exp - 15) as f32).exp2()
+            };
+            let v = if bits & 0x8000 != 0 { -mag } else { mag };
+            (v.clamp(0.0, 1.0) * 255.0).round() as u8
+        };
+        let bpr = w * 8;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("hdr readback"),
+            size: (bpr * h) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut e = device.create_command_encoder(&Default::default());
+        e.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: tex, mip_level: 0, origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        queue.submit(std::iter::once(e.finish()));
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        let raw = slice.get_mapped_range().unwrap().to_vec();
+        let mut out = vec![0u8; (w * h * 4) as usize];
+        for i in 0..(w * h) as usize {
+            for c in 0..4 {
+                let bits = u16::from_le_bytes([raw[i * 8 + c * 2], raw[i * 8 + c * 2 + 1]]);
+                out[i * 4 + c] = half_to_u8(bits);
+            }
+        }
+        out
+    }
+
     fn render_checkerboard_probe(
         world: &World, cam: &Camera, w: u32, h: u32, t0: f32, t1: f32,
     ) -> Option<Vec<u8>> {
@@ -4650,7 +4965,7 @@ mod gpu_render_tests {
         let words = ((tiles_w * tiles_h) as usize + 31) / 32;
         let td = storage(&device, "td", bytemuck::cast_slice(&vec![u32::MAX; words]));
         let players = storage(&device, "pl", &vec![0u8; 16 + MAX_REMOTE_PLAYERS * 16]);
-        let (_o, ov) = create_output_texture(&device, w, h);
+        let (_o, ov) = create_hdr_texture(&device, w, h);
         let (_b, bv) = create_beam_texture(&device, w, h);
         let (_c, csv, _csw) = create_cloud_texture(&device, w, h);
         let csamp = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -4663,7 +4978,7 @@ mod gpu_render_tests {
         let tpb = create_transp_buf(&device, w, h);
         let spr = storage(&device, "sprites", bytemuck::cast_slice(&crate::sprites::encoded()));
         let (_dt, dv) = create_depth_texture(&device, w, h);
-        let (_gt, gv) = create_output_texture(&device, w, h);
+        let (_gt, gv) = create_hdr_texture(&device, w, h);
         let (_dd, ddv) = create_depth_texture(&device, 1, 1);
         let bgl = create_compute_bgl(&device);
         let bg = make_compute_bg(
@@ -4743,33 +5058,7 @@ mod gpu_render_tests {
         queue.write_buffer(&camera_buf, 0, bytemuck::bytes_of(&cu1));
         frame(&device, &queue);
         // Read back frame B.
-        let bpr = w * 4;
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("readback"),
-            size: (bpr * h) as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let mut e = device.create_command_encoder(&Default::default());
-        e.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &_o, mip_level: 0, origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &readback,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(h),
-                },
-            },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-        );
-        queue.submit(std::iter::once(e.finish()));
-        let slice = readback.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-        let data = slice.get_mapped_range().unwrap();
-        Some(data.to_vec())
+        Some(read_hdr_as_rgba8(&device, &queue, &_o, w, h))
     }
 
     /// The cloud-shadow checkerboard, measured: with half the tiles one
@@ -5025,7 +5314,7 @@ mod gpu_render_tests {
             let words = ((tw * th) as usize + 31) / 32;
             let td = storage(&device, "td", bytemuck::cast_slice(&vec![u32::MAX; words]));
             let players = storage(&device, "pl", &vec![0u8; 16 + MAX_REMOTE_PLAYERS * 16]);
-            let (_o, ov) = create_output_texture(&device, w, h);
+            let (_o, ov) = create_hdr_texture(&device, w, h);
             let (_b, bv) = create_beam_texture(&device, w, h);
             let (_c, csv, _csw) = create_cloud_texture(&device, w, h);
             let csamp = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -5038,7 +5327,7 @@ mod gpu_render_tests {
             let tpb = create_transp_buf(&device, w, h);
             let spr = storage(&device, "spr", bytemuck::cast_slice(&crate::sprites::encoded()));
             let (_d, dv) = create_depth_texture(&device, w, h);
-            let (_g, gv) = create_output_texture(&device, w, h);
+            let (_g, gv) = create_hdr_texture(&device, w, h);
             let (_hh, hv) = create_output_texture(&device, w, h);
             let (_dd, ddv) = create_depth_texture(&device, 1, 1);
             let bgl = create_compute_bgl(&device);
@@ -5779,8 +6068,8 @@ mod gpu_render_tests {
         );
         for (name, d) in [("stone side", stone_side), ("stone top", stone_top), ("ice side", ice_side)] {
             assert!(
-                d < 0.005,
-                "{name}: texture pattern changes with depth along the normal (diff {d:.4} >= 0.005) - \
+                d < 0.0075,
+                "{name}: texture pattern changes with depth along the normal (diff {d:.4} >= 0.0075, tonemap-adjusted) - \
                  lines cannot line up across steps/terraces"
             );
         }
@@ -6373,7 +6662,7 @@ mod gpu_render_tests {
         let words = ((tw * th) as usize + 31) / 32;
         let td = storage(&device, "td", bytemuck::cast_slice(&vec![u32::MAX; words]));
         let players = storage(&device, "pl", &vec![0u8; 16 + MAX_REMOTE_PLAYERS * 16]);
-        let (_o, ov) = create_output_texture(&device, w, h);
+        let (_o, ov) = create_hdr_texture(&device, w, h);
         let (_b, bv) = create_beam_texture(&device, w, h);
         let (_c, csv, _csw) = create_cloud_texture(&device, w, h);
         let csamp = device.create_sampler(&wgpu::SamplerDescriptor { mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
@@ -6382,7 +6671,7 @@ mod gpu_render_tests {
         let tpb = create_transp_buf(&device, w, h);
         let spr = storage(&device, "spr", bytemuck::cast_slice(&crate::sprites::encoded()));
         let (_d, dv) = create_depth_texture(&device, w, h);
-        let (_g, gv) = create_output_texture(&device, w, h);
+        let (_g, gv) = create_hdr_texture(&device, w, h);
         let (_hh, hv) = create_output_texture(&device, w, h);
         let (_dd, ddv) = create_depth_texture(&device, 1, 1);
         let bgl = create_compute_bgl(&device);
@@ -6605,7 +6894,7 @@ mod gpu_render_tests {
         let words = ((tw * th) as usize + 31) / 32;
         let td = storage(&device, "td", bytemuck::cast_slice(&vec![u32::MAX; words]));
         let players = storage(&device, "pl", &vec![0u8; 16 + MAX_REMOTE_PLAYERS * 16]);
-        let (_o, _ov) = create_output_texture(&device, w, h);
+        let (_o, _ov) = create_hdr_texture(&device, w, h);
         let (_b, bv) = create_beam_texture(&device, w, h);
         let (_c, csv, _csw) = create_cloud_texture(&device, w, h);
         let csamp = device.create_sampler(&wgpu::SamplerDescriptor { mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
@@ -6614,7 +6903,7 @@ mod gpu_render_tests {
         let tpb = create_transp_buf(&device, w, h);
         let spr = storage(&device, "spr", bytemuck::cast_slice(&crate::sprites::encoded()));
         let (_d, dv) = create_depth_texture(&device, w, h);
-        let (_g, gv) = create_output_texture(&device, w, h);
+        let (_g, gv) = create_hdr_texture(&device, w, h);
         let (_hh, hv) = create_output_texture(&device, w, h);
         let bgl = create_compute_bgl(&device);
         let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &gv, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &dv, &hv, &bv);
@@ -6758,7 +7047,7 @@ mod gpu_render_tests {
         let words = ((tw * th) as usize + 31) / 32;
         let td = storage(&device, "td", bytemuck::cast_slice(&vec![u32::MAX; words]));
         let players = storage(&device, "pl", &vec![0u8; 16 + MAX_REMOTE_PLAYERS * 16]);
-        let (_o, _ov) = create_output_texture(&device, w, h);
+        let (_o, _ov) = create_hdr_texture(&device, w, h);
         let (_b, bv) = create_beam_texture(&device, w, h);
         let (_c, csv, _csw) = create_cloud_texture(&device, w, h);
         let csamp = device.create_sampler(&wgpu::SamplerDescriptor { mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
@@ -6767,7 +7056,7 @@ mod gpu_render_tests {
         let tpb = create_transp_buf(&device, w, h);
         let spr = storage(&device, "spr", bytemuck::cast_slice(&crate::sprites::encoded()));
         let (_d, dv) = create_depth_texture(&device, w, h);
-        let (_g, gv) = create_output_texture(&device, w, h);
+        let (_g, gv) = create_hdr_texture(&device, w, h);
         let (_hh, hv) = create_output_texture(&device, w, h);
         let (_dd, ddv) = create_depth_texture(&device, 1, 1);
         let bgl = create_compute_bgl(&device);
@@ -6982,7 +7271,7 @@ mod gpu_render_tests {
         let words = ((tw * th) as usize + 31) / 32;
         let td = storage(&device, "td", bytemuck::cast_slice(&vec![u32::MAX; words]));
         let players = storage(&device, "pl", &vec![0u8; 16 + MAX_REMOTE_PLAYERS * 16]);
-        let (_o, ov) = create_output_texture(&device, w, h);
+        let (_o, ov) = create_hdr_texture(&device, w, h);
         let (_b, bv) = create_beam_texture(&device, w, h);
         let (_c, csv, _csw) = create_cloud_texture(&device, w, h);
         let csamp = device.create_sampler(&wgpu::SamplerDescriptor { mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
@@ -6992,7 +7281,7 @@ mod gpu_render_tests {
         let spr = storage(&device, "sprites", bytemuck::cast_slice(&crate::sprites::encoded()));
         let bgl = create_compute_bgl(&device);
         let (_dtex, dv) = create_depth_texture(&device, w, h);
-        let (_gt2, gv2) = create_output_texture(&device, w, h);
+        let (_gt2, gv2) = create_hdr_texture(&device, w, h);
         let (_dd2, ddv2) = create_depth_texture(&device, 1, 1);
         let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &gv2, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &dv, &ov, &bv);
         let bg_compose = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &ov, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &ddv2, &gv2, &dv);

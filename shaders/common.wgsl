@@ -72,8 +72,12 @@ fn sun_intensity(s: vec3<f32>) -> f32 {
 
 fn sun_color(s: vec3<f32>) -> vec3<f32> {
     let h = clamp(s.y, 0.0, 1.0);
-    // Sunset/sunrise = warm orange. Midday = neutral. Lerp on solar elevation.
-    let warm = vec3<f32>(1.40, 0.60, 0.25);
+    // Three stops: horizon ember -> golden hour -> neutral midday. The
+    // golden band is wide and rich (the low-sun look every beauty shot
+    // lives in); the HDR post stack keeps the warmth from clipping.
+    let ember = vec3<f32>(1.55, 0.52, 0.16);
+    let gold = vec3<f32>(1.38, 0.88, 0.44);
     let mid = vec3<f32>(1.10, 1.02, 0.92);
-    return mix(warm, mid, smoothstep(0.05, 0.40, h)) * sun_intensity(s);
+    let c = mix(ember, gold, smoothstep(0.02, 0.16, h));
+    return mix(c, mid, smoothstep(0.16, 0.55, h)) * sun_intensity(s);
 }

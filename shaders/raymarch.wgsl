@@ -33,7 +33,9 @@ struct Brick {
 @group(0) @binding(2) var<storage, read> tile_mask: array<u32>;
 @group(0) @binding(3) var<storage, read> chunk_mask: array<u32>;
 @group(0) @binding(4) var<uniform> palette: array<vec4<f32>, 256>;
-@group(0) @binding(5) var output_tex: texture_storage_2d<rgba8unorm, write>;
+// HDR scene target: sun glints, sky disc and backlit foliage exceed 1.0;
+// the post stack (shaders/post.wgsl) tonemaps to LDR before the TAA.
+@group(0) @binding(5) var output_tex: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(6) var beam_depth: texture_2d<f32>;
 @group(0) @binding(7) var<storage, read> tile_dirty: array<u32>;
 
