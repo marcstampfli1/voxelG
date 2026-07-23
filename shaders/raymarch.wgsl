@@ -1620,9 +1620,107 @@ fn sprite_cross_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u3
     return out;
 }
 
+// Near-tier volumetric grass (docs/FLORA_PLAN.md stage 2): K single-blade
+// CARDS rooted in the cell, gathered into 2-3 sub-clumps, yawed around the
+// 8-angle fan with jitter, leaning outward from their sub-clump centre and
+// shearing with the wind (tip-weighted, via wind_offset - which routes
+// through wind_time(), so shadow rays sample the frozen phase exactly like
+// the cross quads). Same primitives as sprite_cross_hit: plane test, sprite
+// texel alpha, cross_sprite_tint ramp.
+const FLORA_NEAR_T: f32 = 28.0;
+const FLORA_BLADES: i32 = 18;
+
+fn flora_clump_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32) -> SubHit {
+    var out: SubHit;
+    out.hit = false;
+    out.color_tint = vec3<f32>(1.0);
+    let voxel_min = vec3<f32>(f32(voxel.x), f32(voxel.y), f32(voxel.z));
+    let vh = hash3f(voxel_min);
+    if (vh > 0.92) { return out; } // same sparse gaps as the cross tier
+    let phase = voxel_min.x * 0.40 + voxel_min.z * 0.55 + vh * 6.28;
+    let wind = wind_offset(voxel_min, phase, 0.32);
+
+    var best_t: f32 = 1e30;
+    var best_n = vec3<f32>(0.0, 1.0, 0.0);
+    var tint = vec3<f32>(1.0);
+
+    for (var i: i32 = 0; i < FLORA_BLADES; i = i + 1) {
+        let bh = hash3f(voxel_min + vec3<f32>(f32(i) * 7.13 + 0.31, 3.7, f32(i) * 2.9 + 0.17));
+        // Sub-clump centre (3 per cell), blade root jittered around it.
+        let sc = f32(i % 3);
+        let cx = 0.28 + 0.44 * fract(vh * 23.0 + sc * 0.37);
+        let cz = 0.28 + 0.44 * fract(vh * 57.0 + sc * 0.71);
+        let root2 = vec2<f32>(cx, cz) + (vec2<f32>(fract(bh * 13.0), fract(bh * 29.0)) - vec2<f32>(0.5)) * 0.20;
+        // Yaw: the 8-angle fan plus jitter; card tangent/normal from it.
+        let ang = (f32(i & 7) / 8.0) * 6.2832 + fract(bh * 5.0) * 0.7;
+        let ca = cos(ang);
+        let sa = sin(ang);
+        let pt2 = vec2<f32>(ca, sa);
+        let pn = vec3<f32>(-sa, 0.0, ca);
+        let h = 0.55 + fract(bh * 3.0) * 0.45;
+        let denom = dot(dir, pn);
+        if (abs(denom) < 1e-4) { continue; }
+        let rootw = voxel_min + vec3<f32>(root2.x, 0.0, root2.y);
+        let t = dot(rootw - origin, pn) / denom;
+        if (t < 0.0 || t >= best_t) { continue; }
+        let pw = origin + dir * t;
+        // Stay inside the cell like the cross quads do - hits beyond the
+        // cell wall would break the DDA's front-to-back ordering.
+        let cl = pw - voxel_min;
+        if (cl.x < 0.0 || cl.x > 1.0 || cl.z < 0.0 || cl.z > 1.0) { continue; }
+        let p = pw - rootw;
+        if (p.y < 0.0 || p.y > h) { continue; }
+        let vn = p.y / h;
+        // Outward lean from the sub-clump centre plus tip-weighted wind sway
+        // (v^2: roots stay planted, tips ride the gusts).
+        let lean = (root2 - vec2<f32>(0.5)) * 0.5;
+        let sway = lean * p.y + wind * (p.y * p.y);
+        let uoff = dot(p.xz - sway, pt2);
+        let wq = 0.26; // card half-width
+        if (abs(uoff) > wq) { continue; }
+        let u = clamp(uoff / wq * 0.5 + 0.5, 0.0, 0.99999);
+        var sprite = SPR_BLADE_A + (u32(fract(bh * 97.0) * 3.0) % 3u);
+        if (mat == MAT_TALL_GRASS_DRY) {
+            // Dry clumps: forked straw, one seed head per clump on blade 0.
+            sprite = select(SPR_BLADE_DRY, SPR_SEED_HEAD, i == 0);
+        }
+        let val = sprite_texel(sprite, u32(u * 16.0) & 15u, u32(clamp(vn * 16.0, 0.0, 15.0)));
+        if (val == 0u) { continue; }
+        best_t = t;
+        // Blend the card normal toward up so blades take the ground's
+        // lighting instead of flipping dark at unlucky yaws (random-yaw
+        // vertical cards otherwise scatter black blades through the clump).
+        let face_n = select(pn, -pn, denom > 0.0);
+        best_n = normalize(mix(face_n, vec3<f32>(0.0, 1.0, 0.0), 0.5));
+        // Per-blade brightness spread: inner/outer blades separate visually,
+        // which is what makes 18 cards read as a volume, not a flat fan.
+        tint = cross_sprite_tint(mat, sprite, val, vn, vh)
+            * (0.82 + 0.36 * fract(bh * 11.0));
+    }
+
+    if (best_t < 1e30) {
+        out.hit = true;
+        out.t_hit = best_t;
+        out.normal = best_n;
+        out.color_tint = tint;
+    }
+    return out;
+}
+
 fn foliage_subvoxel(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32) -> SubHit {
     var hit: SubHit;
-    if (mat == MAT_TALL_GRASS || mat == MAT_FLOWER || mat == MAT_TALL_GRASS_DRY) {
+    if (mat == MAT_TALL_GRASS || mat == MAT_TALL_GRASS_DRY) {
+        // Tiered grass: volumetric blade clumps near, crossed quads beyond,
+        // with a hash-dithered edge so no switching line forms. Ray-local
+        // distance is the right LOD metric for secondaries too.
+        let cd = length(vec3<f32>(voxel) + vec3<f32>(0.5) - origin);
+        let edge = FLORA_NEAR_T + (hash3f(vec3<f32>(voxel)) - 0.5) * 4.0;
+        if (cd < edge) {
+            hit = flora_clump_hit(voxel, origin, dir, mat);
+        } else {
+            hit = sprite_cross_hit(voxel, origin, dir, mat);
+        }
+    } else if (mat == MAT_FLOWER) {
         hit = sprite_cross_hit(voxel, origin, dir, mat);
     } else if (mat == MAT_LEAF_FRINGE) {
         hit = leaf_fringe_hit(voxel, origin, dir);

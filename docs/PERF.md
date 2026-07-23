@@ -32,7 +32,23 @@ Live static frames (tile-gated): ~1.9-2.5 ms GPU total.
 
 ## Proven (shipped)
 
-- Moving-camera reflection reuse (one path for both camera states): the
+- Flora stage 2: near-tier volumetric grass (flora_clump_hit) - 18 blade
+  cards per decoration cell inside a hash-dithered ~28-voxel band (green:
+  3 blade sprites; dry: forked straw + one oat seed head), sub-clump roots,
+  8-angle yaw fan, outward lean, tip-weighted wind (v^2 - amplitude at or
+  below the cross-quad shear), up-blended normals (0.5 toward +Y) so random
+  yaws never flip blades black, per-blade brightness spread. Cross quads
+  unchanged beyond the band; flowers still cross-tier (stage 3). Bench
+  pairs (B A B A, thermal decline in ALL rows incl. terrain control):
+  meadow 292/280 -> 285/263 fps = +0.10-0.16 ms; foliage ~+0.1 ms; water
+  rows flat. Budget: 0.9 ms for the whole flora system - stage 2 spends
+  ~0.15. Rig meadow: 8231 strong (baseline 2527) BUT gi on/off delta is 8231
+  vs 8207 - lighting is stable; the rise is animated-edge count (18 thin
+  moving blades vs 2 fat quads), the same energy class as the shipped tree
+  scenes (tree_shadow 10497, terrain_trees 23387). Breathing 3373,
+  proportionate. LESSON (lab): a "pink grass cell" chased for a session was
+  two dry-straw rows perspective-splitting at off-center x - verify cell
+  identity with a single-material render before debugging color math.
   reflection history is reprojected by ABSOLUTE surface position into the
   previous frame and reused when the stored position matches AND the view
   ray to the point rotated < ~2 degrees since last frame (computable from
