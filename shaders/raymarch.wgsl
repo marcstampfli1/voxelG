@@ -101,12 +101,15 @@ fn pack_light_cache(shadow: f32, ao: f32, sun_y: f32) -> u32 {
 //   w = spare (0)
 @group(0) @binding(17) var<storage, read_write> transp_buf: array<vec4<u32>>;
 
-// Reflection history region of transp_buf (third region, after the per-pixel
-// records and the half-res god-ray scratch): rgb (f16x3) + the water surface
-// point that produced it, for reuse validation.
-fn refl_hist_idx(px: vec2<i32>, res: vec2<i32>) -> i32 {
+// Reflection region of transp_buf (third region, after the per-pixel records
+// and the half-res god-ray scratch), indexed per 2x2 PIXEL QUAD: rgb (f16x3)
+// + the water surface point that produced it. Written by cs_water_refl (the
+// half-res reflection pass, which also owns the temporal history semantics);
+// read by shade_water_top. Quad entries use a quarter of the region the old
+// full-res history occupied.
+fn refl_quad_idx(q: vec2<i32>, res: vec2<i32>) -> i32 {
     let half_res = (res + vec2<i32>(1)) / 2;
-    return res.x * res.y + half_res.x * half_res.y + px.y * res.x + px.x;
+    return res.x * res.y + half_res.x * half_res.y + q.y * half_res.x + q.x;
 }
 
 const TR_NONE:       u32 = 0u;
@@ -557,6 +560,105 @@ fn cs_transparent(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Clouds/god rays/underwater are applied by cs_compose (per-frame terms
     // must not bake into cached pixels) - store the plain shaded colour.
     textureStore(output_tex, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(col, 1.0));
+}
+
+// Half-resolution water reflection pass: one thread per 2x2 pixel quad, runs
+// between cs_main and cs_transparent. Owns the reflection's temporal history
+// (reproject by absolute surface position, ~2 degree view-rotation gate,
+// 8x8-PIXEL block stagger = 4x4 quad blocks, 0.55 history blend) at quad
+// granularity and writes the resolved colour + surface point to the quad
+// region. Quarter the reflection rays and hit shades; shade_water_top keeps
+// Fresnel/glint/refraction per pixel, so wave detail stays full-res.
+@compute @workgroup_size(8, 8, 1)
+fn cs_water_refl(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let res = vec2<i32>(camera.resolution);
+    let half_res = (res + vec2<i32>(1)) / 2;
+    let q = vec2<i32>(i32(gid.x), i32(gid.y));
+    if (q.x >= half_res.x || q.y >= half_res.y) { return; }
+    // Representative water-top pixel of the quad (any member: the reflected
+    // scene is shared content; per-pixel normals stay in cs_transparent).
+    var px = vec2<i32>(-1, -1);
+    var rec = vec4<u32>(0u);
+    for (var i: i32 = 0; i < 4; i = i + 1) {
+        let p = q * 2 + vec2<i32>(i & 1, i >> 1);
+        if (p.x >= res.x || p.y >= res.y) { continue; }
+        let r = transp_buf[u32(p.y * res.x + p.x)];
+        if (r.y == TR_WATER_TOP) { px = p; rec = r; break; }
+    }
+    if (px.x < 0) { return; } // no water-top surface in this quad
+    // Reconstruct the surface exactly as cs_transparent does.
+    let uv = (vec2<f32>(px) + vec2<f32>(0.5) + camera.jitter) / camera.resolution;
+    let dir = ray_dir_uv(uv);
+    let t_hit = bitcast<f32>(rec.x);
+    let p_hit = camera.origin + dir * t_hit;
+    let g_raw = unpack2x16float(rec.z);
+    let m2 = dot(g_raw, g_raw);
+    let g = g_raw / (1.0 + m2 * m2 * 0.6);
+    let f = water_field(p_hit.xz, camera.time);
+    let n = normalize(vec3<f32>(-(g.x + f.y), 1.0, -(g.y + f.z)));
+    let jit = fract(p_hit.x * 17.0 + p_hit.z * 23.0 + camera.time * 13.0);
+    var no_cache = vec2<f32>(0.0);
+    let refl_dir = reflect(dir, n);
+    // Grazing origin lift (proven): clears the wave chop along skim paths.
+    let graze = 1.0 - clamp(dot(-dir, n), 0.0, 1.0);
+    let refl_origin = p_hit + n * (0.01 + 0.34 * graze * graze);
+    // Reproject this surface point into the previous frame's quad grid.
+    var hist_q = q;
+    if (camera.prev_valid > 0.5) {
+        let abs_hit = p_hit + vec3<f32>(camera.world_origin);
+        let dprev = abs_hit - camera.prev_origin;
+        let pz = dot(dprev, camera.prev_forward);
+        if (pz > 0.01) {
+            let aspect = camera.resolution.x / camera.resolution.y;
+            let ndc = vec2<f32>(
+                dot(dprev, camera.prev_right) / (pz * camera.tan_half_fov * aspect),
+                dot(dprev, camera.prev_up) / (pz * camera.tan_half_fov));
+            let uvp = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+            if (uvp.x >= 0.0 && uvp.x < 1.0 && uvp.y >= 0.0 && uvp.y < 1.0) {
+                hist_q = vec2<i32>(uvp * camera.resolution) / 2;
+            }
+        }
+    }
+    let hist = transp_buf[refl_quad_idx(hist_q, res)];
+    let hist_p = vec3<f32>(bitcast<f32>(hist.z), unpack2x16float(hist.y).y, bitcast<f32>(hist.w));
+    let hist_dp = hist_p - p_hit;
+    let v_now = normalize(p_hit - camera.origin);
+    let v_prev = normalize((p_hit + vec3<f32>(camera.world_origin)) - camera.prev_origin);
+    let angle_ok = dot(v_now, v_prev) > 0.9994; // ~2 degrees
+    let hist_ok = camera.prev_valid > 0.5 && angle_ok && dot(hist_dp, hist_dp) < 0.35;
+    // Block stagger at 4x4 QUADS = the same 8x8 pixels as before.
+    let stagger_trace = (((q.x >> 2) ^ (q.y >> 2) ^ i32(camera.gi_round)) & 1) == 0;
+    var refl_col: vec3<f32>;
+    if (PROF_TRANSP_NO_REFL > 0.5) {
+        refl_col = sky(refl_dir);
+    } else if (hist_ok && !stagger_trace) {
+        let rg = unpack2x16float(hist.x);
+        refl_col = vec3<f32>(rg.x, rg.y, unpack2x16float(hist.y).x);
+    } else {
+        let refl_hit = trace_secondary(refl_origin, refl_dir, SECONDARY_MAX_T);
+        var fresh: vec3<f32>;
+        if (refl_hit.hit) {
+            if (PROF_TRANSP_REFL_FLATSHADE > 0.5) {
+                fresh = palette[refl_hit.mat].rgb;
+            } else {
+                fresh = shade(refl_hit, refl_origin, refl_dir, jit, false, false, false, &no_cache, vec3<f32>(0.0));
+            }
+        } else {
+            fresh = sky(refl_dir);
+        }
+        if (hist_ok) {
+            let rg = unpack2x16float(hist.x);
+            refl_col = mix(fresh, vec3<f32>(rg.x, rg.y, unpack2x16float(hist.y).x), 0.55);
+        } else {
+            refl_col = fresh;
+        }
+    }
+    transp_buf[refl_quad_idx(q, res)] = vec4<u32>(
+        pack2x16float(refl_col.rg),
+        pack2x16float(vec2<f32>(refl_col.b, p_hit.y)),
+        bitcast<u32>(p_hit.x),
+        bitcast<u32>(p_hit.z),
+    );
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -2877,80 +2979,15 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>, px: vec2<i32>) -
     // before. History always updates, so stopping the camera never reads
     // stale content.
     let res_i = vec2<i32>(camera.resolution);
-    let hidx = refl_hist_idx(px, res_i);
-    // MOVING-camera reuse (one path for both states): find where this
-    // frame's surface point sat in the PREVIOUS frame and read history
-    // there; a static camera reprojects to the same pixel. Validity needs
-    // BOTH a surface-position match (below, as before) and a bounded view
-    // rotation toward the point (~2 deg since last frame) - reflections are
-    // view-dependent, so the angle gate bounds reflection parallax error by
-    // construction. Distance-adaptive for free: close water re-traces
-    // (parallax visible), far water reuses (parallax negligible).
-    var hist_px = px;
-    if (camera.prev_valid > 0.5) {
-        let abs_hit = p_hit + vec3<f32>(camera.world_origin);
-        let dprev = abs_hit - camera.prev_origin;
-        let pz = dot(dprev, camera.prev_forward);
-        if (pz > 0.01) {
-            let aspect = camera.resolution.x / camera.resolution.y;
-            let ndc = vec2<f32>(
-                dot(dprev, camera.prev_right) / (pz * camera.tan_half_fov * aspect),
-                dot(dprev, camera.prev_up) / (pz * camera.tan_half_fov));
-            let uvp = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-            if (uvp.x >= 0.0 && uvp.x < 1.0 && uvp.y >= 0.0 && uvp.y < 1.0) {
-                hist_px = vec2<i32>(uvp * camera.resolution);
-            }
-        }
-    }
-    let hist = transp_buf[refl_hist_idx(hist_px, res_i)];
-    let hist_p = vec3<f32>(bitcast<f32>(hist.z), unpack2x16float(hist.y).y, bitcast<f32>(hist.w));
-    let hist_dp = hist_p - p_hit;
-    let v_now = normalize(p_hit - camera.origin);
-    let v_prev = normalize((p_hit + vec3<f32>(camera.world_origin)) - camera.prev_origin);
-    let angle_ok = dot(v_now, v_prev) > 0.9994; // ~2 degrees
-    let hist_ok = camera.prev_valid > 0.5 && angle_ok && dot(hist_dp, hist_dp) < 0.35;
-    // 8x8-BLOCK stagger, not per-pixel: a pixel checkerboard leaves every
-    // SIMT warp with both tracing and skipping threads, so the warp pays the
-    // trace latency anyway (measured: zero gain). Whole workgroups skipping
-    // coherently is what converts skipped work into time.
-    let stagger_trace = (((px.x >> 3) ^ (px.y >> 3) ^ i32(camera.gi_round)) & 1) == 0;
-    var refl_col: vec3<f32>;
-    if (PROF_TRANSP_NO_REFL > 0.5) {
-        // Cost-split probe: whole reflection component off (trace, shade,
-        // history traffic).
-        refl_col = sky(refl_dir);
-    } else if (hist_ok && !stagger_trace) {
-        let rg = unpack2x16float(hist.x);
-        refl_col = vec3<f32>(rg.x, rg.y, unpack2x16float(hist.y).x);
-    } else {
-        let refl_hit = trace_secondary(refl_origin, refl_dir, SECONDARY_MAX_T);
-        var fresh: vec3<f32>;
-        if (refl_hit.hit) {
-            if (PROF_TRANSP_REFL_FLATSHADE > 0.5) {
-                // Cost-split probe: trace kept, hit shading replaced by a
-                // palette read.
-                fresh = palette[refl_hit.mat].rgb;
-            } else {
-                fresh = shade(refl_hit, refl_origin, refl_dir, jit, false, false, false, &no_cache, vec3<f32>(0.0));
-            }
-        } else {
-            fresh = sky(refl_dir);
-        }
-        if (hist_ok) {
-            let rg = unpack2x16float(hist.x);
-            refl_col = mix(fresh, vec3<f32>(rg.x, rg.y, unpack2x16float(hist.y).x), 0.55);
-        } else {
-            refl_col = fresh;
-        }
-    }
-    if (PROF_TRANSP_NO_REFL < 0.5) {
-        transp_buf[hidx] = vec4<u32>(
-            pack2x16float(refl_col.rg),
-            pack2x16float(vec2<f32>(refl_col.b, p_hit.y)),
-            bitcast<u32>(p_hit.x),
-            bitcast<u32>(p_hit.z),
-        );
-    }
+    // Reflection CONTENT at quad rate: cs_water_refl (the half-res pass
+    // between cs_main and this one) traced, temporally accumulated and wrote
+    // this 2x2 quad's reflection into the quad region. Per-pixel Fresnel,
+    // glint and refraction below keep full-resolution wave detail; only the
+    // reflected scene is shared across the quad - quarter the reflection
+    // rays and shades.
+    let entry = transp_buf[refl_quad_idx(px / 2, res_i)];
+    let e_rg = unpack2x16float(entry.x);
+    let refl_col = vec3<f32>(e_rg.x, e_rg.y, unpack2x16float(entry.y).x);
 
     // ---- refraction: primary ray bent into the water, trace through it ----
     // Snell's law via WGSL `refract`. eta = n_air / n_water ≈ 1/1.33.

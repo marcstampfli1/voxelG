@@ -298,6 +298,7 @@ pub struct Renderer {
     compute_bg: wgpu::BindGroup,
     // Deferred transparent pass (#16): shares compute_bgl/compute_bg.
     transparent_pipeline: wgpu::ComputePipeline,
+    water_refl_pipeline: wgpu::ComputePipeline,
 
     // Hardware ray-tracing occlusion (opt-in via VOXELG_RT). All None when RT is
     // off, so the software path above is untouched. The RT pipelines share the
@@ -315,6 +316,7 @@ pub struct Renderer {
     compute_pipeline_rt: Option<wgpu::ComputePipeline>,
     compose_pipeline_rt: Option<wgpu::ComputePipeline>,
     transparent_pipeline_rt: Option<wgpu::ComputePipeline>,
+    water_refl_pipeline_rt: Option<wgpu::ComputePipeline>,
     // World-space irradiance probe cache + its per-frame update pass (RT only).
     gi_probe_buf: Option<wgpu::Buffer>,
     gi_probe_pipeline: Option<wgpu::ComputePipeline>,
@@ -769,6 +771,15 @@ impl Renderer {
             compilation_options: Default::default(),
             cache: None,
         });
+        // -- half-res water reflection pass (cs_water_refl, same module + bgl) --
+        let water_refl_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("water refl pipeline"),
+            layout: Some(&compute_pl),
+            module: &compute_shader,
+            entry_point: Some("cs_water_refl"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
 
         // -- hardware-RT occlusion variants (opt-in via VOXELG_RT) --
         // The three occlusion-using entry points (cs_main / cs_compose /
@@ -784,6 +795,7 @@ impl Renderer {
             compute_pipeline_rt,
             compose_pipeline_rt,
             transparent_pipeline_rt,
+            water_refl_pipeline_rt,
             gi_in_tex,
             gi_in_view,
             gi_out_tex,
@@ -839,6 +851,7 @@ impl Renderer {
             log::info!("RT init: cs_main pipeline (driver compile) in {:.2}s", t_pipe.elapsed().as_secs_f64());
             let p_compose = mk("cs_compose", "compose pipeline (RT)");
             let p_transp = mk("cs_transparent", "transparent pipeline (RT)");
+            let p_refl = mk("cs_water_refl", "water refl pipeline (RT)");
             let p_probe = mk("cs_gi_probe_update", "gi probe update (RT)");
             log::info!("RT init: all 4 RT pipelines in {:.2}s total", t_pipe.elapsed().as_secs_f64());
             // Worker: owns nothing persistent; each job carries the spare set in
@@ -869,6 +882,7 @@ impl Renderer {
                 Some(p_main),
                 Some(p_compose),
                 Some(p_transp),
+                Some(p_refl),
                 Some(gi_in_tex),
                 Some(gi_in_view),
                 Some(gi_out_tex),
@@ -881,7 +895,7 @@ impl Renderer {
                 Some(res_rx),
             )
         } else {
-            (None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None)
+            (None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None)
         };
 
         // -- half-res cloud pipeline (cs_clouds, same shader module) --
@@ -1063,6 +1077,7 @@ impl Renderer {
             compute_bgl, compute_pipeline, compute_bg,
             rt_shadows, world_accel,
             rt_bgl, rt_bg, compute_pipeline_rt, compose_pipeline_rt, transparent_pipeline_rt,
+            water_refl_pipeline, water_refl_pipeline_rt,
             gi_probe_buf, gi_probe_pipeline, godray_pipeline, godray_pipeline_rt,
             rt_accel_spare, accel_req_tx, accel_res_rx, accel_job_inflight: false,
             rt_accel_origin: world.world_origin_voxel(),
@@ -1537,6 +1552,27 @@ impl Renderer {
                 cp.dispatch_workgroups(gx, gy, 1);
             }
             if let Some(pr) = &self.gpu_profiler { pr.stamp(&mut encoder, 4); }
+            // ---- half-res water reflection pass: traces + accumulates the
+            // reflected scene per 2x2 quad; cs_transparent reads the quad
+            // entries (quarter the reflection rays). Shares the transp
+            // profiler bracket. ----
+            {
+                let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("water refl"),
+                    timestamp_writes: None,
+                });
+                if self.rt_shadows {
+                    cp.set_pipeline(self.water_refl_pipeline_rt.as_ref().unwrap());
+                    cp.set_bind_group(0, &self.compute_bg, &[]);
+                    cp.set_bind_group(1, &self.rt_bg.as_ref().unwrap()[gi_idx], &[]);
+                } else {
+                    cp.set_pipeline(&self.water_refl_pipeline);
+                    cp.set_bind_group(0, &self.compute_bg, &[]);
+                }
+                let hx = self.size.0.div_ceil(2).div_ceil(8);
+                let hy = self.size.1.div_ceil(2).div_ceil(8);
+                cp.dispatch_workgroups(hx, hy, 1);
+            }
             // ---- deferred transparent pass (#16): shade water/glass pixels ----
             {
                 let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -3303,6 +3339,7 @@ mod gpu_render_tests {
         };
         let p_main = mk_pipe("cs_main");
         let p_transp = mk_pipe("cs_transparent");
+        let p_refl = mk_pipe("cs_water_refl");
         let p_comp = mk_pipe("cs_compose");
         let p_probe = mk_pipe("cs_gi_probe_update");
         let p_godray = mk_pipe("cs_godrays");
@@ -3403,10 +3440,24 @@ mod gpu_render_tests {
                 let threads = crate::voxel::PROBE_TOTAL / GI_PROBE_UPDATE_DIV;
                 cp.dispatch_workgroups(threads.div_ceil(64), 1, 1);
             }
-            for (pipe, bg) in [(&p_main, &bg_main[parity]), (&p_transp, &bg_main[parity])] {
+            {
                 let mut cp = enc.begin_compute_pass(&Default::default());
-                cp.set_pipeline(pipe);
-                cp.set_bind_group(0, bg, &[]);
+                cp.set_pipeline(&p_main);
+                cp.set_bind_group(0, &bg_main[parity], &[]);
+                cp.set_bind_group(1, &rt_bg[parity], &[]);
+                cp.dispatch_workgroups(tiles_w, tiles_h, 1);
+            }
+            {
+                let mut cp = enc.begin_compute_pass(&Default::default());
+                cp.set_pipeline(&p_refl);
+                cp.set_bind_group(0, &bg_main[parity], &[]);
+                cp.set_bind_group(1, &rt_bg[parity], &[]);
+                cp.dispatch_workgroups(w.div_ceil(2).div_ceil(8), h.div_ceil(2).div_ceil(8), 1);
+            }
+            {
+                let mut cp = enc.begin_compute_pass(&Default::default());
+                cp.set_pipeline(&p_transp);
+                cp.set_bind_group(0, &bg_main[parity], &[]);
                 cp.set_bind_group(1, &rt_bg[parity], &[]);
                 cp.dispatch_workgroups(tiles_w, tiles_h, 1);
             }
