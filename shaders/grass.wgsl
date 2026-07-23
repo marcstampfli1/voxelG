@@ -236,9 +236,10 @@ fn vs_grass(@builtin(vertex_index) vid: u32,
     // pinhole as the vertex path; jitter offset matches the cache's grid).
     let rd = rootw - camera.origin;
     let rz = max(dot(rd, camera.forward), 0.05);
-    var rndc = vec2<f32>(dot(rd, camera.right) / (rz * camera.tan_half_fov * aspect),
+    // NO jitter here: the jittered grid made the cache texel alternate per
+    // frame - visibly flickering shadows on every blade.
+    let rndc = vec2<f32>(dot(rd, camera.right) / (rz * camera.tan_half_fov * aspect),
                          dot(rd, camera.up) / (rz * camera.tan_half_fov));
-    rndc = rndc - vec2<f32>(camera.jitter.x, -camera.jitter.y) * 2.0 / camera.resolution;
     o.root_px = vec2<f32>(rndc.x * 0.5 + 0.5, 0.5 - rndc.y * 0.5) * camera.resolution;
 
     // ---- colour: clump-coherent, root-dark -> tip-bright, dry skew ----
@@ -272,14 +273,34 @@ fn fs_grass(in: VsOut) -> @location(0) vec4<f32> {
     // behind this pixel - the ground the blade stands on. Grass shadows and
     // ambient occlusion stay consistent with the world for free.
     // SYNC: raymarch.wgsl pack_light_cache.
-    let rp = clamp(vec2<i32>(in.root_px), vec2<i32>(0), vec2<i32>(camera.resolution) - 1);
-    let lc = textureLoad(light_cache, rp, 0);
-    let pw = bitcast<u32>(lc.w);
-    var shadow = f32(pw >> 24u) / 255.0;
-    var ao = f32((pw >> 16u) & 0xFFu) / 255.0;
-    // Sky / no-hit background pixels carry no cache: a blade silhouetted
-    // against the sky is fully exposed - lit, not black.
-    if (pw == 0u || lc.x >= 1e8) {
+    // 2x2 average: the cache stores single jittered penumbra samples that
+    // terrain smooths through TAA accumulation; blades read them directly,
+    // so average a quad to keep blade lighting temporally steady.
+    let rp = clamp(vec2<i32>(in.root_px), vec2<i32>(0), vec2<i32>(camera.resolution) - 2);
+    let lc0 = textureLoad(light_cache, rp, 0);
+    let lc1 = textureLoad(light_cache, rp + vec2<i32>(1, 0), 0);
+    let lc2 = textureLoad(light_cache, rp + vec2<i32>(0, 1), 0);
+    let lc3 = textureLoad(light_cache, rp + vec2<i32>(1, 1), 0);
+    let lc = lc0;
+    var shadow = 0.0;
+    var ao = 0.0;
+    var valid = 0.0;
+    for (var k = 0; k < 4; k = k + 1) {
+        var c: vec4<f32>;
+        if (k == 0) { c = lc0; } else if (k == 1) { c = lc1; }
+        else if (k == 2) { c = lc2; } else { c = lc3; }
+        let pw = bitcast<u32>(c.w);
+        // Sky / no-hit texels carry no cache - skip them.
+        if (pw == 0u || c.x >= 1e8) { continue; }
+        shadow += f32(pw >> 24u) / 255.0;
+        ao += f32((pw >> 16u) & 0xFFu) / 255.0;
+        valid += 1.0;
+    }
+    if (valid > 0.0) {
+        shadow /= valid;
+        ao /= valid;
+    } else {
+        // Blade silhouetted against sky: fully exposed - lit, not black.
         shadow = 1.0;
         ao = 1.0;
     }
