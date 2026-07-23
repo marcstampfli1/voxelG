@@ -397,7 +397,7 @@ pub struct Renderer {
     // (block place) still rebuilds immediately.
     // Per-pass GPU timing (Some only when VOXELG_GPU_PROFILE=1 and the adapter
     // supports timestamp queries).
-    gpu_profiler: Option<GpuProfiler>,
+    pub(crate) gpu_profiler: Option<GpuProfiler>,
     // Async accel rebuild (RT only): the frame thread snapshots the tile mask
     // and hands a SPARE accel set to a worker thread, which enumerates, DMAs
     // and rebuilds the BVH into it - buffers no shader currently reads, so the
@@ -2308,10 +2308,16 @@ pub(crate) struct GpuProfiler {
     read_buf: wgpu::Buffer,
     period_ns: f32,
     frame: u32,
+    /// Most recent sampled per-pass milliseconds (GPU_PROFILE_LABELS order),
+    /// their total, and a sample counter - lets the bench mode aggregate
+    /// per-segment GPU attributions instead of scraping the log.
+    pub(crate) last: [f64; 9],
+    pub(crate) last_total: f64,
+    pub(crate) reports: u64,
 }
 
 /// Pass boundaries bracketed in render(); N_TS timestamps -> N_TS-1 deltas.
-const GPU_PROFILE_LABELS: [&str; 9] =
+pub(crate) const GPU_PROFILE_LABELS: [&str; 9] =
     ["clouds", "beam", "probe", "main", "transp", "compose", "taa", "post", "blit"];
 const GPU_PROFILE_TS: u32 = GPU_PROFILE_LABELS.len() as u32 + 1;
 
@@ -2335,7 +2341,11 @@ impl GpuProfiler {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        Self { query_set, resolve_buf, read_buf, period_ns: queue.get_timestamp_period(), frame: 0 }
+        Self {
+            query_set, resolve_buf, read_buf,
+            period_ns: queue.get_timestamp_period(), frame: 0,
+            last: [0.0; 9], last_total: 0.0, reports: 0,
+        }
     }
 
     /// True on the frames that resolve + read back (1 in 64 dirty frames).
@@ -2374,9 +2384,15 @@ impl GpuProfiler {
         let ms = |a: u64, b: u64| (b.saturating_sub(a)) as f64 * self.period_ns as f64 / 1.0e6;
         let mut line = String::from("gpu pass ms:");
         for (i, name) in GPU_PROFILE_LABELS.iter().enumerate() {
-            line.push_str(&format!(" {name} {:.2}", ms(ts[i], ts[i + 1])));
+            let v = ms(ts[i], ts[i + 1]);
+            if i < self.last.len() {
+                self.last[i] = v;
+            }
+            line.push_str(&format!(" {name} {:.2}", v));
         }
-        line.push_str(&format!("  | total {:.2}", ms(ts[0], ts[GPU_PROFILE_TS as usize - 1])));
+        self.last_total = ms(ts[0], ts[GPU_PROFILE_TS as usize - 1]);
+        self.reports = self.reports.wrapping_add(1);
+        line.push_str(&format!("  | total {:.2}", self.last_total));
         log::info!("{line}");
     }
 }
@@ -6003,10 +6019,13 @@ mod gpu_render_tests {
         let pipes: Vec<(&str, wgpu::ComputePipeline)> =
             variants.iter().map(|(n, e)| (*n, mk_t(e))).collect();
 
-        let (water_anchor, _, _) = find_scene_anchors(&world);
+        // The live bench's water_grazing pose (eye 1.4 voxels over the pond,
+        // near-horizontal): the WORST measured water view (9.7 ms transp
+        // live). The old anchor-offset camera saw far less water and
+        // understated the whale by ~2.5x.
         let mut cam = Camera::new();
-        cam.pos = glam::Vec3::new(clamp_anchor(water_anchor.x), 71.0, clamp_anchor(water_anchor.y) - 8.0);
-        cam.pitch = -0.22;
+        cam.pos = glam::Vec3::new(468.5, 65.4, 78.0);
+        cam.pitch = -0.06;
 
         let time1 = |pipe: &wgpu::ComputePipeline| -> f64 {
             let encode = || {
@@ -6028,7 +6047,10 @@ mod gpu_render_tests {
             t0.elapsed().as_secs_f64() * 1000.0 / n as f64
         };
         for (state, taa) in [("moving", 0.0f32), ("static", 0.9f32)] {
-            let mut cu = CameraUniform::from_camera(&cam, w, h, 0.0, 0.0, wo, [0.0, 0.0], taa);
+            // Live-like clock: t=0 was benchmarking a wave phase the game
+            // never shows (the live bench measured transp ~2x the harness's
+            // t=0 numbers at comparable views).
+            let mut cu = CameraUniform::from_camera(&cam, w, h, 30.0, 30.0, wo, [0.0, 0.0], taa);
             // Model live motion: a real previous camera displaced by one
             // frame of strafing (~0.5 voxel at 150 fps), light-cache
             // reprojection off exactly as in live movement. The static state

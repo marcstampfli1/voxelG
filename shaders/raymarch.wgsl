@@ -2862,7 +2862,12 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>, px: vec2<i32>) -
     // it started in. Skipping water also keeps the reflection showing terrain
     // and sky rather than the surface's own neighbouring plates.
     let refl_dir = reflect(dir, n);
-    let refl_origin = p_hit + n * 0.01;
+    // Grazing rays skim the wavy surface and brush dozens of neighbouring
+    // wave-plate AABBs before escaping; lifting the origin with incidence
+    // angle clears the chop (max ~0.35 voxel at full graze - geometrically
+    // invisible, but it skips the candidate forest along the skim path).
+    let graze = 1.0 - clamp(dot(-dir, n), 0.0, 1.0);
+    let refl_origin = p_hit + n * (0.01 + 0.34 * graze * graze);
     // Temporal reflection accumulation (converging, TAA-family): on a STATIC
     // camera the reflected scene per pixel varies only with the animated wave
     // normal, so blending history converges to the cone-filtered (glossy)
