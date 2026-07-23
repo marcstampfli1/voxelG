@@ -63,8 +63,32 @@ atlas_consts! {
     SPR_LEAF_BIRCH = 10;
     /// Pine needle whisk.
     SPR_LEAF_NEEDLE = 11;
+    /// Single tapered S-curve blade for near-tier grass cards (sways right
+    /// then left; root-dark, tip-lit). Blades are contiguous so a variant
+    /// pick is `SPR_BLADE_A + n`.
+    SPR_BLADE_A = 12;
+    /// Counter-curved blade, slightly shorter (top rows empty).
+    SPR_BLADE_B = 13;
+    /// Near-straight blade with a bent tip.
+    SPR_BLADE_C = 14;
+    /// Dry forked straw blade for sand/tundra clumps.
+    SPR_BLADE_DRY = 15;
+    /// Drooping oat-style seed head on a stem top.
+    SPR_SEED_HEAD = 16;
+    /// Rounded petal pair for card-built flower heads (poppy/tulip class).
+    SPR_PETAL_ROUND = 17;
+    /// Slim three-ray floret fan (daisy class).
+    SPR_PETAL_RAY = 18;
+    /// Ragged spiky petal fan (cornflower class).
+    SPR_PETAL_SPIKE = 19;
+    /// Dotted hemispherical puff wedge (dandelion class).
+    SPR_PUFF = 20;
+    /// Small flower-centre disc with accent dots.
+    SPR_FLOWER_CENTER = 21;
+    /// Thin centre-column stem with leaf nubs (columns 7-8, mirror-safe).
+    SPR_STEM = 22;
     /// Number of 16x16 sprites in the atlas.
-    N_SPRITES = 12;
+    N_SPRITES = 23;
     /// Word offset of the first 32x32 tuft (after the 16x16 sprites).
     TUFT_BASE_WORDS = N_SPRITES * SPRITE_WORDS;
     /// Better Leaves tuft indices: tuft i lives at word
@@ -317,6 +341,226 @@ const ART: [[&str; SPRITE_DIM]; N_SPRITES] = [
         "................",
         "................",
         "................",
+    ],
+    // SPR_BLADE_A - single tapered blade, S-swaying right then left: the
+    // near-tier grass card workhorse. Root darkens, tip catches light.
+    [
+        "................",
+        "........*.......",
+        "........#.......",
+        ".......##.......",
+        ".......#........",
+        "......##........",
+        "......#.........",
+        "......#.........",
+        "......##........",
+        ".......#........",
+        ".......##.......",
+        "........#.......",
+        "........#o......",
+        ".......o#o......",
+        ".......o#o......",
+        "......oo#oo.....",
+    ],
+    // SPR_BLADE_B - counter-curved and shorter (three empty top rows) so
+    // mixed clumps get height variance from art, not just scale.
+    [
+        "................",
+        "................",
+        "................",
+        "......*.........",
+        "......#.........",
+        ".......#........",
+        ".......##.......",
+        "........#.......",
+        "........#.......",
+        ".......##.......",
+        ".......#........",
+        "......##........",
+        "......#o........",
+        ".....o#o........",
+        ".....o#o........",
+        "....oo#oo.......",
+    ],
+    // SPR_BLADE_C - near-straight with a wind-bent tip: reads as the stiff
+    // blade in a clump; the sharp tip kink sells the breeze.
+    [
+        "................",
+        ".....**.........",
+        "......#*........",
+        ".......#........",
+        ".......#........",
+        ".......#........",
+        ".......#........",
+        ".......#........",
+        ".......#........",
+        ".......#........",
+        ".......#........",
+        ".......#o.......",
+        ".......#o.......",
+        "......o#o.......",
+        "......o#o.......",
+        ".....oo#oo......",
+    ],
+    // SPR_BLADE_DRY - forked straw: two thin prongs splitting mid-height,
+    // sparse the way dead grass is.
+    [
+        "................",
+        "....#......*....",
+        "....#......#....",
+        ".....#....#.....",
+        ".....#....#.....",
+        "......#..#......",
+        "......#..#......",
+        ".......##.......",
+        ".......#........",
+        ".......#........",
+        ".......#........",
+        ".......#o.......",
+        ".......#o.......",
+        "......o#o.......",
+        "......o#o.......",
+        ".....oo#oo......",
+    ],
+    // SPR_SEED_HEAD - drooping oat head: kernels hang off the arc of a
+    // bowed stem tip; pairs with the dry blades on 1-2 cards per clump.
+    [
+        "................",
+        "......###.......",
+        ".....#*.*#......",
+        "....#*...*#.....",
+        "....*.....*#....",
+        "...........#....",
+        "..........#.....",
+        ".........#......",
+        "........##......",
+        ".......#........",
+        ".......#........",
+        ".......#o.......",
+        ".......#o.......",
+        "......o#o.......",
+        "......o#o.......",
+        ".....oo#oo......",
+    ],
+    // SPR_PETAL_ROUND - two overlapping rounded petals for card-built heads
+    // (poppy/tulip class); bright rims read as the light-facing edge.
+    [
+        "................",
+        "................",
+        "....***..***....",
+        "...*###**###*...",
+        "..*#####*####*..",
+        "..*###########..",
+        "..############..",
+        "..############..",
+        "...##########...",
+        "....########....",
+        ".....######.....",
+        "......####......",
+        ".......##.......",
+        "................",
+        "................",
+        "................",
+    ],
+    // SPR_PETAL_RAY - three slim ray florets fanning from the card base
+    // (daisy class): airy, with light tips.
+    [
+        "................",
+        "..*....*....*...",
+        "..#....#....#...",
+        "..#...##....#...",
+        "..##..#....##...",
+        "...#..#....#....",
+        "...##.#...##....",
+        "....#.#...#.....",
+        "....######......",
+        ".....####.......",
+        "......##........",
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+    ],
+    // SPR_PETAL_SPIKE - ragged spiky fan (cornflower class): jagged edges,
+    // uneven lengths, accent tips.
+    [
+        "................",
+        "...*..*...*.....",
+        "...#..#..*#..*..",
+        "...##.#..##..#..",
+        "....#.##.#..##..",
+        "..*.#..#.#..#...",
+        "..#.##.###.##...",
+        "..##.#.###.#....",
+        "...#########....",
+        "....#######.....",
+        ".....#####......",
+        "......###.......",
+        ".......#........",
+        "................",
+        "................",
+        "................",
+    ],
+    // SPR_PUFF - dotted hemispherical wedge (dandelion class): detached
+    // seed dots around a soft core so card clusters read as a fluffy globe.
+    [
+        "................",
+        "....*...*..*....",
+        "..*..*.*..*..*..",
+        "...*.*#*#**.*...",
+        "..*.*#####*.*...",
+        "...*#######*....",
+        "..*.#######.*...",
+        "...*#######*....",
+        "....*#####*.....",
+        ".....*###*......",
+        "......*#*.......",
+        ".......#........",
+        "................",
+        "................",
+        "................",
+        "................",
+    ],
+    // SPR_FLOWER_CENTER - small disc with accent stipple: the head's core
+    // card, drawn last over the petal cards.
+    [
+        "................",
+        "................",
+        "................",
+        "................",
+        "......####......",
+        ".....#*##*#.....",
+        ".....##**##.....",
+        ".....#*##*#.....",
+        "......####......",
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+    ],
+    // SPR_STEM - centre-column stem with two leaf nubs; columns 7-8 exactly
+    // (the cross-quad mirror rule) so single-card use stays centred too.
+    [
+        "................",
+        ".......##.......",
+        ".......##.......",
+        ".......##.......",
+        ".....#o##.......",
+        "......o##.......",
+        ".......##o#.....",
+        ".......##o......",
+        ".......##.......",
+        ".....#o##.......",
+        "......o##.......",
+        ".......##.......",
+        ".......##.......",
+        ".......##.......",
+        ".......##.......",
+        ".......##.......",
     ],
 ];
 
@@ -655,5 +899,55 @@ mod tests {
             assert!(row_count(12) <= 4, "sprite {s} tip row density");
             assert_eq!(row_count(15), 0, "sprite {s} top row clear");
         }
+    }
+
+    /// Contact sheet: every 16x16 sprite scaled x8 into a grid PNG for eye
+    /// review (the flora plan's stage-1 gate). CPU-only, no GPU needed.
+    #[test]
+    #[ignore]
+    fn sprite_sheet() {
+        let w = encoded();
+        let scale = 8usize;
+        let cols = 6usize;
+        let rows = N_SPRITES.div_ceil(cols);
+        let cell = (SPRITE_DIM + 2) * scale;
+        let (iw, ih) = (cols * cell, rows * cell);
+        let mut img = vec![0u8; iw * ih * 4];
+        for px in img.chunks_exact_mut(4) {
+            px[0] = 28;
+            px[1] = 30;
+            px[2] = 34;
+            px[3] = 255;
+        }
+        for s in 0..N_SPRITES {
+            let (gx, gy) = (s % cols, s / cols);
+            for y in 0..SPRITE_DIM {
+                for x in 0..SPRITE_DIM {
+                    let c: [u8; 3] = match texel(&w, s, x, y) {
+                        1 => [96, 176, 64],
+                        2 => [52, 92, 40],
+                        3 => [222, 232, 152],
+                        _ => continue,
+                    };
+                    let py0 = gy * cell + (1 + SPRITE_DIM - 1 - y) * scale;
+                    let px0 = gx * cell + (1 + x) * scale;
+                    for dy in 0..scale {
+                        for dx in 0..scale {
+                            let o = ((py0 + dy) * iw + px0 + dx) * 4;
+                            img[o] = c[0];
+                            img[o + 1] = c[1];
+                            img[o + 2] = c[2];
+                        }
+                    }
+                }
+            }
+        }
+        std::fs::create_dir_all("target/lookdev").unwrap();
+        let f = std::fs::File::create("target/lookdev/flora_sprites.png").unwrap();
+        let mut e = png::Encoder::new(std::io::BufWriter::new(f), iw as u32, ih as u32);
+        e.set_color(png::ColorType::Rgba);
+        e.set_depth(png::BitDepth::Eight);
+        e.write_header().unwrap().write_image_data(&img).unwrap();
+        eprintln!("wrote target/lookdev/flora_sprites.png");
     }
 }
