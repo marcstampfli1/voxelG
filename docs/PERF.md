@@ -108,6 +108,12 @@ Live static frames (tile-gated): ~1.9-2.5 ms GPU total.
   flickered dappled shadows. (Foliage cost is PRIMARY-ray blade cutouts.)
 - Water secondary-shading LOD + refraction cap 40 + grazing reflection cap:
   perf ~neutral on water-close and damaged the look (user reverted).
+- Fog-bounded reflection range at grazing (cap skimming rays, resolve to
+  fog): NULL on the bench pairs - grazing reflections mostly hit NEARBY
+  terraced terrain, not distant geometry, so range caps save nothing. The
+  cost is ray count x moderate traversal. Look risk for zero gain: rejected.
+- Column-anchored reflection-history validation (wave-tolerant reuse):
+  NULL - reuse was already engaging; validation was not the blocker.
 - 4-phase static reflection stagger (trace each 8x8 block every 4th frame
   instead of every 2nd): the live deterministic bench measured IDENTICAL fps
   on every water segment across interleaved before/after pairs (93/93,
