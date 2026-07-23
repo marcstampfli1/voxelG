@@ -36,6 +36,17 @@ pub const WORLD_L4_Y: u32 = (WORLD_CHUNKS_Y + 3) / 4;
 pub const WORLD_L4_Z: u32 = (WORLD_CHUNKS_Z + 3) / 4;
 pub const WORLD_L4_TOTAL: u32 = WORLD_L4_X * WORLD_L4_Y * WORLD_L4_Z;
 
+// ---- GI irradiance probe grid (world-space DDGI-style cache) ----
+// One irradiance probe every PROBE_SPACING voxels, centered in its cell. The
+// grid is world-space and toroidal like the voxel storage, so it follows the
+// streaming window at O(1) and per-pixel GI is a cheap trilinear probe sample
+// instead of a fresh bounce ray. PROBE_SPACING must divide the world dims.
+pub const PROBE_SPACING: u32 = 8;
+pub const PROBE_DIM_X: u32 = WORLD_VOXELS_X / PROBE_SPACING; // 64
+pub const PROBE_DIM_Y: u32 = WORLD_VOXELS_Y / PROBE_SPACING; // 32
+pub const PROBE_DIM_Z: u32 = WORLD_VOXELS_Z / PROBE_SPACING; // 64
+pub const PROBE_TOTAL: u32 = PROBE_DIM_X * PROBE_DIM_Y * PROBE_DIM_Z; // 131072
+
 // ---- storage chunks (the "chunked world") ----
 // A storage chunk holds 8x8x8 bricks = 32x32x32 voxels. Generation, dirty
 // tracking and GPU streaming all operate at this granularity.

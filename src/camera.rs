@@ -80,7 +80,9 @@ pub struct CameraUniform {
     /// uses this to bounds-check rays + mod-fold world voxel coords into the
     /// toroidal slot storage.
     pub world_origin: [i32; 3],
-    pub _pad4: i32,
+    /// Rotating GI-probe update round (frame counter mod GI_UPDATE_DIV). The probe
+    /// gather updates a strided 1/GI_UPDATE_DIV slice of probes each frame.
+    pub gi_round: i32,
     /// Sub-pixel ray jitter (in pixels) for temporal anti-aliasing. Non-zero
     /// only while accumulating (static camera); 0 on motion.
     pub jitter: [f32; 2],
@@ -143,7 +145,7 @@ impl CameraUniform {
             time,
             wind_x: wind_dir(time).x,
             world_origin: [world_origin_voxel.x, world_origin_voxel.y, world_origin_voxel.z],
-            _pad4: 0,
+            gi_round: 0,
             jitter,
             taa_blend,
             reproject_lighting: 0.0,
