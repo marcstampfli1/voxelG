@@ -4545,6 +4545,184 @@ mod gpu_render_tests {
         }
     }
 
+    /// Continuous-carpet prototype (Marc's "continuous grass everywhere,
+    /// higher and lower"): a 150x150 platform with EVERY cell decorated
+    /// (grass carpet + dry patches + scattered flowers), heights rolling on
+    /// the shader's flora_field. Stills for the eye, then a carpet-vs-sparse
+    /// timing A/B (shipped RT-primary + probe-GI config, main+transp+compose)
+    /// on the same cameras to price 100% density before any worldgen change.
+    #[test]
+    #[ignore]
+    fn flora_carpet_lab() {
+        use crate::voxel::{
+            MAT_DIRT, MAT_FLOWER, MAT_GRASS, MAT_TALL_GRASS, MAT_TALL_GRASS_DRY,
+        };
+        let hash = |x: u32, z: u32, salt: u32| -> f32 {
+            let mut v = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            v ^= z.wrapping_mul(22695477).wrapping_add(salt.wrapping_mul(747796405));
+            v ^= v >> 16;
+            v = v.wrapping_mul(2654435769);
+            (v >> 8) as f32 / 16777216.0
+        };
+        let build = |carpet: bool| -> World {
+            let mut world = World::new();
+            for z in 150u32..300 {
+                for x in 150u32..300 {
+                    world.set_voxel(x, 63, z, MAT_DIRT);
+                    world.set_voxel(x, 64, z, MAT_GRASS);
+                    let r = hash(x, z, 0);
+                    let m = if hash(x, z, 1) < 0.03 {
+                        MAT_FLOWER
+                    } else if hash(x / 12, z / 12, 2) < 0.18 {
+                        MAT_TALL_GRASS_DRY
+                    } else {
+                        MAT_TALL_GRASS
+                    };
+                    // Sparse reference approximates live worldgen density.
+                    if carpet || r < 0.05 {
+                        world.set_voxel(x, 65, z, m);
+                    }
+                }
+            }
+            world
+        };
+
+        // ---- Stills on the carpet world (the look Marc judges). ----
+        let carpet_world = build(true);
+        let views: [(&str, glam::Vec3, f32, f32); 3] = [
+            ("flora_carpet_low", glam::Vec3::new(225.0, 66.2, 218.0), 0.6, -0.06),
+            ("flora_carpet_walk", glam::Vec3::new(225.0, 67.5, 225.0), 0.8, -0.25),
+            ("flora_carpet_vista", glam::Vec3::new(225.0, 74.0, 200.0), 0.5, -0.30),
+        ];
+        std::fs::create_dir_all("target/lookdev").unwrap();
+        for (name, pos, yaw, pitch) in views {
+            let mut cam = Camera::new();
+            cam.pos = pos;
+            cam.yaw = yaw;
+            cam.pitch = pitch;
+            let Some(rgba) = render_rgba(&carpet_world, &cam, 960, 540) else {
+                eprintln!("no GPU - skipping");
+                return;
+            };
+            let path = format!("target/lookdev/{name}.png");
+            let file = std::fs::File::create(&path).unwrap();
+            let mut enc = png::Encoder::new(std::io::BufWriter::new(file), 960, 540);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            enc.write_header().unwrap().write_image_data(&rgba).unwrap();
+            eprintln!("wrote {path}");
+        }
+
+        // ---- Timing: carpet vs sparse, shipped config, same cameras. ----
+        let Some((device, queue, _gpu)) = rt_headless_device() else {
+            eprintln!("flora_carpet_lab: no RT adapter, timing skipped");
+            return;
+        };
+        let (w, h) = (1920u32, 1080u32);
+        let tw = (w + 7) / 8;
+        let th = (h + 7) / 8;
+        let cams: [(&str, glam::Vec3, f32, f32); 2] = [
+            ("carpet-walk", glam::Vec3::new(225.0, 67.5, 225.0), 0.8, -0.25),
+            ("carpet-graze", glam::Vec3::new(225.0, 66.2, 218.0), 0.6, -0.06),
+        ];
+        for (wname, world) in [("sparse", build(false)), ("carpet", build(true))] {
+            let wo = world.world_origin_voxel();
+            let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::bytes_of(&CameraUniform::from_camera(
+                    &Camera::new(), w, h, 0.0, 0.0, wo, [0.0, 0.0], 0.0,
+                )),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+            let bricks_buf = storage(&device, "b", bytemuck::cast_slice(&world.bricks));
+            let tm = storage(&device, "tm", bytemuck::cast_slice(&world.tile_mask));
+            let cm = storage(&device, "cm", bytemuck::cast_slice(&world.chunk_mask));
+            let l4 = storage(&device, "l4", bytemuck::cast_slice(&world.l4_mask));
+            let bu = storage(&device, "bu", bytemuck::cast_slice(&pack_u8_to_u32(&world.brick_uniform)));
+            let tu = storage(&device, "tu", bytemuck::cast_slice(&pack_u8_to_u32(&world.tile_uniform)));
+            let palette = default_palette();
+            let palette_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&palette),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+            let words = ((tw * th) as usize + 31) / 32;
+            let td = storage(&device, "td", bytemuck::cast_slice(&vec![u32::MAX; words]));
+            let players = storage(&device, "pl", &vec![0u8; 16 + MAX_REMOTE_PLAYERS * 16]);
+            let (_o, ov) = create_output_texture(&device, w, h);
+            let (_b, bv) = create_beam_texture(&device, w, h);
+            let (_c, csv, _csw) = create_cloud_texture(&device, w, h);
+            let csamp = device.create_sampler(&wgpu::SamplerDescriptor {
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                ..Default::default()
+            });
+            let (_li, liv) = create_lighting_texture(&device, w, h);
+            let (_lo, lov) = create_lighting_texture(&device, w, h);
+            let tpb = create_transp_buf(&device, w, h);
+            let spr = storage(&device, "spr", bytemuck::cast_slice(&crate::sprites::encoded()));
+            let (_d, dv) = create_depth_texture(&device, w, h);
+            let (_g, gv) = create_output_texture(&device, w, h);
+            let (_hh, hv) = create_output_texture(&device, w, h);
+            let (_dd, ddv) = create_depth_texture(&device, 1, 1);
+            let bgl = create_compute_bgl(&device);
+            let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &gv, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &dv, &hv, &bv);
+            let bg_compose = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &ov, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &ddv, &gv, &dv);
+            let accel = crate::accel::build_world_accel(&device, &queue, &world);
+            let rt_bgl = create_rt_bgl(&device);
+            let (_gi_i, gi_iv) = create_lighting_texture(&device, w, h);
+            let (_gi_o, gi_ov) = create_lighting_texture(&device, w, h);
+            let probe_buf = create_probe_buf(&device);
+            let rt_bg = make_rt_bg(&device, &rt_bgl, &accel, &gi_iv, &gi_ov, &probe_buf);
+            let rt_m = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: None,
+                source: wgpu::ShaderSource::Wgsl(raymarch_source_variant(true).into()),
+            });
+            let rt_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[Some(&bgl), Some(&rt_bgl)],
+                immediate_size: 0,
+            });
+            let rtpg: &[(&'static str, f64)] = &[("GI_ENABLE", 1.0), ("RT_PRIMARY", 1.0), ("GI_PROBE_MODE", 1.0)];
+            let mk = |e: &'static str| device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: None,
+                layout: Some(&rt_pl),
+                module: &rt_m,
+                entry_point: Some(e),
+                compilation_options: wgpu::PipelineCompilationOptions { constants: rtpg, ..Default::default() },
+                cache: None,
+            });
+            let (main_p, transp_p, compose_p) = (mk("cs_main"), mk("cs_transparent"), mk("cs_compose"));
+            for (cname, pos, yaw, pitch) in cams {
+                let mut cam = Camera::new();
+                cam.pos = pos;
+                cam.yaw = yaw;
+                cam.pitch = pitch;
+                let cu = CameraUniform::from_camera(&cam, w, h, 0.0, 0.0, wo, [0.0, 0.0], 0.0);
+                queue.write_buffer(&camera_buf, 0, bytemuck::bytes_of(&cu));
+                let encode = || {
+                    let mut e = device.create_command_encoder(&Default::default());
+                    for (pipe, bind) in [(&main_p, &bg), (&transp_p, &bg), (&compose_p, &bg_compose)] {
+                        let mut cp = e.begin_compute_pass(&Default::default());
+                        cp.set_pipeline(pipe);
+                        cp.set_bind_group(0, bind, &[]);
+                        cp.set_bind_group(1, &rt_bg, &[]);
+                        cp.dispatch_workgroups(tw, th, 1);
+                    }
+                    e.finish()
+                };
+                for _ in 0..5 { queue.submit(std::iter::once(encode())); }
+                device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+                let n = 60;
+                let t0 = std::time::Instant::now();
+                for _ in 0..n { queue.submit(std::iter::once(encode())); }
+                device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+                let ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
+                eprintln!("flora_carpet_lab [{wname} / {cname}]: {ms:.2} ms");
+            }
+        }
+    }
+
     /// Flora lab (docs/FLORA_PLAN.md): crafted rows of every decoration
     /// variant on a flat grass platform, stills from side/top/grazing. Art
     /// iterates here in seconds; world integration only after the lab

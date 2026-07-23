@@ -1555,9 +1555,13 @@ fn sprite_cross_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u3
         sprite = SPR_POPPY + min(u32(fract(vh * 128.0) * 5.0), 4u);
     }
     // Per-clump height (grass and straw only): flowers keep hs = 1.0, their
-    // stems must reach the ground plane at full sprite height.
+    // stems must reach the ground plane at full sprite height. Grass rides
+    // the same rolling height field as the near-tier blades.
     var hs = 1.0;
-    if (mat != MAT_FLOWER) { hs = 0.70 + fract(vh * 4.0) * 0.30; }
+    if (mat != MAT_FLOWER) {
+        hs = (0.70 + fract(vh * 4.0) * 0.30)
+            * flora_field(voxel_min.xz + vec2<f32>(0.5));
+    }
 
     let voxel_center = voxel_min + vec3<f32>(0.5);
     let phase = voxel_min.x * 0.40 + voxel_min.z * 0.55 + vh * 6.28;
@@ -1630,6 +1634,14 @@ fn sprite_cross_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u3
 const FLORA_NEAR_T: f32 = 28.0;
 const FLORA_BLADES: i32 = 18;
 
+// Rolling grass height: a smooth ~18-voxel field so blade and tuft heights
+// cohere regionally (tall waves and short hollows, the "higher and lower"
+// carpet look) instead of dicing at random per cell. Both tiers scale by
+// the same field, so the near/far handoff keeps silhouette heights.
+fn flora_field(xz: vec2<f32>) -> f32 {
+    return 0.60 + 0.40 * vnoise3(vec3<f32>(xz.x * 0.055, 3.7, xz.y * 0.055));
+}
+
 fn flora_clump_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32) -> SubHit {
     var out: SubHit;
     out.hit = false;
@@ -1639,6 +1651,9 @@ fn flora_clump_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32
     if (vh > 0.92) { return out; } // same sparse gaps as the cross tier
     let phase = voxel_min.x * 0.40 + voxel_min.z * 0.55 + vh * 6.28;
     let wind = wind_offset(voxel_min, phase, 0.32);
+    // One field sample per clump: the intra-cell field delta (~2% height)
+    // is invisible, and 18 vnoise3 calls per cell are not.
+    let field = flora_field(voxel_min.xz + vec2<f32>(0.5));
 
     var best_t: f32 = 1e30;
     var best_n = vec3<f32>(0.0, 1.0, 0.0);
@@ -1664,7 +1679,7 @@ fn flora_clump_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32
         let sa = sin(ang);
         let pt2 = vec2<f32>(ca, sa);
         let pn = vec3<f32>(-sa, 0.0, ca);
-        let h = 0.60 + fract(bh * 3.0) * 0.40;
+        let h = (0.60 + fract(bh * 3.0) * 0.40) * field;
         let denom = dot(dir, pn);
         if (abs(denom) < 1e-4) { continue; }
         let rootw = voxel_min + vec3<f32>(root2.x, 0.0, root2.y);
