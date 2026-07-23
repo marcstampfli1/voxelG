@@ -164,12 +164,14 @@ fn vs_grass(@builtin(vertex_index) vid: u32,
     let fdir = vec2<f32>(cos(fa), sin(fa));
     let hfrac = 0.40 + 0.60 * fract(bh * 3.0);
     let h = field * clump_h * hfrac * 1.15;
-    let curve = 0.30 + 0.50 * fract(bh * 13.0);
+    let curve = 0.16 + 0.30 * fract(bh * 13.0);
     // Wind bends the CURVE (control points), not the whole blade rigidly.
     let phase = rootw.x * 0.40 + rootw.z * 0.55 + bh * 6.28;
     let wind = wind_off(rootw.xz, phase, 0.30);
     let arc2 = fdir * curve * h + wind * h * 1.7;
-    let droop = clamp(length(arc2) * 0.75, 0.0, 0.60);
+    // Gentle arc: meadow blades bow, they do not hook over. Tips stay
+    // above ~80% height even in gusts.
+    let droop = clamp(length(arc2) * 0.35, 0.0, 0.20);
     let cp0 = rootw;
     let cp1 = rootw + vec3<f32>(arc2.x * 0.5, h * 0.85, arc2.y * 0.5);
     let cp2 = rootw + vec3<f32>(arc2.x, h * (1.0 - droop), arc2.y);
@@ -220,7 +222,7 @@ fn vs_grass(@builtin(vertex_index) vid: u32,
     o.wide3 = wide3;
     // Sward interior: a blade shorter than its neighbourhood's tall canopy
     // lives in their shade. hfrac is the blade's height rank in the cell.
-    o.blade_ao = 0.55 + 0.45 * hfrac;
+    o.blade_ao = 0.78 + 0.22 * hfrac;
 
     // ---- colour: clump-coherent, root-dark -> tip-bright, dry skew ----
     let ground = vec3<f32>(0.30, 0.65, 0.20); // palette[MAT_GRASS], SYNC renderer default_palette
@@ -229,7 +231,7 @@ fn vs_grass(@builtin(vertex_index) vid: u32,
     let hue = mix(vec3<f32>(1.0), vec3<f32>(1.22, 1.04, 0.62),
                   smoothstep(0.75, 1.0, dry) * 0.45);
     let cb = (0.88 + 0.24 * fract(cid * 5.23)) * (0.92 + 0.16 * fract(bh * 23.0));
-    o.albedo0 = ground * hue * cb * 0.42;
+    o.albedo0 = ground * hue * cb * 0.58;
     o.albedo1 = ground * hue * cb * 1.35;
     return o;
 }
@@ -278,11 +280,11 @@ fn fs_grass(in: VsOut) -> @location(0) vec4<f32> {
     // Sward depth: the grass volume darkens toward its interior - the
     // height gradient AND the blade's height rank both pull light out.
     // This value range (deep shade to lit tips) is most of the "volume".
-    let sward = (0.30 + 0.70 * sblade * sblade) * in.blade_ao;
+    let sward = (0.55 + 0.45 * sblade) * in.blade_ao;
 
     // Wrapped diffuse: foliage responds softer than a hard lambert.
     let ndl = max(0.0, (dot(n, s) + 0.35) / 1.35);
-    let direct = sc * ndl * shadow * s_int * (0.45 + 0.55 * sward);
+    let direct = sc * ndl * shadow * s_int * (0.70 + 0.30 * sward);
     // Cool sky ambient against the warm sun (the two-tone light contrast
     // stylized fields live on), scaled by the cached ground AO + sward.
     let sky_f = 0.25 + 0.75 * s_int;
