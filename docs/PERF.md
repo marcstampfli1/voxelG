@@ -32,6 +32,20 @@ Live static frames (tile-gated): ~1.9-2.5 ms GPU total.
 
 ## Proven (shipped)
 
+- Moving-camera reflection reuse (one path for both camera states): the
+  reflection history is reprojected by ABSOLUTE surface position into the
+  previous frame and reused when the stored position matches AND the view
+  ray to the point rotated < ~2 degrees since last frame (computable from
+  prev_origin, zero extra storage) - the angle gate bounds reflection
+  parallax by construction and is distance-adaptive for free (close water
+  re-traces, far water reuses). New camera.prev_valid uniform flag (stays
+  set under motion, unlike reproject_lighting; repurposed _pad8). Modeled
+  strafe on water-close: transp 4.80 -> 3.88 ms (refl trace 2.61 -> 2.01);
+  static bit-identical (3.55). Live: ~170 fps static / ~120 moving at
+  water (Marc, motion look signed off). BENCH LESSON: rt_vs_software's
+  static row regressed 7.34 -> 8.47 after the gate change because the
+  bench never set a prev camera - it modeled a state the live game is
+  never in; benches must model live inputs (fixed).
 - Flat AO on refracted water hits: the transp cost-split attributed 2.55-2.66
   ms (the single largest water cost) to AO rays traced for bed pixels whose
   contribution absorption + tint then swamp. Replaced with a flat 0.4;

@@ -5866,7 +5866,11 @@ mod gpu_render_tests {
             // STATIC-camera variant (taa_blend > 0): the temporal reflection
             // accumulation only engages here - the whale's worst case is a
             // still camera staring at water.
-            let cu_static = CameraUniform::from_camera(cam, w, h, 0.0, 0.0, wo, [0.0, 0.0], 0.9);
+            let mut cu_static = CameraUniform::from_camera(cam, w, h, 0.0, 0.0, wo, [0.0, 0.0], 0.9);
+            // A static camera in live play always has a valid previous frame
+            // (update_camera sets it); the reflection-history reuse gates on
+            // prev_valid, so model it here too.
+            cu_static.set_prev_camera(cam, true);
             queue.write_buffer(&camera_buf, 0, bytemuck::bytes_of(&cu_static));
             let rtpg_static_ms = run_probe(&prg_update, &rtpg_main, &rtpg_transp, &rtpg_compose);
             eprintln!("  static-cam [{name}]: RT-prim+PROBE-GI {rtpg_static_ms:.2} ms");
@@ -6021,7 +6025,16 @@ mod gpu_render_tests {
             t0.elapsed().as_secs_f64() * 1000.0 / n as f64
         };
         for (state, taa) in [("moving", 0.0f32), ("static", 0.9f32)] {
-            let cu = CameraUniform::from_camera(&cam, w, h, 0.0, 0.0, wo, [0.0, 0.0], taa);
+            let mut cu = CameraUniform::from_camera(&cam, w, h, 0.0, 0.0, wo, [0.0, 0.0], taa);
+            // Model live motion: a real previous camera displaced by one
+            // frame of strafing (~0.5 voxel at 150 fps), light-cache
+            // reprojection off exactly as in live movement. The static state
+            // keeps the same-camera prev with the cache flag on.
+            let mut prev = cam.clone();
+            if taa == 0.0 {
+                prev.pos.x -= 0.5;
+            }
+            cu.set_prev_camera(&prev, taa > 0.0);
             queue.write_buffer(&camera_buf, 0, bytemuck::bytes_of(&cu));
             // Populate the transp records + reflection history for this state.
             {

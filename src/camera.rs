@@ -102,7 +102,12 @@ pub struct CameraUniform {
     /// --freeze-time while everything else animates on `time`.
     pub sun_time: f32,
     pub prev_right: [f32; 3],
-    pub _pad8: f32,
+    /// 1.0 = the prev_* camera fields describe a real previous frame (set by
+    /// set_prev_camera). Unlike reproject_lighting this stays 1.0 while the
+    /// camera MOVES - consumers that reproject by absolute position (the
+    /// water reflection history) stay valid under motion; the first frame's
+    /// zeroed history is rejected by its stored-position check.
+    pub prev_valid: f32,
     pub prev_up: [f32; 3],
     pub _pad9: f32,
 }
@@ -154,7 +159,7 @@ impl CameraUniform {
             prev_forward: c.forward().to_array(),
             sun_time,
             prev_right: c.right().to_array(),
-            _pad8: 0.0,
+            prev_valid: 0.0,
             prev_up: c.up().to_array(),
             _pad9: 0.0,
         }
@@ -164,6 +169,7 @@ impl CameraUniform {
     /// Called by the frame loop once it has last frame's camera.
     pub fn set_prev_camera(&mut self, prev: &Camera, enable: bool) {
         self.reproject_lighting = if enable { 1.0 } else { 0.0 };
+        self.prev_valid = 1.0;
         self.prev_origin = prev.pos.to_array();
         self.prev_forward = prev.forward().to_array();
         self.prev_right = prev.right().to_array();

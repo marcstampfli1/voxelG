@@ -34,7 +34,9 @@ struct Camera {
     // --freeze-time while water/wind/leaves keep animating on `time`.
     sun_time: f32,
     prev_right: vec3<f32>,
-    _pad8: f32,
+    // 1.0 = prev_* fields describe a real previous frame; stays set while
+    // the camera moves (unlike reproject_lighting).
+    prev_valid: f32,
     prev_up: vec3<f32>,
     _pad9: f32,
 };

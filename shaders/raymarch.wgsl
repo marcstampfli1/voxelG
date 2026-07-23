@@ -2873,10 +2873,37 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>, px: vec2<i32>) -
     // stale content.
     let res_i = vec2<i32>(camera.resolution);
     let hidx = refl_hist_idx(px, res_i);
-    let hist = transp_buf[hidx];
+    // MOVING-camera reuse (one path for both states): find where this
+    // frame's surface point sat in the PREVIOUS frame and read history
+    // there; a static camera reprojects to the same pixel. Validity needs
+    // BOTH a surface-position match (below, as before) and a bounded view
+    // rotation toward the point (~2 deg since last frame) - reflections are
+    // view-dependent, so the angle gate bounds reflection parallax error by
+    // construction. Distance-adaptive for free: close water re-traces
+    // (parallax visible), far water reuses (parallax negligible).
+    var hist_px = px;
+    if (camera.prev_valid > 0.5) {
+        let abs_hit = p_hit + vec3<f32>(camera.world_origin);
+        let dprev = abs_hit - camera.prev_origin;
+        let pz = dot(dprev, camera.prev_forward);
+        if (pz > 0.01) {
+            let aspect = camera.resolution.x / camera.resolution.y;
+            let ndc = vec2<f32>(
+                dot(dprev, camera.prev_right) / (pz * camera.tan_half_fov * aspect),
+                dot(dprev, camera.prev_up) / (pz * camera.tan_half_fov));
+            let uvp = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+            if (uvp.x >= 0.0 && uvp.x < 1.0 && uvp.y >= 0.0 && uvp.y < 1.0) {
+                hist_px = vec2<i32>(uvp * camera.resolution);
+            }
+        }
+    }
+    let hist = transp_buf[refl_hist_idx(hist_px, res_i)];
     let hist_p = vec3<f32>(bitcast<f32>(hist.z), unpack2x16float(hist.y).y, bitcast<f32>(hist.w));
     let hist_dp = hist_p - p_hit;
-    let hist_ok = camera.taa_blend > 0.0 && dot(hist_dp, hist_dp) < 0.35;
+    let v_now = normalize(p_hit - camera.origin);
+    let v_prev = normalize((p_hit + vec3<f32>(camera.world_origin)) - camera.prev_origin);
+    let angle_ok = dot(v_now, v_prev) > 0.9994; // ~2 degrees
+    let hist_ok = camera.prev_valid > 0.5 && angle_ok && dot(hist_dp, hist_dp) < 0.35;
     // 8x8-BLOCK stagger, not per-pixel: a pixel checkerboard leaves every
     // SIMT warp with both tracing and skipping threads, so the warp pays the
     // trace latency anyway (measured: zero gain). Whole workgroups skipping
