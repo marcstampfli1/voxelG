@@ -109,10 +109,16 @@ struct VsOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) uv: vec2<f32>,          // x: side -1..1, y: height 0..1 along blade
     @location(1) view_t: f32,
-    @location(2) @interpolate(flat) tangent: vec3<f32>,
-    @location(3) @interpolate(flat) wide3: vec3<f32>,
+    // Interpolated (NOT flat): the tangent follows the Bezier per vertex, so
+    // shading bends smoothly along the blade - flat interpolation carved
+    // every quad into one constant facet (the paper-fold look).
+    @location(2) tangent: vec3<f32>,
+    @location(3) wide3: vec3<f32>,
     @location(4) @interpolate(flat) albedo0: vec3<f32>, // root colour
     @location(5) @interpolate(flat) albedo1: vec3<f32>, // tip colour
+    // Sward-depth term: short blades under tall neighbours sit in the dark
+    // interior of the grass volume (the GoT depth look).
+    @location(6) @interpolate(flat) blade_ao: f32,
 };
 
 fn bez(cp0: vec3<f32>, cp1: vec3<f32>, cp2: vec3<f32>, t: f32) -> vec3<f32> {
@@ -156,20 +162,22 @@ fn vs_grass(@builtin(vertex_index) vid: u32,
 
     let fa = clump_ang + (fract(bh * 5.0) - 0.5) * 1.5;
     let fdir = vec2<f32>(cos(fa), sin(fa));
-    let h = field * clump_h * (0.45 + 0.55 * fract(bh * 3.0));
-    let curve = 0.35 + 0.55 * fract(bh * 13.0);
+    let hfrac = 0.40 + 0.60 * fract(bh * 3.0);
+    let h = field * clump_h * hfrac * 1.15;
+    let curve = 0.30 + 0.50 * fract(bh * 13.0);
     // Wind bends the CURVE (control points), not the whole blade rigidly.
     let phase = rootw.x * 0.40 + rootw.z * 0.55 + bh * 6.28;
     let wind = wind_off(rootw.xz, phase, 0.30);
     let arc2 = fdir * curve * h + wind * h * 1.7;
-    let droop = clamp(length(arc2) * 0.9, 0.0, 0.70);
+    let droop = clamp(length(arc2) * 0.75, 0.0, 0.60);
     let cp0 = rootw;
     let cp1 = rootw + vec3<f32>(arc2.x * 0.5, h * 0.85, arc2.y * 0.5);
     let cp2 = rootw + vec3<f32>(arc2.x, h * (1.0 - droop), arc2.y);
 
     let p = bez(cp0, cp1, cp2, t0);
-    let p_next = bez(cp0, cp1, cp2, min(t0 + 0.25, 1.0));
-    var tang = p_next - p;
+    // Analytic Bezier derivative: exact per-vertex tangent, interpolated
+    // across the quad for smooth curvature shading.
+    var tang = (cp1 - cp0) * (2.0 * (1.0 - t0)) + (cp2 - cp1) * (2.0 * t0);
     if (dot(tang, tang) < 1e-8) { tang = vec3<f32>(0.0, 1.0, 0.0); }
     tang = normalize(tang);
 
@@ -179,7 +187,7 @@ fn vs_grass(@builtin(vertex_index) vid: u32,
     let wide3 = vec3<f32>(-wf.y, 0.0, wf.x);
 
     // Width: taper root->tip.
-    var hw = 0.032 * GRASS_WIDTH_MUL * (0.8 + 0.4 * fract(bh * 17.0)) * (1.0 - t0 * 0.80);
+    var hw = 0.032 * GRASS_WIDTH_MUL * (0.8 + 0.4 * fract(bh * 17.0)) * (1.0 - t0 * 0.93);
 
     let wp0 = p + wide3 * hw * cs;
     let d = wp0 - camera.origin;
@@ -210,6 +218,9 @@ fn vs_grass(@builtin(vertex_index) vid: u32,
     o.view_t = length(d2);
     o.tangent = tang;
     o.wide3 = wide3;
+    // Sward interior: a blade shorter than its neighbourhood's tall canopy
+    // lives in their shade. hfrac is the blade's height rank in the cell.
+    o.blade_ao = 0.55 + 0.45 * hfrac;
 
     // ---- colour: clump-coherent, root-dark -> tip-bright, dry skew ----
     let ground = vec3<f32>(0.30, 0.65, 0.20); // palette[MAT_GRASS], SYNC renderer default_palette
@@ -255,20 +266,27 @@ fn fs_grass(in: VsOut) -> @location(0) vec4<f32> {
     let sc = sun_color(s);
     let sblade = in.uv.y;
 
-    // Rounded normal: flat face bowed across the width, blended toward up
-    // along the height (small sharp speculars at tips).
-    var nf = normalize(cross(in.tangent, in.wide3));
+    // Rounded normal on the SMOOTH interpolated frame: bowed across the
+    // width, blended toward up along the height (soft speculars at tips).
+    let tang_s = normalize(in.tangent);
+    let wide_s = normalize(in.wide3);
+    var nf = normalize(cross(tang_s, wide_s));
     nf = nf * select(1.0, -1.0, nf.y < 0.0);
-    var n = normalize(nf + in.wide3 * in.uv.x * 0.65);
+    var n = normalize(nf + wide_s * in.uv.x * 0.65);
     n = normalize(mix(n, vec3<f32>(0.0, 1.0, 0.0), 0.25 + 0.35 * sblade));
+
+    // Sward depth: the grass volume darkens toward its interior - the
+    // height gradient AND the blade's height rank both pull light out.
+    // This value range (deep shade to lit tips) is most of the "volume".
+    let sward = (0.30 + 0.70 * sblade * sblade) * in.blade_ao;
 
     // Wrapped diffuse: foliage responds softer than a hard lambert.
     let ndl = max(0.0, (dot(n, s) + 0.35) / 1.35);
-    let direct = sc * ndl * shadow * s_int;
-    // Sky ambient with the blade-depth gradient (dark in the sward, bright
-    // at the tips) modulated by the ground's cached AO.
+    let direct = sc * ndl * shadow * s_int * (0.45 + 0.55 * sward);
+    // Cool sky ambient against the warm sun (the two-tone light contrast
+    // stylized fields live on), scaled by the cached ground AO + sward.
     let sky_f = 0.25 + 0.75 * s_int;
-    let ambient = vec3<f32>(0.30, 0.34, 0.40) * sky_f * ao * (0.45 + 0.55 * sblade);
+    let ambient = vec3<f32>(0.24, 0.32, 0.46) * 1.15 * sky_f * ao * sward;
 
     let albedo = mix(in.albedo0, in.albedo1, sblade * sblade * 0.6 + sblade * 0.4);
     var col = albedo * (direct + ambient);
@@ -282,12 +300,18 @@ fn fs_grass(in: VsOut) -> @location(0) vec4<f32> {
         + camera.up * ndc.y * camera.tan_half_fov);
     if (s_int > 0.0) {
         let hv = normalize(s - vdir2);
-        let tdh = dot(normalize(in.tangent), hv);
+        let tdh = dot(tang_s, hv);
         let sheen = pow(sqrt(max(0.0, 1.0 - tdh * tdh)), 32.0);
-        let back = pow(max(0.0, dot(vdir2, s)), 6.0) * clamp(1.0 - s.y * 1.4, 0.0, 1.0);
+        // Backlight: sun through the sward toward the viewer, strongest at
+        // tips; rim: bright light edge where a tip silhouettes against the
+        // view. Together they are the glow GoT fields carry.
+        let back = pow(max(0.0, dot(vdir2, s)), 5.0) * clamp(1.2 - s.y * 1.2, 0.0, 1.0);
+        let rim = pow(1.0 - abs(dot(n, vdir2)), 3.0) * sblade * sblade
+            * max(0.0, dot(vdir2, s) * 0.5 + 0.5);
         col = col + sc * shadow
             * (sheen * 0.25 * vec3<f32>(1.0, 1.0, 0.85)
-               + back * 0.30 * vec3<f32>(0.55, 0.85, 0.30) * (0.4 + 0.6 * sblade));
+               + back * 0.55 * vec3<f32>(0.60, 0.88, 0.30) * (0.3 + 0.7 * sblade)
+               + rim * 0.35 * vec3<f32>(0.95, 1.0, 0.70));
     }
 
     // Fog toward the horizon haze so far grass melts into the fogged
