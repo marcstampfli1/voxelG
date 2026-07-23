@@ -52,5 +52,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     if (in_horiz_outer || in_vert_outer) {
         return vec4<f32>(0.0, 0.0, 0.0, 1.0);
     }
-    return col;
+    // Force opaque: the TAA resolve smuggles the grass-blade marker in its
+    // alpha; presenting it would alpha-composite the window on Wayland.
+    return vec4<f32>(col.rgb, 1.0);
 }

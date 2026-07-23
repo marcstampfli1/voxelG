@@ -3128,15 +3128,16 @@ mod gpu_render_tests {
         world: &World, cam: &Camera, w: u32, h: u32, leaves: &[crate::leaffall::LeafInstance],
         t: f32, sun_t: f32,
     ) -> Option<Vec<u8>> {
-        render_rgba_full_opts(world, cam, w, h, leaves, t, sun_t, true)
+        render_rgba_full_opts(world, cam, w, h, leaves, t, sun_t, true, false)
     }
 
     /// `draw_grass: false` renders without the raster blade field - for
     /// probes that assert on SHADING stability of rigid geometry, where
     /// legitimately wind-moving blade geometry is out of scope by design.
+    #[allow(clippy::too_many_arguments)]
     fn render_rgba_full_opts(
         world: &World, cam: &Camera, w: u32, h: u32, leaves: &[crate::leaffall::LeafInstance],
-        t: f32, sun_t: f32, draw_grass: bool,
+        t: f32, sun_t: f32, draw_grass: bool, keep_alpha: bool,
     ) -> Option<Vec<u8>> {
         let (device, queue, _gpu) = headless_device()?;
         let wo = world.world_origin_voxel();
@@ -3451,7 +3452,17 @@ mod gpu_render_tests {
         slice.map_async(wgpu::MapMode::Read, |_| {});
         device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
         let data = slice.get_mapped_range().unwrap();
-        Some(data.to_vec())
+        let mut v = data.to_vec();
+        // The LDR alpha carries the grass-blade TAA marker; as an IMAGE the
+        // frame is opaque. PNG dumps kept the marker and image viewers
+        // rendered every blade transparent-gray. keep_alpha exposes the raw
+        // marker to the transport probe only.
+        if !keep_alpha {
+            for px in v.chunks_exact_mut(4) {
+                px[3] = 255;
+            }
+        }
+        Some(v)
     }
 
     /// RT-capable headless device (enables wgpu_ray_query), or None so the test
@@ -5190,7 +5201,7 @@ mod gpu_render_tests {
         cam.pos = glam::Vec3::new(225.0, 66.2, 218.0);
         cam.yaw = 0.6;
         cam.pitch = -0.10;
-        let Some(rgba) = render_rgba(&world, &cam, 960, 540) else {
+        let Some(rgba) = render_rgba_full_opts(&world, &cam, 960, 540, &[], 0.0, 0.0, true, true) else {
             eprintln!("no GPU - skipping");
             return;
         };
@@ -5642,11 +5653,11 @@ mod gpu_render_tests {
         cam.yaw = 0.0;
         cam.pitch = -0.5;
         let (w, h) = (960usize, 540usize);
-        let Some(a) = render_rgba_full_opts(&world, &cam, w as u32, h as u32, &[], 30.0, 30.0, false) else {
+        let Some(a) = render_rgba_full_opts(&world, &cam, w as u32, h as u32, &[], 30.0, 30.0, false, false) else {
             eprintln!("no GPU adapter — skipping luma-wave probe");
             return;
         };
-        let b = render_rgba_full_opts(&world, &cam, w as u32, h as u32, &[], 32.0, 30.0, false).unwrap();
+        let b = render_rgba_full_opts(&world, &cam, w as u32, h as u32, &[], 32.0, 30.0, false, false).unwrap();
         let luma = |f: &[u8], x: usize, y: usize| {
             let i = (y * w + x) * 4;
             (f[i] as f32 + f[i + 1] as f32 + f[i + 2] as f32) / (3.0 * 255.0)
