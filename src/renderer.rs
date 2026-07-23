@@ -5173,6 +5173,38 @@ mod gpu_render_tests {
     /// layer above every block - analytic 3D blades out of the ground, the
     /// combed sheen shading between and beyond them - at a day and an
     /// evening sun, walking and grazing cameras.
+    /// The blade marker must survive grass -> post -> LDR: blade pixels
+    /// carry alpha 0, sky/terrain alpha 1. The TAA ghost fix stands on it.
+    #[test]
+    #[ignore]
+    fn grass_marker_reaches_ldr() {
+        use crate::voxel::{MAT_DIRT, MAT_GRASS};
+        let mut world = World::new();
+        for z in 150u32..300 {
+            for x in 150u32..300 {
+                world.set_voxel(x, 63, z, MAT_DIRT);
+                world.set_voxel(x, 64, z, MAT_GRASS);
+            }
+        }
+        let mut cam = Camera::new();
+        cam.pos = glam::Vec3::new(225.0, 66.2, 218.0);
+        cam.yaw = 0.6;
+        cam.pitch = -0.10;
+        let Some(rgba) = render_rgba(&world, &cam, 960, 540) else {
+            eprintln!("no GPU - skipping");
+            return;
+        };
+        let mut blade_px = 0usize;
+        let mut solid_px = 0usize;
+        for px in rgba.chunks_exact(4) {
+            if px[3] < 128 { blade_px += 1; } else { solid_px += 1; }
+        }
+        let frac = blade_px as f64 / (blade_px + solid_px) as f64;
+        eprintln!("grass_marker_reaches_ldr: blade-marked {blade_px} px ({:.1}%), other {solid_px}", frac * 100.0);
+        assert!(frac > 0.10, "almost no blade-marked pixels - the marker chain is broken");
+        assert!(frac < 0.95, "everything marked - the marker chain is broken the other way");
+    }
+
     #[test]
     #[ignore]
     fn dump_turf() {

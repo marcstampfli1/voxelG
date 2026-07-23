@@ -34,8 +34,9 @@ fn cs_taa(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Hard reset (first frame / after resize → taa_blend 0) or no valid
     // reprojection basis (origin shifted on a chunk cross → reproject_lighting 0)
     // → pass the current frame straight through (sharp, no smear).
+    let out_a = select(1.0, 0.0, is_blade);
     if (camera.taa_blend <= 0.0 || camera.reproject_lighting < 0.5) {
-        textureStore(resolve_out, p, vec4<f32>(cur, 1.0));
+        textureStore(resolve_out, p, vec4<f32>(cur, out_a));
         return;
     }
 
@@ -76,9 +77,20 @@ fn cs_taa(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Sample the REPROJECTED history, clamp into the current neighbourhood
     // (rejects ghosting/disocclusion) and blend.
-    let hist = textureLoad(history_tex, hp, 0).rgb;
-    let hist_clamped = clamp(hist, mn, mx);
-    let blend = select(camera.taa_blend, camera.taa_blend * 0.45, is_blade);
+    // Same-kind accumulation rule: a pixel only blends with history of its
+    // own kind (the resolve stores the blade marker in alpha). Blade over
+    // blade accumulates - temporal AA along the blade body; any coverage
+    // flip (blade moved on or off this pixel) renders PURE current frame,
+    // so terrain history can never bleed through a blade, by construction.
+    let hist4 = textureLoad(history_tex, hp, 0);
+    let hist_blade = hist4.a < 0.5;
+    var blend = camera.taa_blend;
+    if (is_blade != hist_blade) {
+        blend = 0.0;
+    } else if (is_blade) {
+        blend = camera.taa_blend * 0.6;
+    }
+    let hist_clamped = clamp(hist4.rgb, mn, mx);
     let resolved = mix(cur, hist_clamped, blend);
-    textureStore(resolve_out, p, vec4<f32>(resolved, 1.0));
+    textureStore(resolve_out, p, vec4<f32>(resolved, out_a));
 }
