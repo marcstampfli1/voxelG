@@ -238,6 +238,7 @@ fn default_palette() -> [PaletteEntry; PALETTE_SIZE] {
     p[crate::voxel::MAT_LEAF_FRINGE as usize] = PaletteEntry([0.30, 0.58, 0.20, 1.0]);
     p[MAT_TALL_GRASS_DRY as usize] = PaletteEntry([0.78, 0.68, 0.38, 1.0]); // pale straw
     p[crate::voxel::MAT_TURF as usize] = PaletteEntry([0.34, 0.66, 0.22, 1.0]); // ground blades
+    p[crate::voxel::MAT_BUSH as usize] = PaletteEntry([0.28, 0.55, 0.19, 1.0]); // leafy bush
     p
 }
 
@@ -5230,6 +5231,8 @@ mod gpu_render_tests {
         for (x, z) in [(214u32, 210u32), (216, 211), (215, 213), (219, 210), (213, 216)] {
             world.set_voxel(x, 65, z, MAT_TALL_GRASS);
         }
+        world.set_voxel(211, 65, 212, crate::voxel::MAT_BUSH);
+        world.set_voxel(218, 65, 214, crate::voxel::MAT_BUSH);
         let mut cam = Camera::new();
         cam.pos = glam::Vec3::new(215.5, 66.4, 207.0);
         cam.yaw = 0.35;

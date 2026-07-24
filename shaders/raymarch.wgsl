@@ -885,6 +885,7 @@ const MAT_TALL_GRASS:      u32 = 31u;
 const MAT_LEAF_FRINGE:     u32 = 33u;
 const MAT_TALL_GRASS_DRY:  u32 = 34u;
 const MAT_TURF:            u32 = 35u;
+const MAT_BUSH:            u32 = 36u;
 
 fn is_water_mat(m: u32) -> bool {
     return m >= MAT_WATER_L1 && m <= MAT_WATER_L8;
@@ -901,7 +902,7 @@ fn is_foliage_mat(m: u32) -> bool {
         || m == MAT_LEAVES_PINE || m == MAT_LEAVES_AUTUMN
         || m == MAT_FLOWER || m == MAT_TALL_GRASS
         || m == MAT_LEAF_FRINGE || m == MAT_TALL_GRASS_DRY
-        || m == MAT_TURF;
+        || m == MAT_TURF || m == MAT_BUSH;
 }
 fn is_leaf_block_mat(m: u32) -> bool {
     return m == MAT_LEAVES || m == MAT_LEAVES_BIRCH
@@ -913,7 +914,7 @@ fn is_leaf_block_mat(m: u32) -> bool {
 // don't disappear.
 fn is_decoration_mat(m: u32) -> bool {
     return m == MAT_FLOWER || m == MAT_TALL_GRASS || m == MAT_LEAF_FRINGE
-        || m == MAT_TALL_GRASS_DRY || m == MAT_TURF;
+        || m == MAT_TALL_GRASS_DRY || m == MAT_TURF || m == MAT_BUSH;
 }
 
 struct SubHit {
@@ -1947,26 +1948,27 @@ fn micro_tuft_bit(variant: u32, x: i32, y: i32, z: i32) -> bool {
     return ((w >> (bit & 31u)) & 1u) != 0u;
 }
 
-fn grass_tuft_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>) -> SubHit {
-    var out: SubHit;
-    out.hit = false;
-    out.color_tint = vec3<f32>(1.0);
-    let voxel_min = vec3<f32>(f32(voxel.x), f32(voxel.y), f32(voxel.z));
-    let vh = hash3f(voxel_min);
-    let variant = u32(fract(vh * 8.0) * 3.0) % 3u;
-    let phase = voxel_min.x * 0.40 + voxel_min.z * 0.55 + vh * 6.28;
-    // Wind lean, clamped so sheared tips stay essentially in-cell.
-    let wind = wind_offset(voxel_min, phase, 0.30);
-    let lean = clamp(wind, vec2<f32>(-0.25), vec2<f32>(0.25));
+// Shared micro-volume march for tussocks and bushes: DDA with CUTOUT
+// faces - an occupied cell's face carries a hole pattern (grass: vertical
+// slits, airier toward the crown; bush: round leaf holes), and a holed
+// crossing lets the ray continue, exactly like the leaf-block cutouts.
+struct TuftHit {
+    hit: bool,
+    t: f32,
+    n: vec3<f32>,
+    vn: f32,     // micro height 0..1 of the hit cell
+    tone: f32,   // per-micro-cell quantized tone
+}
 
-    // Shear space: q = p - lean * y. The shear is linear, so the ray stays
-    // a straight line with a modified direction and the volume stays the
-    // axis-aligned unit cell - an exact rigid-lean march.
+fn tuft_volume_march(
+    voxel_min: vec3<f32>, origin: vec3<f32>, dir: vec3<f32>,
+    variant: u32, lean: vec2<f32>, is_bush: bool,
+) -> TuftHit {
+    var out: TuftHit;
+    out.hit = false;
     let o_l = origin - voxel_min;
     let o_s = vec3<f32>(o_l.x - lean.x * o_l.y, o_l.y, o_l.z - lean.y * o_l.y);
     let d_s = vec3<f32>(dir.x - lean.x * dir.y, dir.y, dir.z - lean.y * dir.y);
-
-    // Entry into the unit cell in shear space.
     let inv = 1.0 / d_s;
     let t0v = (vec3<f32>(0.0) - o_s) * inv;
     let t1v = (vec3<f32>(1.0) - o_s) * inv;
@@ -1975,57 +1977,61 @@ fn grass_tuft_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>) -> SubHit
     let t_in = max(max(tmin3.x, tmin3.y), max(tmin3.z, 0.0));
     let t_out = min(min(tmax3.x, tmax3.y), tmax3.z);
     if (t_in >= t_out) { return out; }
-
-    // 8x8x8 DDA from the entry point.
     let eps = 1e-4;
     var p = (o_s + d_s * (t_in + eps)) * 8.0;
     var c = vec3<i32>(clamp(floor(p), vec3<f32>(0.0), vec3<f32>(7.0)));
     let step_i = vec3<i32>(sign(d_s));
     let inv8 = 1.0 / (d_s * 8.0);
-    // Parametric distance (in ray t) to each next cell boundary.
-    // Micro units: p advances at d_s * 8 per unit ray-t, so a boundary at
-    // distance (b - p) micro cells lies (b - p) * inv8 ray-t away.
     var t_next = vec3<f32>(1e30);
     if (d_s.x != 0.0) { t_next.x = t_in + (select(f32(c.x), f32(c.x + 1), d_s.x > 0.0) - p.x) * inv8.x; }
     if (d_s.y != 0.0) { t_next.y = t_in + (select(f32(c.y), f32(c.y + 1), d_s.y > 0.0) - p.y) * inv8.y; }
     if (d_s.z != 0.0) { t_next.z = t_in + (select(f32(c.z), f32(c.z + 1), d_s.z > 0.0) - p.z) * inv8.z; }
     let t_delta = abs(inv8);
-
     var t_cur = t_in;
-    var axis = 1; // entry face axis fallback: +Y-ish
+    var axis = 1;
     for (var s = 0; s < 26; s = s + 1) {
         if (c.x < 0 || c.x > 7 || c.y < 0 || c.y > 7 || c.z < 0 || c.z > 7) { break; }
         if (t_cur > t_out) { break; }
         if (micro_tuft_bit(variant, c.x, c.y, c.z)) {
-            out.hit = true;
-            out.t_hit = t_cur;
-            // Face normal from the crossed axis (unshear ~ identity for
-            // small leans); entry through the cell top reads as +Y.
-            var n = vec3<f32>(0.0, 1.0, 0.0);
-            if (axis == 0) { n = vec3<f32>(-f32(step_i.x), 0.0, 0.0); }
-            if (axis == 2) { n = vec3<f32>(0.0, 0.0, -f32(step_i.z)); }
-            // Carpet tint rules on the micro height.
-            let vn = (f32(c.y) + 0.5) / 8.0;
-            let ground = mix(vec3<f32>(1.0),
-                             palette[MAT_GRASS].rgb / max(palette[MAT_TALL_GRASS].rgb, vec3<f32>(1e-3)),
-                             0.6);
-            let s1 = smoothstep(0.48, 0.56, vn);
-            let s2 = smoothstep(0.80, 0.88, vn);
-            var b = 0.95 + 0.13 * s1 + 0.14 * s2;
-            // Top faces a breath lighter, sides a breath darker.
-            b = b * select(0.96, 1.06, axis == 1 && ((dir.y < 0.0) == (n.y > 0.0)));
-            // Per-micro-cell quantized tone (two steps, +-8%): the texel-
-            // scale shading detail voxel art lives on - a flat monotone
-            // face reads as a plastic crate.
-            let mh = hash3f(voxel_min + vec3<f32>(f32(c.x) * 0.37 + 1.1,
-                                                  f32(c.y) * 0.53 + 2.3,
-                                                  f32(c.z) * 0.71 + 3.7));
-            b = b * select(select(1.0, 1.08, mh > 0.66), 0.92, mh < 0.33);
-            out.normal = n;
-            out.color_tint = vec3<f32>(b) * ground;
-            return out;
+            // Face-local UV for the cutout pattern.
+            let pm = (o_s + d_s * (t_cur + eps)) * 8.0;
+            var uv = vec2<f32>(fract(pm.x), fract(pm.y));
+            if (axis == 0) { uv = vec2<f32>(fract(pm.z), fract(pm.y)); }
+            if (axis == 2) { uv = vec2<f32>(fract(pm.x), fract(pm.y)); }
+            if (axis == 1) { uv = vec2<f32>(fract(pm.x), fract(pm.z)); }
+            let fy = (f32(c.y) + 0.5) / 8.0;
+            var hole = false;
+            if (is_bush) {
+                // Round leaf holes: one lottery per 4x4 uv patch per cell.
+                let u4 = vec2<u32>(uv * 4.0);
+                let hh = hash3f(voxel_min + vec3<f32>(f32(c.x * 4 + i32(u4.x)) * 0.37 + 5.1,
+                                                      f32(c.y) * 0.53 + 6.2,
+                                                      f32(c.z * 4 + i32(u4.y)) * 0.71 + 7.3));
+                hole = hh < 0.28;
+            } else {
+                // Grass slits: vertical strip lottery, airier at the crown.
+                let u4 = u32(uv.x * 4.0);
+                let hh = hash3f(voxel_min + vec3<f32>(f32(c.x * 4 + i32(u4)) * 0.37 + 8.1,
+                                                      f32(c.y) * 0.53 + 9.2,
+                                                      f32(c.z) * 0.71 + 10.3));
+                hole = hh < (0.12 + fy * 0.38);
+            }
+            if (!hole) {
+                out.hit = true;
+                out.t = t_cur;
+                var n = vec3<f32>(0.0, 1.0, 0.0);
+                if (axis == 0) { n = vec3<f32>(-f32(step_i.x), 0.0, 0.0); }
+                if (axis == 2) { n = vec3<f32>(0.0, 0.0, -f32(step_i.z)); }
+                if (axis == 1) { n = vec3<f32>(0.0, -f32(step_i.y), 0.0); }
+                out.n = n;
+                out.vn = fy;
+                let mh = hash3f(voxel_min + vec3<f32>(f32(c.x) * 0.37 + 1.1,
+                                                      f32(c.y) * 0.53 + 2.3,
+                                                      f32(c.z) * 0.71 + 3.7));
+                out.tone = select(select(1.0, 1.08, mh > 0.66), 0.92, mh < 0.33);
+                return out;
+            }
         }
-        // Step to the nearest boundary.
         if (t_next.x <= t_next.y && t_next.x <= t_next.z) {
             c.x = c.x + step_i.x;
             t_cur = t_next.x;
@@ -2046,6 +2052,122 @@ fn grass_tuft_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>) -> SubHit
     return out;
 }
 
+// Crown cards: two X planes through the cell centre carrying a cutout
+// sprite (fluffy tuft spray for grass, the 32x32 oak leaf tuft for
+// bushes), wind-sheared - the overhanging soft detail the pure volume
+// lacks (the tree-canopy recipe).
+fn tuft_card_hit(
+    voxel_min: vec3<f32>, origin: vec3<f32>, dir: vec3<f32>,
+    sprite: u32, is_bush: bool, wind: vec2<f32>, vh: f32,
+) -> TuftHit {
+    var out: TuftHit;
+    out.hit = false;
+    let voxel_center = voxel_min + vec3<f32>(0.5);
+    let mirror_u = fract(vh * 16.0) > 0.5;
+    var best_t = 1e30;
+    for (var i = 0; i < 2; i = i + 1) {
+        var pn = vec3<f32>(0.7071, 0.0, 0.7071);
+        var pt = vec3<f32>(0.7071, 0.0, -0.7071);
+        if (i == 1) {
+            pn = vec3<f32>(0.7071, 0.0, -0.7071);
+            pt = vec3<f32>(0.7071, 0.0, 0.7071);
+        }
+        let denom = dot(dir, pn);
+        if (abs(denom) < 1e-4) { continue; }
+        let t = dot(voxel_center - origin, pn) / denom;
+        if (t < 0.0 || t >= best_t) { continue; }
+        let p_hit = origin + dir * t;
+        let local = p_hit - voxel_min;
+        if (local.x < 0.0 || local.x > 1.0
+         || local.y < 0.0 || local.y > 1.0
+         || local.z < 0.0 || local.z > 1.0) { continue; }
+        let v = local.y;
+        let sx = local.x - wind.x * v;
+        let sz = local.z - wind.y * v;
+        let s_w = (sx - 0.5) * pt.x + (sz - 0.5) * pt.z;
+        let u = clamp((s_w + 0.70711) / 1.41421, 0.0, 0.99999);
+        var val = 0u;
+        if (is_bush) {
+            var tx = u32(u * 32.0) & 31u;
+            if (mirror_u) { tx = 31u - tx; }
+            val = tuft_texel(TUFT_OAK, tx, u32(clamp(v * 32.0, 0.0, 31.0)));
+        } else {
+            var tx = u32(u * 16.0) & 15u;
+            if (mirror_u) { tx = 15u - tx; }
+            val = sprite_texel(sprite, tx, u32(clamp(v * 16.0, 0.0, 15.0)));
+        }
+        if (val == 0u) { continue; }
+        best_t = t;
+        out.hit = true;
+        out.t = t;
+        out.n = select(pn, -pn, denom > 0.0);
+        out.vn = v;
+        // Card texel tones ride the same quantized scale; '*' texels are
+        // the bright accent detail.
+        out.tone = select(select(1.0, 1.18, val == 3u), 0.88, val == 2u);
+    }
+    return out;
+}
+
+fn grass_tuft_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>) -> SubHit {
+    var out: SubHit;
+    out.hit = false;
+    out.color_tint = vec3<f32>(1.0);
+    let voxel_min = vec3<f32>(f32(voxel.x), f32(voxel.y), f32(voxel.z));
+    let vh = hash3f(voxel_min);
+    let variant = u32(fract(vh * 8.0) * 3.0) % 3u;
+    let phase = voxel_min.x * 0.40 + voxel_min.z * 0.55 + vh * 6.28;
+    let wind = wind_offset(voxel_min, phase, 0.30);
+    let lean = clamp(wind, vec2<f32>(-0.25), vec2<f32>(0.25));
+
+    let vol = tuft_volume_march(voxel_min, origin, dir, variant, lean, false);
+    let card = tuft_card_hit(voxel_min, origin, dir, SPR_TUFT_A + variant, false, wind, vh);
+    var h: TuftHit = vol;
+    if (card.hit && (!vol.hit || card.t < vol.t)) { h = card; }
+    if (!h.hit) { return out; }
+
+    let ground = mix(vec3<f32>(1.0),
+                     palette[MAT_GRASS].rgb / max(palette[MAT_TALL_GRASS].rgb, vec3<f32>(1e-3)),
+                     0.6);
+    let s1 = smoothstep(0.48, 0.56, h.vn);
+    let s2 = smoothstep(0.80, 0.88, h.vn);
+    let b = (0.95 + 0.13 * s1 + 0.14 * s2) * h.tone;
+    out.hit = true;
+    out.t_hit = h.t;
+    out.normal = h.n;
+    out.color_tint = vec3<f32>(b) * ground;
+    return out;
+}
+
+fn bush_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>) -> SubHit {
+    var out: SubHit;
+    out.hit = false;
+    out.color_tint = vec3<f32>(1.0);
+    let voxel_min = vec3<f32>(f32(voxel.x), f32(voxel.y), f32(voxel.z));
+    let vh = hash3f(voxel_min);
+    let variant = 3u + (u32(fract(vh * 8.0) * 3.0) % 3u);
+    let phase = voxel_min.x * 0.40 + voxel_min.z * 0.55 + vh * 6.28;
+    let wind = wind_offset(voxel_min, phase, 0.18);
+    let lean = clamp(wind, vec2<f32>(-0.15), vec2<f32>(0.15));
+
+    let vol = tuft_volume_march(voxel_min, origin, dir, variant, lean, true);
+    let card = tuft_card_hit(voxel_min, origin, dir, 0u, true, wind, vh);
+    var h: TuftHit = vol;
+    if (card.hit && (!vol.hit || card.t < vol.t)) { h = card; }
+    if (!h.hit) { return out; }
+
+    // Leafy tint: coupled toward the leaf palette, gentle top-light ramp.
+    let ground = mix(vec3<f32>(1.0),
+                     palette[MAT_LEAVES].rgb / max(palette[MAT_BUSH].rgb, vec3<f32>(1e-3)),
+                     0.7);
+    let b = (0.92 + 0.16 * smoothstep(0.35, 0.9, h.vn)) * h.tone;
+    out.hit = true;
+    out.t_hit = h.t;
+    out.normal = h.n;
+    out.color_tint = vec3<f32>(b) * ground;
+    return out;
+}
+
 fn foliage_subvoxel(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32) -> SubHit {
     var hit: SubHit;
     if (mat == MAT_TURF) {
@@ -2062,8 +2184,10 @@ fn foliage_subvoxel(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u3
         return hit;
     }
     if (mat == MAT_TALL_GRASS) {
-        // Fluffy tussock card-cloud (voxel patches over the raster carpet).
+        // Micro-voxel tussock with cutout faces and crown cards.
         hit = grass_tuft_hit(voxel, origin, dir);
+    } else if (mat == MAT_BUSH) {
+        hit = bush_hit(voxel, origin, dir);
     } else if (mat == MAT_TALL_GRASS_DRY) {
         hit = sprite_cross_hit(voxel, origin, dir, mat);
     } else if (mat == MAT_FLOWER) {

@@ -109,7 +109,8 @@ atlas_consts! {
     /// MICRO_TUFT_BASE_WORDS + i * MICRO_TUFT_WORDS.
     MICRO_TUFT_BASE_WORDS = TUFT_BASE_WORDS + N_TUFTS * BL_TUFT_WORDS;
     MICRO_TUFT_WORDS = 16;
-    N_MICRO_TUFTS = 3;
+    /// 0..2 = grass tussocks, 3..5 = bush domes.
+    N_MICRO_TUFTS = 6;
 }
 
 /// IMPORTANT (flowers): the cross-quad renderer draws the SAME sprite on two
@@ -580,64 +581,64 @@ const ART: [[&str; SPRITE_DIM]; N_SPRITES] = [
         ".......##.......",
         ".......##.......",
     ],
-    // SPR_TUFT_A - fluffy tussock: dense full body, bulging middle, ragged
-    // crown. '#' body, 'o' inner-shadow texels, '*' crown highlights. Every
-    // pixel orthogonally connected (floaters read as escaping squares).
+    // SPR_TUFT_A - airy crown spray: sparse thin strands poking above the
+    // micro-volume mass (the card is stray wisps, never a solid sail -
+    // dense card bodies rendered as big flat tents over the tuft).
     [
-        "......*...*.....",
-        "....*.#..*#.....",
-        "....#.##.##..*..",
-        "...*#####*##.#..",
-        "...#########*#..",
-        "..*##########...",
-        "..############..",
-        ".##############.",
-        ".####o#####o###.",
-        "###o#####o#####.",
-        "##o###o###o####.",
-        "################",
-        "###o####o###o###",
-        "##o###o####o####",
-        "################",
-        "################",
+        ".....*..........",
+        ".....#....*.....",
+        "..*..#....#.....",
+        "..#..##...#..*..",
+        "..#...#..##..#..",
+        "...#..#..#...#..",
+        "...#..##.#..#...",
+        "....#..#.#..#...",
+        "....#..###.#....",
+        ".....#..##.#....",
+        ".....##.###.....",
+        "......#..#......",
+        "......###.......",
+        ".......#........",
+        "................",
+        "................",
     ],
-    // SPR_TUFT_B - broader crown, twin peaks.
+    // SPR_TUFT_B - wider spray, outward-arcing strands.
     [
-        "...*......*.....",
-        "..*#..*..#*.....",
-        "..##.*##.##.....",
-        "..###*####*#..*.",
-        ".############.#.",
-        ".*#############.",
-        ".##############.",
-        "################",
-        "####o######o####",
-        "##o#####o#######",
-        "###o###o###o####",
-        "################",
-        "##o####o####o###",
-        "####o######o####",
-        "################",
-        "################",
+        "..*.........*...",
+        "..#..*......#...",
+        "..#..#..*...#...",
+        "...#.#..#..#....",
+        "...#.##.#..#....",
+        "....#.#.#.#.....",
+        "....#.###.#.....",
+        ".....#.#.#......",
+        ".....#.###......",
+        "......###.......",
+        "......##........",
+        ".......#........",
+        ".......#........",
+        "................",
+        "................",
+        "................",
     ],
-    // SPR_TUFT_C - narrower, taller centre peak.
+    // SPR_TUFT_C - short centre spray with side wisps.
     [
-        ".......*.#*.....",
-        "......#.##......",
-        "....*.####.*....",
-        "....#*#######...",
-        "....########....",
-        "...##########*..",
-        "..############..",
-        ".##############.",
-        ".####o#####o###.",
-        "####o####o######",
-        "##o####o###o####",
-        "################",
-        "###o###o####o###",
-        "##o#####o###o###",
-        "################",
-        "################",
+        "................",
+        "......*.........",
+        "......#..*......",
+        "..*...#..#......",
+        "..#..##..#......",
+        "..#..#...#..*...",
+        "...#.#..##..#...",
+        "...#.##.#..#....",
+        "....#.#.#..#....",
+        "....#.###.#.....",
+        ".....#.##.#.....",
+        "......###.......",
+        ".......#........",
+        "................",
+        "................",
+        "................",
     ],
 ];
 
@@ -827,7 +828,7 @@ pub fn encoded() -> Vec<u32> {
     // A tussock is AIRY: clustered thin vertical spikes with sky between
     // them, dense only near the base - never a filled blob (a full volume
     // reads as a green crate, seen and rejected).
-    for var in 0..N_MICRO_TUFTS {
+    for var in 0..3 {
         for z in 0..8u32 {
             for x in 0..8u32 {
                 let dx = (x as f32 + 0.5) / 8.0 - 0.5;
@@ -851,6 +852,36 @@ pub fn encoded() -> Vec<u32> {
                 let spike_h = (1.0 + (1.0 - r * 2.0).max(0.0) * 4.0 + hj * 2.0).min(7.0);
                 for y in 0..8u32 {
                     if (y as f32) >= spike_h {
+                        break;
+                    }
+                    let bit = (x + z * 8 + y * 64) as usize;
+                    out[MICRO_TUFT_BASE_WORDS + var * MICRO_TUFT_WORDS + bit / 32] |=
+                        1 << (bit % 32);
+                }
+            }
+        }
+    }
+    // Bush domes (variants 3..5): a full round canopy - wide, dome height
+    // profile, ragged rim - denser than the tussocks (a bush is a mass of
+    // leaves; the airiness comes from the cutout faces, not from holes in
+    // the volume).
+    for var in 3..N_MICRO_TUFTS {
+        for z in 0..8u32 {
+            for x in 0..8u32 {
+                let dx = (x as f32 + 0.5) / 8.0 - 0.5;
+                let dz = (z as f32 + 0.5) / 8.0 - 0.5;
+                let r = (dx * dx + dz * dz).sqrt();
+                let rag = 0.88 + 0.24 * h32(var as u32 + 11, x, z);
+                if r > 0.48 * rag {
+                    continue;
+                }
+                // Dome: tall centre, low rim, one cell of ground clearance
+                // on the rim so the silhouette reads as a rounded bush.
+                let rn = (r / 0.48).min(1.0);
+                let dome_h = (1.0 - rn * rn).sqrt() * 6.5 + 1.0;
+                let y0 = if rn > 0.75 { 1u32 } else { 0u32 };
+                for y in y0..8u32 {
+                    if (y as f32) >= dome_h {
                         break;
                     }
                     let bit = (x + z * 8 + y * 64) as usize;

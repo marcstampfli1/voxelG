@@ -149,6 +149,9 @@ pub const MAT_TALL_GRASS_DRY: u8 = 34;
 /// carries the field. Transparent to RT/GI rays (bounce comes from the
 /// grass block below); never occludes shadow rays.
 pub const MAT_TURF: u8 = 35;
+/// Leafy bush decoration: a micro-voxel dome with leaf-cutout faces and
+/// oak-tuft crown cards (renderer bush_hit). Scattered on grass tops.
+pub const MAT_BUSH: u8 = 36;
 
 #[inline(always)]
 pub fn is_leaf_mat(m: u8) -> bool {
@@ -1417,9 +1420,9 @@ pub fn gen_slot_bricks(world_chunk: glam::IVec3, seed: u64) -> Vec<Brick> {
                                 MAT_FLOWER
                             } else if v > 1.0 - fp - gp {
                                 MAT_TALL_GRASS
+                            } else if v > 1.0 - fp - gp - 0.006 {
+                                MAT_BUSH
                             } else {
-                                // Bare grass tops grow the GPU blade field
-                                // (src/grass.rs), not a voxel layer.
                                 0u8
                             }
                         }
