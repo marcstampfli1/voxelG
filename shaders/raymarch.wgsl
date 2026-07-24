@@ -2008,14 +2008,9 @@ fn tuft_volume_march(
                                                       f32(c.y) * 0.53 + 6.2,
                                                       f32(c.z * 4 + i32(u4.y)) * 0.71 + 7.3));
                 hole = hh < 0.28;
-            } else {
-                // Grass slits: vertical strip lottery, airier at the crown.
-                let u4 = u32(uv.x * 4.0);
-                let hh = hash3f(voxel_min + vec3<f32>(f32(c.x * 4 + i32(u4)) * 0.37 + 8.1,
-                                                      f32(c.y) * 0.53 + 9.2,
-                                                      f32(c.z) * 0.71 + 10.3));
-                hole = hh < (0.18 + fy * 0.34);
             }
+            // Grass: solid faces - shape carries the read (dense base,
+            // sparse spike top); cutouts are a bush-only device.
             if (!hole) {
                 out.hit = true;
                 out.t = t_cur;

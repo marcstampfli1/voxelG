@@ -1414,7 +1414,7 @@ pub fn gen_slot_bricks(world_chunk: glam::IVec3, seed: u64) -> Vec<Brick> {
                                 // clustered tuft fields, elsewhere stays
                                 // sparse - patches, not a carpet.
                                 fp *= 3.0;
-                                gp *= 8.0;
+                                gp *= 12.0;
                             }
                             if v > 1.0 - fp {
                                 MAT_FLOWER

@@ -834,24 +834,22 @@ pub fn encoded() -> Vec<u32> {
                 let dx = (x as f32 + 0.5) / 8.0 - 0.5;
                 let dz = (z as f32 + 0.5) / 8.0 - 0.5;
                 let r = (dx * dx + dz * dz).sqrt();
-                if r > 0.36 {
+                let rag = 0.82 + 0.36 * h32(var as u32 + 5, x, z);
+                if r > 0.46 * rag {
                     continue;
                 }
-                // Spikes ALL the way: the crown's ragged texture runs the
-                // full height - moderately sparse columns with air gaps
-                // between them top to bottom, heights strongly varied, so
-                // no band of the tuft ever reads as a solid leaf block.
+                // Dense base, sparse top: nearly every column inside the
+                // ragged footprint exists (the base reads as one grounded
+                // mass), but heights follow a QUADRATIC lottery - most
+                // columns stay short, a few spike tall - so occupancy
+                // thins naturally with height and the top is open spikes.
                 let lot = h32(var as u32, x, z);
-                let p_col = 0.70 - r * 1.5;
+                let p_col = 0.92 - r * 0.9;
                 if lot >= p_col {
                     continue;
                 }
                 let hj = h32(var as u32 + 7, x, z);
-                // HARD radial height cap: tall spikes exist only near the
-                // axis, rim columns stay low - otherwise tall edge spikes
-                // trace the containing cell and the tuft reads as a block.
-                let h_cap = (7.5 * (1.0 - r * 1.7).max(0.15)).max(2.0);
-                let spike_h = (1.0 + (h_cap - 1.0) * hj).min(7.0);
+                let spike_h = ((1.0 + hj * hj * 6.5) * (1.0 - r * 1.1).max(0.2)).min(7.0);
                 for y in 0..8u32 {
                     if (y as f32) >= spike_h {
                         break;
