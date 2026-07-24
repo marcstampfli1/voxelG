@@ -1420,10 +1420,23 @@ pub fn gen_slot_bricks(world_chunk: glam::IVec3, seed: u64) -> Vec<Brick> {
                                 MAT_FLOWER
                             } else if v > 1.0 - fp - gp {
                                 MAT_TALL_GRASS
-                            } else if v > 1.0 - fp - gp - 0.006 {
-                                MAT_BUSH
                             } else {
-                                0u8
+                                // Bushes: rare scattered singles, plus BIG
+                                // 2x2x2 bushes anchored to the even lattice
+                                // - every column of an anchor block derives
+                                // the same decision, so the four columns
+                                // assemble one super-bush (renderer marches
+                                // one shared dome across the block).
+                                let ax = wx_int & !1;
+                                let az = wz_int & !1;
+                                let big = hash3(ax, 977, az) * 0.5 + 0.5 > 0.9955;
+                                if big {
+                                    MAT_BUSH
+                                } else if v > 1.0 - fp - gp - 0.004 {
+                                    MAT_BUSH
+                                } else {
+                                    0u8
+                                }
                             }
                         }
                         MAT_SAND if matches!(biome, Biome::Desert | Biome::Savanna) => {
@@ -1437,6 +1450,18 @@ pub fn gen_slot_bricks(world_chunk: glam::IVec3, seed: u64) -> Vec<Brick> {
                     if dec_mat != 0 {
                         let dy = (dec_y - world_y0) as u32;
                         write_into_scratch(&mut bricks, dx, dy, dz, dec_mat);
+                        // Big bushes are two cells tall: the aligned block
+                        // spans 2x2x2 and the renderer marches one dome.
+                        if dec_mat == MAT_BUSH {
+                            let ax = wx_int & !1;
+                            let az = wz_int & !1;
+                            let big = hash3(ax, 977, az) * 0.5 + 0.5 > 0.9955;
+                            if big && dec_y + 1 >= world_y0
+                                && dec_y + 1 < world_y0 + STORAGE_CHUNK_VOXELS as i32
+                            {
+                                write_into_scratch(&mut bricks, dx, dy + 1, dz, MAT_BUSH);
+                            }
+                        }
                     }
                 }
             }

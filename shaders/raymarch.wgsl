@@ -1963,19 +1963,32 @@ struct TuftHit {
 fn tuft_volume_march(
     voxel_min: vec3<f32>, origin: vec3<f32>, dir: vec3<f32>,
     variant: u32, lean: vec2<f32>, is_bush: bool,
+    anchor: vec3<f32>, scale: f32, h_scale: f32,
 ) -> TuftHit {
     var out: TuftHit;
     out.hit = false;
-    let o_l = origin - voxel_min;
-    let o_s = vec3<f32>(o_l.x - lean.x * o_l.y, o_l.y, o_l.z - lean.y * o_l.y);
-    let d_s = vec3<f32>(dir.x - lean.x * dir.y, dir.y, dir.z - lean.y * dir.y);
+    // Super-volume space: the baked cube spans `scale` world cells from
+    // `anchor` (1 = a single-cell tuft, 2 = a big 2x2x2 bush). The march
+    // clips to the CURRENT cell so every cell renders exactly its slice.
+    let o_a = (origin - anchor) / scale;
+    let o_s = vec3<f32>(o_a.x - lean.x * o_a.y, o_a.y, o_a.z - lean.y * o_a.y);
+    let d_s0 = vec3<f32>(dir.x - lean.x * dir.y, dir.y, dir.z - lean.y * dir.y) / scale;
+    let d_s = d_s0;
     let inv = 1.0 / d_s;
     let t0v = (vec3<f32>(0.0) - o_s) * inv;
     let t1v = (vec3<f32>(1.0) - o_s) * inv;
     let tmin3 = min(t0v, t1v);
     let tmax3 = max(t0v, t1v);
-    let t_in = max(max(tmin3.x, tmin3.y), max(tmin3.z, 0.0));
-    let t_out = min(min(tmax3.x, tmax3.y), tmax3.z);
+    // Current-cell slab (unsheared world space).
+    let o_c = origin - voxel_min;
+    let tc0 = (vec3<f32>(0.0) - o_c) / dir;
+    let tc1 = (vec3<f32>(1.0) - o_c) / dir;
+    let tcmin = min(tc0, tc1);
+    let tcmax = max(tc0, tc1);
+    let t_in = max(max(max(tmin3.x, tmin3.y), max(tmin3.z, 0.0)),
+                   max(max(tcmin.x, tcmin.y), tcmin.z));
+    let t_out = min(min(min(tmax3.x, tmax3.y), tmax3.z),
+                    min(min(tcmax.x, tcmax.y), tcmax.z));
     if (t_in >= t_out) { return out; }
     let eps = 1e-4;
     var p = (o_s + d_s * (t_in + eps)) * 16.0;
@@ -1992,7 +2005,8 @@ fn tuft_volume_march(
     for (var s = 0; s < 52; s = s + 1) {
         if (c.x < 0 || c.x > 15 || c.y < 0 || c.y > 15 || c.z < 0 || c.z > 15) { break; }
         if (t_cur > t_out) { break; }
-        if (micro_tuft_bit(variant, c.x, c.y, c.z)) {
+        let my = clamp(i32(round(f32(c.y) / h_scale)), 0, 15);
+        if (micro_tuft_bit(variant, c.x, my, c.z)) {
             let fy = (f32(c.y) + 0.5) / 16.0;
             // Solid faces for both families: shape and quantized tone carry
             // the read; cutouts are retired.
@@ -2001,7 +2015,9 @@ fn tuft_volume_march(
                 out.t = t_cur;
                 // Crown light: a cell with open sky above is a tip - the
                 // bright accent detail lives in the voxels themselves.
-                let tip = c.y >= 15 || !micro_tuft_bit(variant, c.x, c.y + 1, c.z);
+                let tip = my >= 15
+                    || !micro_tuft_bit(variant, c.x,
+                                       clamp(i32(round(f32(c.y + 1) / h_scale)), 0, 15), c.z);
                 var tip_mul = 1.0;
                 if (tip) { tip_mul = select(1.10, 1.15, !is_bush); }
                 var n = vec3<f32>(0.0, 1.0, 0.0);
@@ -2106,21 +2122,26 @@ fn grass_tuft_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>) -> SubHit
     let wind = wind_offset(voxel_min, phase, 0.30);
     let lean = clamp(wind, vec2<f32>(-0.25), vec2<f32>(0.25));
 
-    // Volume only: mixing flat sprite cards with the volume made some
-    // tussocks read 1-faced from card-facing angles while others read
-    // properly 3D - the pure micro-voxel cluster is the consistent look.
-    let h = tuft_volume_march(voxel_min, origin, dir, variant, lean, false);
+    // Volume only (pure voxel read); per-tuft height scale varies whole
+    // tussocks from squat to tall.
+    let h_scale = 0.55 + fract(vh * 32.0) * 0.75;
+    let h = tuft_volume_march(voxel_min, origin, dir, variant, lean, false,
+                              voxel_min, 1.0, h_scale);
     if (!h.hit) { return out; }
 
     let ground = mix(vec3<f32>(1.0),
                      palette[MAT_GRASS].rgb / max(palette[MAT_TALL_GRASS].rgb, vec3<f32>(1e-3)),
                      0.6);
-    let s1 = smoothstep(0.48, 0.56, h.vn);
-    let s2 = smoothstep(0.80, 0.88, h.vn);
-    let b = (0.95 + 0.13 * s1 + 0.14 * s2) * h.tone;
+    // Base sits at the ground colour (no extra shading step); brightness
+    // only lifts toward the tips.
+    let s2 = smoothstep(0.62, 0.92, h.vn);
+    let b = (1.0 + 0.16 * s2) * h.tone;
     out.hit = true;
     out.t_hit = h.t;
-    out.normal = h.n;
+    // Bottom cells light like the ground they grow from (normal blended
+    // toward up near the base), so tuft bases fuse with the lawn.
+    out.normal = normalize(mix(vec3<f32>(0.0, 1.0, 0.0), h.n,
+                               clamp(h.vn * 2.2, 0.25, 1.0)));
     out.color_tint = vec3<f32>(b) * ground;
     return out;
 }
@@ -2136,8 +2157,28 @@ fn bush_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>) -> SubHit {
     let wind = wind_offset(voxel_min, phase, 0.18);
     let lean = clamp(wind, vec2<f32>(-0.15), vec2<f32>(0.15));
 
-    // Volume only, like the tussocks: one visual family, no card faces.
-    let h = tuft_volume_march(voxel_min, origin, dir, variant, lean, true);
+    // Big-bush detection: a 2x2x2 lattice block of bush cells marches ONE
+    // dome spanning the block (anchor at the even lattice); lone cells
+    // stay single-cell domes.
+    var anchor = voxel_min;
+    var scale = 1.0;
+    let ax = voxel.x & -2;
+    let az = voxel.z & -2;
+    var ay = voxel.y;
+    if (voxel_material_at(vec3<i32>(voxel.x, voxel.y - 1, voxel.z)) == MAT_BUSH) {
+        ay = voxel.y - 1;
+    }
+    // The four cells of the aligned block must all be bush.
+    let corner = voxel_material_at(vec3<i32>(ax + 1, ay, az + 1));
+    let corner2 = voxel_material_at(vec3<i32>(ax, ay, az));
+    if (corner == MAT_BUSH && corner2 == MAT_BUSH
+        && voxel_material_at(vec3<i32>(ax + 1, ay, az)) == MAT_BUSH
+        && voxel_material_at(vec3<i32>(ax, ay, az + 1)) == MAT_BUSH) {
+        anchor = vec3<f32>(f32(ax), f32(ay), f32(az));
+        scale = 2.0;
+    }
+    let h = tuft_volume_march(voxel_min, origin, dir, variant, lean, true,
+                              anchor, scale, 1.0);
     if (!h.hit) { return out; }
 
     // Leafy tint: coupled toward the leaf palette, gentle top-light ramp.

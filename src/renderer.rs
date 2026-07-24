@@ -5233,6 +5233,13 @@ mod gpu_render_tests {
         }
         world.set_voxel(211, 65, 212, crate::voxel::MAT_BUSH);
         world.set_voxel(218, 65, 214, crate::voxel::MAT_BUSH);
+        // A big 2x2x2 lattice-aligned bush.
+        for (bx, by, bz) in [
+            (220u32, 65u32, 212u32), (221, 65, 212), (220, 65, 213), (221, 65, 213),
+            (220, 66, 212), (221, 66, 212), (220, 66, 213), (221, 66, 213),
+        ] {
+            world.set_voxel(bx, by, bz, crate::voxel::MAT_BUSH);
+        }
         let mut cam = Camera::new();
         cam.pos = glam::Vec3::new(215.5, 66.4, 207.0);
         cam.yaw = 0.35;

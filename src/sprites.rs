@@ -889,7 +889,7 @@ pub fn encoded() -> Vec<u32> {
                 let dx = (x as f32 + 0.5) / 16.0 - 0.5;
                 let dz = (z as f32 + 0.5) / 16.0 - 0.5;
                 let r = (dx * dx + dz * dz).sqrt();
-                let rag = 0.80 + 0.40 * h32(var as u32 + 11, x, z);
+                let rag = 0.90 + 0.16 * h32(var as u32 + 11, x, z);
                 if r > 0.48 * rag {
                     continue;
                 }
@@ -897,7 +897,7 @@ pub fn encoded() -> Vec<u32> {
                 // Ragged dome: the surface height jitters per column, so
                 // the crown is bumpy leaf clusters, not a smooth shell.
                 let dome_h = (1.0 - rn * rn).max(0.0).sqrt()
-                    * (10.0 + h32(var as u32 + 19, x, z) * 5.5)
+                    * (11.5 + h32(var as u32 + 19, x, z) * 3.0)
                     + 1.0;
                 let y0 = if rn < 0.30 {
                     0u32
