@@ -834,27 +834,25 @@ pub fn encoded() -> Vec<u32> {
                 let dx = (x as f32 + 0.5) / 8.0 - 0.5;
                 let dz = (z as f32 + 0.5) / 8.0 - 0.5;
                 let r = (dx * dx + dz * dz).sqrt();
-                if r > 0.42 {
+                if r > 0.36 {
                     continue;
                 }
-                // Dense ragged mass: the CORE is nearly solid (a tussock
-                // is a clump, not scattered pillars) and the occupancy
-                // tapers toward the rim; air lives at the rim and between
-                // crown tips of differing heights.
+                // Spikes ALL the way: the crown's ragged texture runs the
+                // full height - moderately sparse columns with air gaps
+                // between them top to bottom, heights strongly varied, so
+                // no band of the tuft ever reads as a solid leaf block.
                 let lot = h32(var as u32, x, z);
-                let p_col = 0.95 - r * 1.6;
+                let p_col = 0.70 - r * 1.5;
                 if lot >= p_col {
                     continue;
                 }
-                // Column height: tall ragged crown near the centre (4..7),
-                // short at the rim (1..3).
                 let hj = h32(var as u32 + 7, x, z);
-                let spike_h = (1.0 + (1.0 - r * 2.0).max(0.0) * 4.0 + hj * 2.0).min(7.0);
-                // Base waist: only the innermost columns reach the ground -
-                // the tuft pinches at the root and flares upward instead of
-                // sitting on a fat solid slab.
-                let y_start = if r < 0.16 { 0 } else if r < 0.30 { 1 } else { 2 };
-                for y in y_start..8u32 {
+                // HARD radial height cap: tall spikes exist only near the
+                // axis, rim columns stay low - otherwise tall edge spikes
+                // trace the containing cell and the tuft reads as a block.
+                let h_cap = (7.5 * (1.0 - r * 1.7).max(0.15)).max(2.0);
+                let spike_h = (1.0 + (h_cap - 1.0) * hj).min(7.0);
+                for y in 0..8u32 {
                     if (y as f32) >= spike_h {
                         break;
                     }
