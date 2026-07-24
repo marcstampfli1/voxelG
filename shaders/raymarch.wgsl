@@ -2019,6 +2019,11 @@ fn tuft_volume_march(
             if (!hole) {
                 out.hit = true;
                 out.t = t_cur;
+                // Crown light: a cell with open sky above is a tip - the
+                // bright accent detail lives in the voxels themselves.
+                let tip = c.y >= 7 || !micro_tuft_bit(variant, c.x, c.y + 1, c.z);
+                var tip_mul = 1.0;
+                if (tip && !is_bush) { tip_mul = 1.15; }
                 var n = vec3<f32>(0.0, 1.0, 0.0);
                 if (axis == 0) { n = vec3<f32>(-f32(step_i.x), 0.0, 0.0); }
                 if (axis == 2) { n = vec3<f32>(0.0, 0.0, -f32(step_i.z)); }
@@ -2028,7 +2033,7 @@ fn tuft_volume_march(
                 let mh = hash3f(voxel_min + vec3<f32>(f32(c.x) * 0.37 + 1.1,
                                                       f32(c.y) * 0.53 + 2.3,
                                                       f32(c.z) * 0.71 + 3.7));
-                out.tone = select(select(1.0, 1.08, mh > 0.66), 0.92, mh < 0.33);
+                out.tone = select(select(1.0, 1.08, mh > 0.66), 0.92, mh < 0.33) * tip_mul;
                 return out;
             }
         }
@@ -2120,10 +2125,10 @@ fn grass_tuft_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>) -> SubHit
     let wind = wind_offset(voxel_min, phase, 0.30);
     let lean = clamp(wind, vec2<f32>(-0.25), vec2<f32>(0.25));
 
-    let vol = tuft_volume_march(voxel_min, origin, dir, variant, lean, false);
-    let card = tuft_card_hit(voxel_min, origin, dir, SPR_TUFT_A + variant, false, wind, vh);
-    var h: TuftHit = vol;
-    if (card.hit && (!vol.hit || card.t < vol.t)) { h = card; }
+    // Volume only: mixing flat sprite cards with the volume made some
+    // tussocks read 1-faced from card-facing angles while others read
+    // properly 3D - the pure micro-voxel cluster is the consistent look.
+    let h = tuft_volume_march(voxel_min, origin, dir, variant, lean, false);
     if (!h.hit) { return out; }
 
     let ground = mix(vec3<f32>(1.0),
