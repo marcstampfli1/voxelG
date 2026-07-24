@@ -850,7 +850,11 @@ pub fn encoded() -> Vec<u32> {
                 // short at the rim (1..3).
                 let hj = h32(var as u32 + 7, x, z);
                 let spike_h = (1.0 + (1.0 - r * 2.0).max(0.0) * 4.0 + hj * 2.0).min(7.0);
-                for y in 0..8u32 {
+                // Base waist: only the innermost columns reach the ground -
+                // the tuft pinches at the root and flares upward instead of
+                // sitting on a fat solid slab.
+                let y_start = if r < 0.16 { 0 } else if r < 0.30 { 1 } else { 2 };
+                for y in y_start..8u32 {
                     if (y as f32) >= spike_h {
                         break;
                     }
@@ -879,7 +883,16 @@ pub fn encoded() -> Vec<u32> {
                 // on the rim so the silhouette reads as a rounded bush.
                 let rn = (r / 0.48).min(1.0);
                 let dome_h = (1.0 - rn * rn).sqrt() * 6.5 + 1.0;
-                let y0 = if rn > 0.75 { 1u32 } else { 0u32 };
+                // Stem waist: the dome floats on a narrow root with real
+                // ground clearance toward the rim (fat grounded skirts read
+                // as green boulders).
+                let y0 = if rn < 0.30 {
+                    0u32
+                } else if rn < 0.62 {
+                    1u32
+                } else {
+                    2u32
+                };
                 for y in y0..8u32 {
                     if (y as f32) >= dome_h {
                         break;

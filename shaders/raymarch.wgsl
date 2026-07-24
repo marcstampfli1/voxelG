@@ -2014,7 +2014,7 @@ fn tuft_volume_march(
                 let hh = hash3f(voxel_min + vec3<f32>(f32(c.x * 4 + i32(u4)) * 0.37 + 8.1,
                                                       f32(c.y) * 0.53 + 9.2,
                                                       f32(c.z) * 0.71 + 10.3));
-                hole = hh < (0.12 + fy * 0.38);
+                hole = hh < (0.18 + fy * 0.34);
             }
             if (!hole) {
                 out.hit = true;
