@@ -104,6 +104,12 @@ atlas_consts! {
     TUFT_PINE = 2;
     /// Number of 32x32 tufts in the atlas.
     N_TUFTS = 3;
+    /// Micro-voxel tussock volumes (8x8x8 occupancy bits, 16 words each)
+    /// appended after the BL tufts: variant i lives at
+    /// MICRO_TUFT_BASE_WORDS + i * MICRO_TUFT_WORDS.
+    MICRO_TUFT_BASE_WORDS = TUFT_BASE_WORDS + N_TUFTS * BL_TUFT_WORDS;
+    MICRO_TUFT_WORDS = 16;
+    N_MICRO_TUFTS = 3;
 }
 
 /// IMPORTANT (flowers): the cross-quad renderer draws the SAME sprite on two
@@ -804,6 +810,53 @@ pub fn encoded() -> Vec<u32> {
             }
         }
     }
+    // ---- micro-voxel tussocks: 8x8x8 occupancy volumes, procedurally
+    // baked (deterministic). A ragged radial profile - wide base, mid
+    // bulge, tapering crown - with per-column height jitter, so each
+    // variant reads as one chunky voxelized bush.
+    out.resize(MICRO_TUFT_BASE_WORDS + N_MICRO_TUFTS * MICRO_TUFT_WORDS, 0);
+    let h32 = |a: u32, b: u32, c: u32| -> f32 {
+        let mut v = a
+            .wrapping_mul(1664525)
+            .wrapping_add(b.wrapping_mul(22695477))
+            .wrapping_add(c.wrapping_mul(747796405));
+        v ^= v >> 16;
+        v = v.wrapping_mul(2654435769);
+        (v >> 8) as f32 / 16777216.0
+    };
+    for var in 0..N_MICRO_TUFTS {
+        for z in 0..8u32 {
+            for x in 0..8u32 {
+                // Per-column silhouette: jittered height and radial reach.
+                let hj = h32(var as u32, x, z);
+                let col_h = (4.0 + 3.6 * hj).min(7.9);
+                for y in 0..8u32 {
+                    if (y as f32) > col_h {
+                        continue;
+                    }
+                    let fy = (y as f32 + 0.5) / 8.0;
+                    // Radius profile: base 0.40, bulge 0.46 mid, crown 0.16.
+                    let r_prof = if fy < 0.35 {
+                        0.40 + fy * 0.17
+                    } else if fy < 0.6 {
+                        0.46
+                    } else {
+                        0.46 - (fy - 0.6) * 0.75
+                    };
+                    let dx = (x as f32 + 0.5) / 8.0 - 0.5;
+                    let dz = (z as f32 + 0.5) / 8.0 - 0.5;
+                    let r = (dx * dx + dz * dz).sqrt();
+                    // Ragged edge: the rim wobbles per column and variant.
+                    let rag = 0.85 + 0.30 * h32(var as u32 + 7, x, z);
+                    if r < r_prof * rag {
+                        let bit = (x + z * 8 + y * 64) as usize;
+                        out[MICRO_TUFT_BASE_WORDS + var * MICRO_TUFT_WORDS + bit / 32] |=
+                            1 << (bit % 32);
+                    }
+                }
+            }
+        }
+    }
     out
 }
 
@@ -827,8 +880,9 @@ mod tests {
     #[test]
     fn encodes_all_sprites() {
         let w = encoded();
-        assert_eq!(w.len(), TUFT_BASE_WORDS + N_TUFTS * BL_TUFT_WORDS);
+        assert_eq!(w.len(), MICRO_TUFT_BASE_WORDS + N_MICRO_TUFTS * MICRO_TUFT_WORDS);
         assert_eq!(TUFT_BASE_WORDS, N_SPRITES * SPRITE_WORDS);
+        assert_eq!(MICRO_TUFT_BASE_WORDS, TUFT_BASE_WORDS + N_TUFTS * BL_TUFT_WORDS);
     }
 
     /// The generated WGSL consts are the shader's only source of atlas

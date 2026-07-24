@@ -741,9 +741,12 @@ impl App {
             if let Some(sim) = &mut self.leaf_sim {
                 sim.step(&world, self.camera.pos, dt, crate::camera::sun_dir_at(sun_t));
             }
-            // Grass blade field: rescan grass-top columns when the camera
-            // strays from the last scan centre (a few ms, rare).
-            self.grass.maybe_rebuild(&world, self.camera.pos, None);
+            // Raster blade carpet: PARKED (thin animated geometry fights the
+            // jittered-TAA pipeline; voxel tussocks are the focus). Re-enable
+            // with VOXELG_RASTER_GRASS=1 for A/B.
+            if std::env::var("VOXELG_RASTER_GRASS").is_ok() {
+                self.grass.maybe_rebuild(&world, self.camera.pos, None);
+            }
         }
         if let Some(sim) = &self.leaf_sim {
             sim.write_instances(&mut self.leaf_instances);

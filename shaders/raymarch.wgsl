@@ -1933,75 +1933,107 @@ fn turf_blade_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>) -> SubHit
     return out;
 }
 
-// Fluffy voxel tussock (the "voxel patches" style): FOUR full-cell tuft
-// cards - two X pairs yaw-offset ~35 degrees - each carrying a dense
-// ragged pixel-art tuft sprite, wind-sheared together. The card cloud
-// overlaps into one soft volumetric mass (the Better-Leaves recipe applied
-// to grass). Tint follows the carpet rules: bright shared base coupled to
-// the ground palette, quantized value steps by height, zero per-cell
-// colour lotteries; sun/shadow/AO arrive through shade() like any voxel.
+// Micro-voxel tussock (the "voxel patches" style): each MAT_TALL_GRASS
+// cell holds a baked 8x8x8 occupancy volume (three variants, atlas tail)
+// ray-marched with a tiny DDA - a TRUE voxelized bush, chunky from every
+// angle, no billboard planes. Wind is a linear shear of the marching
+// space (the whole tuft leans with the gust and springs back). Tint
+// follows the carpet rules: bright ground-coupled base, quantized height
+// steps, top faces a breath lighter; sun/shadow/AO arrive through shade()
+// like any other voxel surface.
+fn micro_tuft_bit(variant: u32, x: i32, y: i32, z: i32) -> bool {
+    let bit = u32(x + z * 8 + y * 64);
+    let w = sprites[MICRO_TUFT_BASE_WORDS + variant * MICRO_TUFT_WORDS + (bit >> 5u)];
+    return ((w >> (bit & 31u)) & 1u) != 0u;
+}
+
 fn grass_tuft_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>) -> SubHit {
     var out: SubHit;
     out.hit = false;
     out.color_tint = vec3<f32>(1.0);
     let voxel_min = vec3<f32>(f32(voxel.x), f32(voxel.y), f32(voxel.z));
     let vh = hash3f(voxel_min);
-    let voxel_center = voxel_min + vec3<f32>(0.5);
-    let sprite = SPR_TUFT_A + (u32(fract(vh * 8.0) * 3.0) % 3u);
-    let hs = 0.85 + fract(vh * 4.0) * 0.15; // near-even canopy: field, not solo
+    let variant = u32(fract(vh * 8.0) * 3.0) % 3u;
     let phase = voxel_min.x * 0.40 + voxel_min.z * 0.55 + vh * 6.28;
+    // Wind lean, clamped so sheared tips stay essentially in-cell.
     let wind = wind_offset(voxel_min, phase, 0.30);
-    // Two X pairs: base yaw from the cell hash, second pair offset ~35 deg.
-    let a0 = fract(vh * 16.0) * 3.1416;
-    var best_t: f32 = 1e30;
-    var best_n = vec3<f32>(0.0, 1.0, 0.0);
-    var tint = vec3<f32>(1.0);
-    for (var i: i32 = 0; i < 4; i = i + 1) {
-        let ang = a0 + f32(i) * 0.7854 + f32(i & 1) * 0.35;
-        let ca = cos(ang);
-        let sa = sin(ang);
-        let pn = vec3<f32>(-sa, 0.0, ca);
-        let pt = vec3<f32>(ca, 0.0, sa);
-        let denom = dot(dir, pn);
-        if (abs(denom) < 1e-4) { continue; }
-        let t = dot(voxel_center - origin, pn) / denom;
-        if (t < 0.0 || t >= best_t) { continue; }
-        let p_hit = origin + dir * t;
-        let local = p_hit - voxel_min;
-        if (local.x < 0.0 || local.x > 1.0
-         || local.y < 0.0 || local.y > 1.0
-         || local.z < 0.0 || local.z > 1.0) { continue; }
-        let v = local.y;
-        if (v > hs) { continue; }
-        let vn = v / hs;
-        // Shared wind shear in world space (both pairs move together).
-        let sx = local.x - wind.x * v;
-        let sz = local.z - wind.y * v;
-        let s_w = (sx - 0.5) * pt.x + (sz - 0.5) * pt.z;
-        let u = clamp(s_w + 0.5, 0.0, 0.99999);
-        let val = sprite_texel(sprite, u32(u * 16.0) & 15u,
-                               u32(clamp(vn * 16.0, 0.0, 15.0)));
-        if (val == 0u) { continue; }
-        best_t = t;
-        best_n = select(pn, -pn, denom > 0.0);
-        // Carpet rules: bright shared base coupled toward the ground
-        // palette, one mid step and a top band by height, texel tones as
-        // gentle inner shadow ('o') and crown light ('*').
-        let ground = mix(vec3<f32>(1.0),
-                         palette[MAT_GRASS].rgb / max(palette[MAT_TALL_GRASS].rgb, vec3<f32>(1e-3)),
-                         0.6);
-        let s1 = smoothstep(0.48, 0.56, vn);
-        let s2 = smoothstep(0.80, 0.88, vn);
-        var b = (0.95 + 0.13 * s1 + 0.14 * s2)
-            * select(1.0, 0.88, val == 2u)
-            * select(1.0, 1.12, val == 3u);
-        tint = vec3<f32>(b) * ground;
-    }
-    if (best_t < 1e30) {
-        out.hit = true;
-        out.t_hit = best_t;
-        out.normal = best_n;
-        out.color_tint = tint;
+    let lean = clamp(wind, vec2<f32>(-0.25), vec2<f32>(0.25));
+
+    // Shear space: q = p - lean * y. The shear is linear, so the ray stays
+    // a straight line with a modified direction and the volume stays the
+    // axis-aligned unit cell - an exact rigid-lean march.
+    let o_l = origin - voxel_min;
+    let o_s = vec3<f32>(o_l.x - lean.x * o_l.y, o_l.y, o_l.z - lean.y * o_l.y);
+    let d_s = vec3<f32>(dir.x - lean.x * dir.y, dir.y, dir.z - lean.y * dir.y);
+
+    // Entry into the unit cell in shear space.
+    let inv = 1.0 / d_s;
+    let t0v = (vec3<f32>(0.0) - o_s) * inv;
+    let t1v = (vec3<f32>(1.0) - o_s) * inv;
+    let tmin3 = min(t0v, t1v);
+    let tmax3 = max(t0v, t1v);
+    let t_in = max(max(tmin3.x, tmin3.y), max(tmin3.z, 0.0));
+    let t_out = min(min(tmax3.x, tmax3.y), tmax3.z);
+    if (t_in >= t_out) { return out; }
+
+    // 8x8x8 DDA from the entry point.
+    let eps = 1e-4;
+    var p = (o_s + d_s * (t_in + eps)) * 8.0;
+    var c = vec3<i32>(clamp(floor(p), vec3<f32>(0.0), vec3<f32>(7.0)));
+    let step_i = vec3<i32>(sign(d_s));
+    let inv8 = 1.0 / (d_s * 8.0);
+    // Parametric distance (in ray t) to each next cell boundary.
+    var t_next = vec3<f32>(1e30);
+    if (d_s.x != 0.0) { t_next.x = t_in + (select(f32(c.x), f32(c.x + 1), d_s.x > 0.0) - p.x) * inv8.x * 8.0; }
+    if (d_s.y != 0.0) { t_next.y = t_in + (select(f32(c.y), f32(c.y + 1), d_s.y > 0.0) - p.y) * inv8.y * 8.0; }
+    if (d_s.z != 0.0) { t_next.z = t_in + (select(f32(c.z), f32(c.z + 1), d_s.z > 0.0) - p.z) * inv8.z * 8.0; }
+    let t_delta = abs(inv8) * 8.0 / 8.0;
+
+    var t_cur = t_in;
+    var axis = 1; // entry face axis fallback: +Y-ish
+    for (var s = 0; s < 26; s = s + 1) {
+        if (c.x < 0 || c.x > 7 || c.y < 0 || c.y > 7 || c.z < 0 || c.z > 7) { break; }
+        if (t_cur > t_out) { break; }
+        if (micro_tuft_bit(variant, c.x, c.y, c.z)) {
+            out.hit = true;
+            out.t_hit = t_cur;
+            // Face normal from the crossed axis (unshear ~ identity for
+            // small leans); entry through the cell top reads as +Y.
+            var n = vec3<f32>(0.0, 1.0, 0.0);
+            if (axis == 0) { n = vec3<f32>(-f32(step_i.x), 0.0, 0.0); }
+            if (axis == 2) { n = vec3<f32>(0.0, 0.0, -f32(step_i.z)); }
+            // Carpet tint rules on the micro height.
+            let vn = (f32(c.y) + 0.5) / 8.0;
+            let ground = mix(vec3<f32>(1.0),
+                             palette[MAT_GRASS].rgb / max(palette[MAT_TALL_GRASS].rgb, vec3<f32>(1e-3)),
+                             0.6);
+            let s1 = smoothstep(0.48, 0.56, vn);
+            let s2 = smoothstep(0.80, 0.88, vn);
+            var b = 0.95 + 0.13 * s1 + 0.14 * s2;
+            // Top faces a breath lighter, sides a breath darker: the chunky
+            // voxel read without per-cell colour lotteries.
+            b = b * select(0.96, 1.06, axis == 1 && ((dir.y < 0.0) == (n.y > 0.0)));
+            out.normal = n;
+            out.color_tint = vec3<f32>(b) * ground;
+            return out;
+        }
+        // Step to the nearest boundary.
+        if (t_next.x <= t_next.y && t_next.x <= t_next.z) {
+            c.x = c.x + step_i.x;
+            t_cur = t_next.x;
+            t_next.x = t_next.x + t_delta.x;
+            axis = 0;
+        } else if (t_next.y <= t_next.z) {
+            c.y = c.y + step_i.y;
+            t_cur = t_next.y;
+            t_next.y = t_next.y + t_delta.y;
+            axis = 1;
+        } else {
+            c.z = c.z + step_i.z;
+            t_cur = t_next.z;
+            t_next.z = t_next.z + t_delta.z;
+            axis = 2;
+        }
     }
     return out;
 }
