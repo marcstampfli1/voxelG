@@ -850,11 +850,25 @@ pub fn encoded() -> Vec<u32> {
                 }
                 let hj = h32(var as u32 + 7, x, z);
                 let spike_h = ((2.0 + hj * hj * 13.5) * (1.0 - r * 1.1).max(0.2)).min(15.0);
+                // Curved blades: tall spikes arc sideways with a quadratic
+                // bend - one coherent lean per variant (wind-combed) with
+                // per-blade jitter, taller blades bending further.
+                let lean_a = (var as f32) * 2.1
+                    + (h32(var as u32 + 13, x, z) - 0.5) * 1.6;
+                let bend_mag = (spike_h / 15.0).powf(1.5)
+                    * (1.5 + h32(var as u32 + 17, x, z) * 2.5);
                 for y in 0..16u32 {
                     if (y as f32) >= spike_h {
                         break;
                     }
-                    let bit = (x + z * 16 + y * 256) as usize;
+                    let t = y as f32 / spike_h.max(1.0);
+                    let off = bend_mag * t * t;
+                    let bx = (x as f32 + lean_a.cos() * off).round() as i32;
+                    let bz = (z as f32 + lean_a.sin() * off).round() as i32;
+                    if !(0..16).contains(&bx) || !(0..16).contains(&bz) {
+                        break;
+                    }
+                    let bit = (bx as u32 + bz as u32 * 16 + y * 256) as usize;
                     out[MICRO_TUFT_BASE_WORDS + var * MICRO_TUFT_WORDS + bit / 32] |=
                         1 << (bit % 32);
                 }
