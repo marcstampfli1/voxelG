@@ -824,35 +824,38 @@ pub fn encoded() -> Vec<u32> {
         v = v.wrapping_mul(2654435769);
         (v >> 8) as f32 / 16777216.0
     };
+    // A tussock is AIRY: clustered thin vertical spikes with sky between
+    // them, dense only near the base - never a filled blob (a full volume
+    // reads as a green crate, seen and rejected).
     for var in 0..N_MICRO_TUFTS {
         for z in 0..8u32 {
             for x in 0..8u32 {
-                // Per-column silhouette: jittered height and radial reach.
-                let hj = h32(var as u32, x, z);
-                let col_h = (4.0 + 3.6 * hj).min(7.9);
+                let dx = (x as f32 + 0.5) / 8.0 - 0.5;
+                let dz = (z as f32 + 0.5) / 8.0 - 0.5;
+                let r = (dx * dx + dz * dz).sqrt();
+                if r > 0.42 {
+                    continue;
+                }
+                // Dense ragged mass: the CORE is nearly solid (a tussock
+                // is a clump, not scattered pillars) and the occupancy
+                // tapers toward the rim; air lives at the rim and between
+                // crown tips of differing heights.
+                let lot = h32(var as u32, x, z);
+                let p_col = 0.95 - r * 1.6;
+                if lot >= p_col {
+                    continue;
+                }
+                // Column height: tall ragged crown near the centre (4..7),
+                // short at the rim (1..3).
+                let hj = h32(var as u32 + 7, x, z);
+                let spike_h = (1.0 + (1.0 - r * 2.0).max(0.0) * 4.0 + hj * 2.0).min(7.0);
                 for y in 0..8u32 {
-                    if (y as f32) > col_h {
-                        continue;
+                    if (y as f32) >= spike_h {
+                        break;
                     }
-                    let fy = (y as f32 + 0.5) / 8.0;
-                    // Radius profile: base 0.40, bulge 0.46 mid, crown 0.16.
-                    let r_prof = if fy < 0.35 {
-                        0.40 + fy * 0.17
-                    } else if fy < 0.6 {
-                        0.46
-                    } else {
-                        0.46 - (fy - 0.6) * 0.75
-                    };
-                    let dx = (x as f32 + 0.5) / 8.0 - 0.5;
-                    let dz = (z as f32 + 0.5) / 8.0 - 0.5;
-                    let r = (dx * dx + dz * dz).sqrt();
-                    // Ragged edge: the rim wobbles per column and variant.
-                    let rag = 0.85 + 0.30 * h32(var as u32 + 7, x, z);
-                    if r < r_prof * rag {
-                        let bit = (x + z * 8 + y * 64) as usize;
-                        out[MICRO_TUFT_BASE_WORDS + var * MICRO_TUFT_WORDS + bit / 32] |=
-                            1 << (bit % 32);
-                    }
+                    let bit = (x + z * 8 + y * 64) as usize;
+                    out[MICRO_TUFT_BASE_WORDS + var * MICRO_TUFT_WORDS + bit / 32] |=
+                        1 << (bit % 32);
                 }
             }
         }

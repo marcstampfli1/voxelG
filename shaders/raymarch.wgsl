@@ -1983,11 +1983,13 @@ fn grass_tuft_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>) -> SubHit
     let step_i = vec3<i32>(sign(d_s));
     let inv8 = 1.0 / (d_s * 8.0);
     // Parametric distance (in ray t) to each next cell boundary.
+    // Micro units: p advances at d_s * 8 per unit ray-t, so a boundary at
+    // distance (b - p) micro cells lies (b - p) * inv8 ray-t away.
     var t_next = vec3<f32>(1e30);
-    if (d_s.x != 0.0) { t_next.x = t_in + (select(f32(c.x), f32(c.x + 1), d_s.x > 0.0) - p.x) * inv8.x * 8.0; }
-    if (d_s.y != 0.0) { t_next.y = t_in + (select(f32(c.y), f32(c.y + 1), d_s.y > 0.0) - p.y) * inv8.y * 8.0; }
-    if (d_s.z != 0.0) { t_next.z = t_in + (select(f32(c.z), f32(c.z + 1), d_s.z > 0.0) - p.z) * inv8.z * 8.0; }
-    let t_delta = abs(inv8) * 8.0 / 8.0;
+    if (d_s.x != 0.0) { t_next.x = t_in + (select(f32(c.x), f32(c.x + 1), d_s.x > 0.0) - p.x) * inv8.x; }
+    if (d_s.y != 0.0) { t_next.y = t_in + (select(f32(c.y), f32(c.y + 1), d_s.y > 0.0) - p.y) * inv8.y; }
+    if (d_s.z != 0.0) { t_next.z = t_in + (select(f32(c.z), f32(c.z + 1), d_s.z > 0.0) - p.z) * inv8.z; }
+    let t_delta = abs(inv8);
 
     var t_cur = t_in;
     var axis = 1; // entry face axis fallback: +Y-ish
@@ -2010,9 +2012,15 @@ fn grass_tuft_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>) -> SubHit
             let s1 = smoothstep(0.48, 0.56, vn);
             let s2 = smoothstep(0.80, 0.88, vn);
             var b = 0.95 + 0.13 * s1 + 0.14 * s2;
-            // Top faces a breath lighter, sides a breath darker: the chunky
-            // voxel read without per-cell colour lotteries.
+            // Top faces a breath lighter, sides a breath darker.
             b = b * select(0.96, 1.06, axis == 1 && ((dir.y < 0.0) == (n.y > 0.0)));
+            // Per-micro-cell quantized tone (two steps, +-8%): the texel-
+            // scale shading detail voxel art lives on - a flat monotone
+            // face reads as a plastic crate.
+            let mh = hash3f(voxel_min + vec3<f32>(f32(c.x) * 0.37 + 1.1,
+                                                  f32(c.y) * 0.53 + 2.3,
+                                                  f32(c.z) * 0.71 + 3.7));
+            b = b * select(select(1.0, 1.08, mh > 0.66), 0.92, mh < 0.33);
             out.normal = n;
             out.color_tint = vec3<f32>(b) * ground;
             return out;

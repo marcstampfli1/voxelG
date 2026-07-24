@@ -5213,6 +5213,41 @@ mod gpu_render_tests {
     /// layer above every block - analytic 3D blades out of the ground, the
     /// combed sheen shading between and beyond them - at a day and an
     /// evening sun, walking and grazing cameras.
+    /// Close-up tussock lab: a handful of micro-voxel tufts three voxels
+    /// from the camera, so the tuft SHAPE is judged at art scale before any
+    /// field verdicts.
+    #[test]
+    #[ignore]
+    fn dump_tuft_closeup() {
+        use crate::voxel::{MAT_DIRT, MAT_GRASS, MAT_TALL_GRASS};
+        let mut world = World::new();
+        for z in 200u32..232 {
+            for x in 200u32..232 {
+                world.set_voxel(x, 63, z, MAT_DIRT);
+                world.set_voxel(x, 64, z, MAT_GRASS);
+            }
+        }
+        for (x, z) in [(214u32, 210u32), (216, 211), (215, 213), (219, 210), (213, 216)] {
+            world.set_voxel(x, 65, z, MAT_TALL_GRASS);
+        }
+        let mut cam = Camera::new();
+        cam.pos = glam::Vec3::new(215.5, 66.4, 207.0);
+        cam.yaw = 0.35;
+        cam.pitch = -0.28;
+        std::fs::create_dir_all("target/lookdev").unwrap();
+        let Some(rgba) = render_rgba_time_sun(&world, &cam, 1920, 1080, 30.0, 30.0) else {
+            eprintln!("no GPU - skipping");
+            return;
+        };
+        let path = "target/lookdev/tuft_closeup.png";
+        let file = std::fs::File::create(path).unwrap();
+        let mut enc = png::Encoder::new(std::io::BufWriter::new(file), 1920, 1080);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header().unwrap().write_image_data(&rgba).unwrap();
+        eprintln!("wrote {path}");
+    }
+
     /// The three grass-style candidates, rendered to distinctly named
     /// stills for the look decision: style1 = fine spikes with macro-calm
     /// shading, style2 = voxel-native cross-quad sprites (raster field
