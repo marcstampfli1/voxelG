@@ -1502,15 +1502,16 @@ fn leaf_bl_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32) ->
 // like a vertex-shader wave on a crossed billboard.
 fn cross_sprite_tint(mat: u32, sprite: u32, val: u32, v: f32, vh: f32) -> vec3<f32> {
     if (mat == MAT_TALL_GRASS) {
-        // Dark base -> bright tip, darker secondary texels, per-voxel hue.
-        let b = (0.60 + 0.55 * v) * select(1.0, 0.72, val == 2u);
-        // Couple the blade hue 60% toward the ground-block palette so grass
-        // tracks its terrain colour from the one palette source instead of
-        // floating over it.
+        // Macro-calm sprite shading: bright shared base fusing with the
+        // ground, ONE quantized value step to a lighter top band, darker
+        // secondary texels kept mild, and only a whisper of per-cell
+        // variance (per-cell brightness lotteries read as noise).
+        let stp = smoothstep(0.48, 0.56, v);
+        let b = (0.94 + 0.24 * stp) * select(1.0, 0.86, val == 2u);
         let ground = mix(vec3<f32>(1.0),
                          palette[MAT_GRASS].rgb / max(palette[MAT_TALL_GRASS].rgb, vec3<f32>(1e-3)),
                          0.6);
-        return vec3<f32>(b) * (0.85 + vh * 0.30) * ground;
+        return vec3<f32>(b) * (0.96 + vh * 0.08) * ground;
     }
     if (mat == MAT_TALL_GRASS_DRY) {
         // Pale straw: brightness ramp along the stalk, small per-clump spread.
@@ -1948,16 +1949,10 @@ fn foliage_subvoxel(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u3
         return hit;
     }
     if (mat == MAT_TALL_GRASS || mat == MAT_TALL_GRASS_DRY) {
-        // Tiered grass: volumetric blade clumps near, crossed quads beyond,
-        // with a hash-dithered edge so no switching line forms. Ray-local
-        // distance is the right LOD metric for secondaries too.
-        let cd = length(vec3<f32>(voxel) + vec3<f32>(0.5) - origin);
-        let edge = FLORA_NEAR_T + (hash3f(vec3<f32>(voxel)) - 0.5) * 4.0;
-        if (cd < edge) {
-            hit = flora_clump_hit(voxel, origin, dir, mat);
-        } else {
-            hit = sprite_cross_hit(voxel, origin, dir, mat);
-        }
+        // Crossed quads at every distance: the card-tussock near tier was
+        // superseded by the raster blade field (rejected on look); sprites
+        // are the voxel-native look at all ranges.
+        hit = sprite_cross_hit(voxel, origin, dir, mat);
     } else if (mat == MAT_FLOWER) {
         hit = sprite_cross_hit(voxel, origin, dir, mat);
     } else if (mat == MAT_LEAF_FRINGE) {

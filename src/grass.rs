@@ -20,11 +20,20 @@ pub const GRASS_LOD1_T: f32 = 44.0;
 pub const GRASS_LOD2_T: f32 = 90.0;
 
 /// blades x segments per LOD band; a segment is one 6-vertex quad.
-pub const LOD_SHAPE: [(u32, u32); 3] = [(80, 5), (42, 3), (20, 1)];
+/// Two shape languages share the pipeline: fine spikes (default) and the
+/// chunky Hytale-proportioned paddles (VOXELG_GRASS_CHUNKY=1) - fewer,
+/// larger, bolder shapes.
+pub fn lod_shape() -> [(u32, u32); 3] {
+    if std::env::var("VOXELG_GRASS_CHUNKY").is_ok() {
+        [(20, 4), (12, 2), (6, 1)]
+    } else {
+        [(80, 5), (42, 3), (20, 1)]
+    }
+}
 
 /// Vertices per cell instance in a band.
 pub fn verts_per_cell(lod: usize) -> u32 {
-    let (blades, segs) = LOD_SHAPE[lod];
+    let (blades, segs) = lod_shape()[lod];
     blades * segs * 6
 }
 

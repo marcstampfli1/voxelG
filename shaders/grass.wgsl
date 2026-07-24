@@ -30,6 +30,7 @@ override GRASS_BLADES: u32 = 24u;
 override GRASS_SEGS: u32 = 4u;
 override GRASS_WIDTH_MUL: f32 = 1.0;
 override GRASS_FAR_T: f32 = 90.0;
+override GRASS_CHUNKY: f32 = 0.0;
 
 // ---- small local copies (SYNC comments point at the originals) ----------
 
@@ -169,7 +170,7 @@ fn vs_grass(@builtin(vertex_index) vid: u32,
     let fa = clump_ang + (fract(bh * 5.0) - 0.5) * 1.5;
     let fdir = vec2<f32>(cos(fa), sin(fa));
     let hfrac = 0.55 + 0.45 * fract(bh * 3.0);
-    let h = field * clump_h * hfrac * 1.02;
+    let h = field * clump_h * hfrac * (1.02 + GRASS_CHUNKY * 0.18);
     let curve = 0.16 + 0.30 * fract(bh * 13.0);
     // Wind bends the CURVE (control points), not the whole blade rigidly.
     let phase = rootw.x * 0.40 + rootw.z * 0.55 + bh * 6.28;
@@ -195,10 +196,13 @@ fn vs_grass(@builtin(vertex_index) vid: u32,
     let wide3 = vec3<f32>(-wf.y, 0.0, wf.x);
 
     // Width: taper root->tip.
-    // Flat tapered spike: linear width to a sharp point (the reference's
-    // low-poly triangle blades, not rounded straws).
-    let plump = 1.0 - t0 * 0.98;
-    var hw = 0.036 * GRASS_WIDTH_MUL * (0.8 + 0.4 * fract(bh * 17.0)) * plump;
+    // Two silhouettes: flat tapered spike (default), or the chunky blunt
+    // paddle (Hytale-proportioned bold shapes) when GRASS_CHUNKY is set.
+    let spike = 1.0 - t0 * 0.98;
+    let paddle = 1.0 - pow(t0, 2.2) * 0.92;
+    let plump = mix(spike, paddle, GRASS_CHUNKY);
+    var hw = 0.036 * (1.0 + GRASS_CHUNKY * 1.6) * GRASS_WIDTH_MUL
+        * (0.8 + 0.4 * fract(bh * 17.0)) * plump;
 
     let wp0 = p + wide3 * hw * cs;
     let d = wp0 - camera.origin;
@@ -244,16 +248,15 @@ fn vs_grass(@builtin(vertex_index) vid: u32,
 
     // ---- colour: clump-coherent, root-dark -> tip-bright, dry skew ----
     let ground = vec3<f32>(0.30, 0.65, 0.20); // palette[MAT_GRASS], SYNC renderer default_palette
-    let dry = fract(cid * 9.77);
-    // Stylized lush field: only occasional clumps skew warm, and gently.
-    let hue = mix(vec3<f32>(1.0), vec3<f32>(1.22, 1.04, 0.62),
-                  smoothstep(0.75, 1.0, dry) * 0.45);
-    let cb = (0.88 + 0.24 * fract(cid * 5.23)) * (0.92 + 0.16 * fract(bh * 23.0));
-    // Base: ONE shared carpet colour (warm bright green, no per-blade or
-    // per-clump variance) so the bottoms of neighbouring blades fuse into
-    // sameness like the reference; identity lives at the tips.
-    o.albedo0 = ground * vec3<f32>(1.18, 1.06, 0.68) * 0.98;
-    o.albedo1 = ground * hue * cb * 1.52;
+    // MACRO-CALM colour (the BotW/Genshin field principle): colour varies
+    // only at HILL scale - a ~30-voxel hue drift between two greens - never
+    // per blade or per clump. The field reads as one smooth gradient;
+    // blades contribute silhouette, not colour noise.
+    let hue_t = vnoise3g(vec3<f32>(rootw.x * 0.033, 12.5, rootw.z * 0.033));
+    let carpet = ground * mix(vec3<f32>(1.02, 0.98, 0.85), vec3<f32>(1.22, 1.08, 0.62), hue_t);
+    o.albedo0 = carpet;
+    // Tip colour: shared lighten with only a whisper of per-blade spread.
+    o.albedo1 = carpet * (1.34 + (fract(bh * 23.0) - 0.5) * 0.10);
     return o;
 }
 
@@ -310,38 +313,28 @@ fn fs_grass(in: VsOut) -> @location(0) vec4<f32> {
     let sc = sun_color(s);
     let sblade = in.uv.y;
 
-    // Rounded normal on the SMOOTH interpolated frame: bowed across the
-    // width, blended toward up along the height (soft speculars at tips).
-    let tang_s = normalize(in.tangent);
-    let wide_s = normalize(in.wide3);
-    var nf = normalize(cross(tang_s, wide_s));
-    nf = nf * select(1.0, -1.0, nf.y < 0.0);
-    var n = normalize(nf + wide_s * in.uv.x * 0.22);
-    n = normalize(mix(n, vec3<f32>(0.0, 1.0, 0.0), 0.25 + 0.35 * sblade));
-
-    // Sward depth: the grass volume darkens toward its interior - the
-    // height gradient AND the blade's height rank both pull light out.
-    // This value range (deep shade to lit tips) is most of the "volume".
-    let sward = (0.88 + 0.12 * sblade) * in.blade_ao;
-
-    // Wrapped diffuse: foliage responds softer than a hard lambert.
-    let ndl = max(0.0, (dot(n, s) + 0.35) / 1.35);
-    let direct = sc * ndl * shadow * s_int * (0.70 + 0.30 * sward);
-    // Cool sky ambient against the warm sun (the two-tone light contrast
-    // stylized fields live on), scaled by the cached ground AO + sward.
+    // MACRO-CALM shading: the field lights as ONE smooth surface - diffuse
+    // uses the terrain's up normal for every blade (no per-blade normal
+    // response, no sheen, no rim: those are micro noise), modulated only by
+    // the root's cached shadow/AO. Deliberate VALUE STEPS along the blade
+    // height replace the continuous gradient (the stylized-art rule):
+    // carpet -> mid step -> tip step, each a clean readable band.
+    let ndl = max(0.0, (s.y + 0.35) / 1.35);
+    let direct = sc * ndl * shadow * s_int;
     let sky_f = 0.25 + 0.75 * s_int;
-    // Cool sky term plus a green ground-bounce floor: grass in tree shade
-    // reads deep green, never black (the bounce is what real swards do).
-    let ambient = (vec3<f32>(0.24, 0.32, 0.46) * 1.15 * ao
-                   + vec3<f32>(0.10, 0.16, 0.06) * (0.4 + 0.6 * ao))
-        * sky_f * sward;
+    let ambient = (vec3<f32>(0.26, 0.33, 0.45) * ao
+                   + vec3<f32>(0.10, 0.15, 0.06)) * sky_f;
 
-    // Bottom ~45% holds the flat carpet colour; the ramp to the tip colour
-    // happens in the upper body only.
-    let albedo = mix(in.albedo0, in.albedo1, smoothstep(0.45, 1.0, sblade));
-    var col = albedo * (direct + ambient);
+    let step_w = 0.03 + GRASS_CHUNKY * 0.02;
+    let s1 = smoothstep(0.52 - step_w, 0.52 + step_w, sblade);
+    let s2 = smoothstep(0.83 - step_w, 0.83 + step_w, sblade);
+    var alb = in.albedo0 * (1.0 + (0.13 + GRASS_CHUNKY * 0.07) * s1);
+    alb = mix(alb, in.albedo1, s2 * 0.9);
 
-    // Sheen/backlight need the view ray; reconstruct it from the pixel.
+    var col = alb * (direct + ambient);
+
+    // One field-level tip glow toward a low sun (macro term: identical
+    // response across the whole field).
     let res = camera.resolution;
     let ndc = vec2<f32>((in.pos.x / res.x) * 2.0 - 1.0, 1.0 - (in.pos.y / res.y) * 2.0);
     let aspect = res.x / res.y;
@@ -349,25 +342,9 @@ fn fs_grass(in: VsOut) -> @location(0) vec4<f32> {
         + camera.right * ndc.x * camera.tan_half_fov * aspect
         + camera.up * ndc.y * camera.tan_half_fov);
     if (s_int > 0.0) {
-        let hv = normalize(s - vdir2);
-        let tdh = dot(tang_s, hv);
-        let sheen = pow(sqrt(max(0.0, 1.0 - tdh * tdh)), 32.0);
-        // Backlight: sun through the sward toward the viewer, strongest at
-        // tips; rim: bright light edge where a tip silhouettes against the
-        // view. Together they are the glow GoT fields carry.
         let back = pow(max(0.0, dot(vdir2, s)), 5.0) * clamp(1.2 - s.y * 1.2, 0.0, 1.0);
-        let rim = pow(1.0 - abs(dot(n, vdir2)), 3.0) * sblade * sblade
-            * max(0.0, dot(vdir2, s) * 0.5 + 0.5);
-        col = col + sc * shadow
-            * (sheen * 0.25 * vec3<f32>(1.0, 1.0, 0.85)
-               + back * 0.38 * vec3<f32>(0.60, 0.88, 0.30) * (0.3 + 0.7 * sblade)
-               + rim * 0.16 * vec3<f32>(0.95, 1.0, 0.70));
-    }
-    // Solid silhouette: the outer sliver of each blade darkens slightly
-    // (stylized edge), so edges never read as light leaking through.
-    {
-        let edge = smoothstep(0.6, 1.0, abs(in.uv.x));
-        col *= 1.0 - edge * 0.18;
+        col = col + sc * shadow * back * 0.22 * vec3<f32>(0.70, 0.95, 0.35)
+            * smoothstep(0.6, 1.0, sblade);
     }
 
     // Fog toward the horizon haze so far grass melts into the fogged

@@ -2327,14 +2327,16 @@ fn create_grass_pipelines(
         bind_group_layouts: &[Some(bgl)],
         immediate_size: 0,
     });
+    let chunky = if std::env::var("VOXELG_GRASS_CHUNKY").is_ok() { 1.0f64 } else { 0.0 };
     let mk = |lod: usize| {
-        let (blades, segs) = crate::grass::LOD_SHAPE[lod];
+        let (blades, segs) = crate::grass::lod_shape()[lod];
         let width_mul = [1.0f64, 1.6, 2.6][lod];
         let consts: Vec<(&str, f64)> = vec![
             ("GRASS_BLADES", blades as f64),
             ("GRASS_SEGS", segs as f64),
             ("GRASS_WIDTH_MUL", width_mul),
             ("GRASS_FAR_T", crate::grass::GRASS_LOD2_T as f64),
+            ("GRASS_CHUNKY", chunky),
         ];
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("grass pipeline"),
@@ -5184,6 +5186,75 @@ mod gpu_render_tests {
     /// layer above every block - analytic 3D blades out of the ground, the
     /// combed sheen shading between and beyond them - at a day and an
     /// evening sun, walking and grazing cameras.
+    /// The three grass-style candidates, rendered to distinctly named
+    /// stills for the look decision: style1 = fine spikes with macro-calm
+    /// shading, style2 = voxel-native cross-quad sprites (raster field
+    /// off), style3 = chunky paddle blades (VOXELG_GRASS_CHUNKY).
+    #[test]
+    #[ignore]
+    fn dump_grass_styles() {
+        use crate::voxel::{MAT_DIRT, MAT_GRASS, MAT_TALL_GRASS};
+        std::fs::create_dir_all("target/lookdev").unwrap();
+        let save = |name: &str, rgba: &[u8]| {
+            let path = format!("target/lookdev/{name}.png");
+            let file = std::fs::File::create(&path).unwrap();
+            let mut enc = png::Encoder::new(std::io::BufWriter::new(file), 1920, 1080);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            enc.write_header().unwrap().write_image_data(rgba).unwrap();
+            eprintln!("wrote {path}");
+        };
+        let mut platform = World::new();
+        for z in 150u32..300 {
+            for x in 150u32..300 {
+                platform.set_voxel(x, 63, z, MAT_DIRT);
+                platform.set_voxel(x, 64, z, MAT_GRASS);
+            }
+        }
+        let mut sprite_world = World::new();
+        for z in 150u32..300 {
+            for x in 150u32..300 {
+                sprite_world.set_voxel(x, 63, z, MAT_DIRT);
+                sprite_world.set_voxel(x, 64, z, MAT_GRASS);
+                sprite_world.set_voxel(x, 65, z, MAT_TALL_GRASS);
+            }
+        }
+        let mut demo = World::new();
+        demo.fill_demo_terrain();
+        let mut walk = Camera::new();
+        walk.pos = glam::Vec3::new(225.0, 67.0, 225.0);
+        walk.yaw = 0.8;
+        walk.pitch = -0.35;
+        let mut meadow = Camera::new();
+        meadow.pos = glam::Vec3::new(280.5, 72.5, 400.0);
+        meadow.yaw = 2.9;
+        meadow.pitch = -0.12;
+
+        // Style 1: fine spikes (default env).
+        std::env::remove_var("VOXELG_GRASS_CHUNKY");
+        let Some(f) = render_rgba_full_opts(&platform, &walk, 1920, 1080, &[], 30.0, 30.0, true, false) else {
+            eprintln!("no GPU - skipping");
+            return;
+        };
+        save("style1_spikes_walk", &f);
+        save("style1_spikes_meadow",
+             &render_rgba_full_opts(&demo, &meadow, 1920, 1080, &[], 30.0, 66.0, true, false).unwrap());
+
+        // Style 3: chunky paddles.
+        std::env::set_var("VOXELG_GRASS_CHUNKY", "1");
+        save("style3_chunky_walk",
+             &render_rgba_full_opts(&platform, &walk, 1920, 1080, &[], 30.0, 30.0, true, false).unwrap());
+        save("style3_chunky_meadow",
+             &render_rgba_full_opts(&demo, &meadow, 1920, 1080, &[], 30.0, 66.0, true, false).unwrap());
+        std::env::remove_var("VOXELG_GRASS_CHUNKY");
+
+        // Style 2: voxel sprites only (raster field off).
+        save("style2_sprites_walk",
+             &render_rgba_full_opts(&sprite_world, &walk, 1920, 1080, &[], 30.0, 30.0, false, false).unwrap());
+        save("style2_sprites_meadow",
+             &render_rgba_full_opts(&demo, &meadow, 1920, 1080, &[], 30.0, 66.0, false, false).unwrap());
+    }
+
     /// The blade marker must survive grass -> post -> LDR: blade pixels
     /// carry alpha 0, sky/terrain alpha 1. The TAA ghost fix stands on it.
     #[test]
