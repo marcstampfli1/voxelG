@@ -104,11 +104,11 @@ atlas_consts! {
     TUFT_PINE = 2;
     /// Number of 32x32 tufts in the atlas.
     N_TUFTS = 3;
-    /// Micro-voxel tussock volumes (8x8x8 occupancy bits, 16 words each)
+    /// Micro-voxel tussock volumes (16x16x16 occupancy bits, 128 words each)
     /// appended after the BL tufts: variant i lives at
     /// MICRO_TUFT_BASE_WORDS + i * MICRO_TUFT_WORDS.
     MICRO_TUFT_BASE_WORDS = TUFT_BASE_WORDS + N_TUFTS * BL_TUFT_WORDS;
-    MICRO_TUFT_WORDS = 16;
+    MICRO_TUFT_WORDS = 128;
     /// 0..2 = grass tussocks, 3..5 = bush domes.
     N_MICRO_TUFTS = 6;
 }
@@ -829,10 +829,10 @@ pub fn encoded() -> Vec<u32> {
     // them, dense only near the base - never a filled blob (a full volume
     // reads as a green crate, seen and rejected).
     for var in 0..3 {
-        for z in 0..8u32 {
-            for x in 0..8u32 {
-                let dx = (x as f32 + 0.5) / 8.0 - 0.5;
-                let dz = (z as f32 + 0.5) / 8.0 - 0.5;
+        for z in 0..16u32 {
+            for x in 0..16u32 {
+                let dx = (x as f32 + 0.5) / 16.0 - 0.5;
+                let dz = (z as f32 + 0.5) / 16.0 - 0.5;
                 let r = (dx * dx + dz * dz).sqrt();
                 let rag = 0.82 + 0.36 * h32(var as u32 + 5, x, z);
                 if r > 0.46 * rag {
@@ -849,12 +849,12 @@ pub fn encoded() -> Vec<u32> {
                     continue;
                 }
                 let hj = h32(var as u32 + 7, x, z);
-                let spike_h = ((1.0 + hj * hj * 6.5) * (1.0 - r * 1.1).max(0.2)).min(7.0);
-                for y in 0..8u32 {
+                let spike_h = ((2.0 + hj * hj * 13.5) * (1.0 - r * 1.1).max(0.2)).min(15.0);
+                for y in 0..16u32 {
                     if (y as f32) >= spike_h {
                         break;
                     }
-                    let bit = (x + z * 8 + y * 64) as usize;
+                    let bit = (x + z * 16 + y * 256) as usize;
                     out[MICRO_TUFT_BASE_WORDS + var * MICRO_TUFT_WORDS + bit / 32] |=
                         1 << (bit % 32);
                 }
@@ -866,34 +866,31 @@ pub fn encoded() -> Vec<u32> {
     // leaves; the airiness comes from the cutout faces, not from holes in
     // the volume).
     for var in 3..N_MICRO_TUFTS {
-        for z in 0..8u32 {
-            for x in 0..8u32 {
-                let dx = (x as f32 + 0.5) / 8.0 - 0.5;
-                let dz = (z as f32 + 0.5) / 8.0 - 0.5;
+        for z in 0..16u32 {
+            for x in 0..16u32 {
+                let dx = (x as f32 + 0.5) / 16.0 - 0.5;
+                let dz = (z as f32 + 0.5) / 16.0 - 0.5;
                 let r = (dx * dx + dz * dz).sqrt();
                 let rag = 0.88 + 0.24 * h32(var as u32 + 11, x, z);
                 if r > 0.48 * rag {
                     continue;
                 }
-                // Dome: tall centre, low rim, one cell of ground clearance
-                // on the rim so the silhouette reads as a rounded bush.
+                // Dome: tall centre, low rim, ground clearance toward the
+                // rim so the silhouette reads as a rounded bush on a stem.
                 let rn = (r / 0.48).min(1.0);
-                let dome_h = (1.0 - rn * rn).sqrt() * 6.5 + 1.0;
-                // Stem waist: the dome floats on a narrow root with real
-                // ground clearance toward the rim (fat grounded skirts read
-                // as green boulders).
+                let dome_h = (1.0 - rn * rn).sqrt() * 13.0 + 2.0;
                 let y0 = if rn < 0.30 {
                     0u32
                 } else if rn < 0.62 {
-                    1u32
-                } else {
                     2u32
+                } else {
+                    4u32
                 };
-                for y in y0..8u32 {
+                for y in y0..16u32 {
                     if (y as f32) >= dome_h {
                         break;
                     }
-                    let bit = (x + z * 8 + y * 64) as usize;
+                    let bit = (x + z * 16 + y * 256) as usize;
                     out[MICRO_TUFT_BASE_WORDS + var * MICRO_TUFT_WORDS + bit / 32] |=
                         1 << (bit % 32);
                 }

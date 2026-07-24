@@ -1943,7 +1943,7 @@ fn turf_blade_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>) -> SubHit
 // steps, top faces a breath lighter; sun/shadow/AO arrive through shade()
 // like any other voxel surface.
 fn micro_tuft_bit(variant: u32, x: i32, y: i32, z: i32) -> bool {
-    let bit = u32(x + z * 8 + y * 64);
+    let bit = u32(x + z * 16 + y * 256);
     let w = sprites[MICRO_TUFT_BASE_WORDS + variant * MICRO_TUFT_WORDS + (bit >> 5u)];
     return ((w >> (bit & 31u)) & 1u) != 0u;
 }
@@ -1978,10 +1978,10 @@ fn tuft_volume_march(
     let t_out = min(min(tmax3.x, tmax3.y), tmax3.z);
     if (t_in >= t_out) { return out; }
     let eps = 1e-4;
-    var p = (o_s + d_s * (t_in + eps)) * 8.0;
-    var c = vec3<i32>(clamp(floor(p), vec3<f32>(0.0), vec3<f32>(7.0)));
+    var p = (o_s + d_s * (t_in + eps)) * 16.0;
+    var c = vec3<i32>(clamp(floor(p), vec3<f32>(0.0), vec3<f32>(15.0)));
     let step_i = vec3<i32>(sign(d_s));
-    let inv8 = 1.0 / (d_s * 8.0);
+    let inv8 = 1.0 / (d_s * 16.0);
     var t_next = vec3<f32>(1e30);
     if (d_s.x != 0.0) { t_next.x = t_in + (select(f32(c.x), f32(c.x + 1), d_s.x > 0.0) - p.x) * inv8.x; }
     if (d_s.y != 0.0) { t_next.y = t_in + (select(f32(c.y), f32(c.y + 1), d_s.y > 0.0) - p.y) * inv8.y; }
@@ -1989,17 +1989,17 @@ fn tuft_volume_march(
     let t_delta = abs(inv8);
     var t_cur = t_in;
     var axis = 1;
-    for (var s = 0; s < 26; s = s + 1) {
-        if (c.x < 0 || c.x > 7 || c.y < 0 || c.y > 7 || c.z < 0 || c.z > 7) { break; }
+    for (var s = 0; s < 52; s = s + 1) {
+        if (c.x < 0 || c.x > 15 || c.y < 0 || c.y > 15 || c.z < 0 || c.z > 15) { break; }
         if (t_cur > t_out) { break; }
         if (micro_tuft_bit(variant, c.x, c.y, c.z)) {
             // Face-local UV for the cutout pattern.
-            let pm = (o_s + d_s * (t_cur + eps)) * 8.0;
+            let pm = (o_s + d_s * (t_cur + eps)) * 16.0;
             var uv = vec2<f32>(fract(pm.x), fract(pm.y));
             if (axis == 0) { uv = vec2<f32>(fract(pm.z), fract(pm.y)); }
             if (axis == 2) { uv = vec2<f32>(fract(pm.x), fract(pm.y)); }
             if (axis == 1) { uv = vec2<f32>(fract(pm.x), fract(pm.z)); }
-            let fy = (f32(c.y) + 0.5) / 8.0;
+            let fy = (f32(c.y) + 0.5) / 16.0;
             var hole = false;
             if (is_bush) {
                 // Round leaf holes: one lottery per 4x4 uv patch per cell.
@@ -2016,7 +2016,7 @@ fn tuft_volume_march(
                 out.t = t_cur;
                 // Crown light: a cell with open sky above is a tip - the
                 // bright accent detail lives in the voxels themselves.
-                let tip = c.y >= 7 || !micro_tuft_bit(variant, c.x, c.y + 1, c.z);
+                let tip = c.y >= 15 || !micro_tuft_bit(variant, c.x, c.y + 1, c.z);
                 var tip_mul = 1.0;
                 if (tip && !is_bush) { tip_mul = 1.15; }
                 var n = vec3<f32>(0.0, 1.0, 0.0);
