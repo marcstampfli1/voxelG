@@ -772,7 +772,7 @@ impl Renderer {
         let grass_bgl = create_grass_bgl(&device);
         let grass_pipelines = create_grass_pipelines(&device, &grass_bgl);
         let (_grass_depth_tex, grass_depth_view) = create_grass_depth(&device, width, height);
-        let grass_bg = make_grass_bg(&device, &grass_bgl, &camera_buf, &grass_cells_buf, &depth_view, &light_out_view);
+        let grass_bg = make_grass_bg(&device, &grass_bgl, &camera_buf, &grass_cells_buf, &depth_view, &light_out_view, &geom_view);
 
         let godray_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("godray pipeline"),
@@ -1186,7 +1186,7 @@ impl Renderer {
         self.post_bg_final = make_post_bg(&self.device, &self.post_bgl, &self.camera_buf, &self.output_view, &self.bloom_a_view, &self.bloom_b_view, &self.ldr_view, &self.sampler);
         self.grass_bg = make_grass_bg(
             &self.device, &self.grass_bgl, &self.camera_buf, &self.grass_cells_buf,
-            &self.depth_view, &self.light_out_view,
+            &self.depth_view, &self.light_out_view, &self.geom_view,
         );
 
         self.compute_bg = make_compute_bg(
@@ -2310,6 +2310,16 @@ fn create_grass_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 },
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
         ],
     })
 }
@@ -2389,6 +2399,7 @@ fn make_grass_bg(
     cells_buf: &wgpu::Buffer,
     depth_view: &wgpu::TextureView,
     light_view: &wgpu::TextureView,
+    geom_view: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("grass bg"),
@@ -2398,6 +2409,7 @@ fn make_grass_bg(
             wgpu::BindGroupEntry { binding: 1, resource: cells_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(depth_view) },
             wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(light_view) },
+            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(geom_view) },
         ],
     })
 }
@@ -3345,7 +3357,7 @@ mod gpu_render_tests {
                     off += n as u32;
                 }
                 let (_gdt, gdv) = create_grass_depth(&device, w, h);
-                let grass_bg = make_grass_bg(&device, &grass_bgl, &camera_buf, &cells_buf, &depth_view, &light_out_view);
+                let grass_bg = make_grass_bg(&device, &grass_bgl, &camera_buf, &cells_buf, &depth_view, &light_out_view, &geom_view);
                 let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("test grass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {

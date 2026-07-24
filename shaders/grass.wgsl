@@ -25,6 +25,10 @@ struct GrassCell {
 @group(0) @binding(1) var<storage, read> cells: array<GrassCell>;
 @group(0) @binding(2) var scene_depth: texture_2d<f32>;
 @group(0) @binding(3) var light_cache: texture_2d<f32>;
+// The raymarched terrain colour (geometry buffer, pre-compose): the source
+// blades INHERIT their base colour from - the exact lit ground the player
+// sees at the blade's root, texture + shadow + AO + GI included.
+@group(0) @binding(4) var terrain_color: texture_2d<f32>;
 
 override GRASS_BLADES: u32 = 24u;
 override GRASS_SEGS: u32 = 4u;
@@ -110,22 +114,17 @@ struct VsOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) uv: vec2<f32>,          // x: side -1..1, y: height 0..1 along blade
     @location(1) view_t: f32,
-    // Interpolated (NOT flat): the tangent follows the Bezier per vertex, so
-    // shading bends smoothly along the blade - flat interpolation carved
-    // every quad into one constant facet (the paper-fold look).
-    @location(2) tangent: vec3<f32>,
-    @location(3) wide3: vec3<f32>,
-    @location(4) @interpolate(flat) albedo0: vec3<f32>, // root colour
-    @location(5) @interpolate(flat) albedo1: vec3<f32>, // tip colour
-    // Sward-depth term: short blades under tall neighbours sit in the dark
-    // interior of the grass volume (the GoT depth look).
-    @location(6) @interpolate(flat) blade_ao: f32,
-    // The blade ROOT's screen position: the light cache must be sampled
-    // where the blade grows, not where its fragment lands - a fragment's
-    // own texel holds the shadow of whatever terrain is BEHIND it, and
-    // reading that painted the background's shadow pattern through every
-    // blade body.
-    @location(7) @interpolate(flat) root_px: vec2<f32>,
+    // Fallback base colour (palette carpet) for roots whose ground pixel is
+    // occluded or off-screen; inherited terrain colour is the primary path.
+    @location(2) @interpolate(flat) albedo0: vec3<f32>,
+    // Shared tip lighten factor (whisper of per-blade spread).
+    @location(3) @interpolate(flat) tip_mul: f32,
+    // The blade ROOT's screen position and view distance: base colour and
+    // lighting are read from the terrain buffers where the blade GROWS,
+    // never where its fragment lands (a fragment's own texel belongs to
+    // whatever is behind it).
+    @location(4) @interpolate(flat) root_px: vec2<f32>,
+    @location(5) @interpolate(flat) root_dist: f32,
 };
 
 fn bez(cp0: vec3<f32>, cp1: vec3<f32>, cp2: vec3<f32>, t: f32) -> vec3<f32> {
@@ -231,32 +230,23 @@ fn vs_grass(@builtin(vertex_index) vid: u32,
     o.pos = vec4<f32>(ndc.x * z2, ndc.y * z2, 0.05, z2);
     o.uv = vec2<f32>(cs, t0);
     o.view_t = length(d2);
-    o.tangent = tang;
-    o.wide3 = wide3;
-    // Sward interior: a blade shorter than its neighbourhood's tall canopy
-    // lives in their shade. hfrac is the blade's height rank in the cell.
-    o.blade_ao = 0.94 + 0.06 * hfrac;
-    // Project the root to screen space for the light-cache lookup (same
-    // pinhole as the vertex path; jitter offset matches the cache's grid).
+    // Project the root to screen space (stable: no jitter - a jittered grid
+    // made the sampled texel alternate per frame, flickering the lighting).
     let rd = rootw - camera.origin;
     let rz = max(dot(rd, camera.forward), 0.05);
-    // NO jitter here: the jittered grid made the cache texel alternate per
-    // frame - visibly flickering shadows on every blade.
     let rndc = vec2<f32>(dot(rd, camera.right) / (rz * camera.tan_half_fov * aspect),
                          dot(rd, camera.up) / (rz * camera.tan_half_fov));
     o.root_px = vec2<f32>(rndc.x * 0.5 + 0.5, 0.5 - rndc.y * 0.5) * camera.resolution;
+    o.root_dist = length(rd);
 
-    // ---- colour: clump-coherent, root-dark -> tip-bright, dry skew ----
+    // Fallback carpet (only for occluded / off-screen roots): the palette
+    // green with the hill-scale hue drift - never per-blade variance.
     let ground = vec3<f32>(0.30, 0.65, 0.20); // palette[MAT_GRASS], SYNC renderer default_palette
-    // MACRO-CALM colour (the BotW/Genshin field principle): colour varies
-    // only at HILL scale - a ~30-voxel hue drift between two greens - never
-    // per blade or per clump. The field reads as one smooth gradient;
-    // blades contribute silhouette, not colour noise.
     let hue_t = vnoise3g(vec3<f32>(rootw.x * 0.033, 12.5, rootw.z * 0.033));
-    let carpet = ground * mix(vec3<f32>(1.02, 0.98, 0.85), vec3<f32>(1.22, 1.08, 0.62), hue_t);
-    o.albedo0 = carpet;
-    // Tip colour: shared lighten with only a whisper of per-blade spread.
-    o.albedo1 = carpet * (1.34 + (fract(bh * 23.0) - 0.5) * 0.10);
+    o.albedo0 = ground * mix(vec3<f32>(1.02, 0.98, 0.85), vec3<f32>(1.22, 1.08, 0.62), hue_t);
+    // ONE shared tip lighten - zero per-blade colour variance, exactly as
+    // the macro-calm description states.
+    o.tip_mul = 1.30;
     return o;
 }
 
@@ -272,38 +262,42 @@ fn fs_grass(in: VsOut) -> @location(0) vec4<f32> {
     if (in.view_t > scene_t + 0.02 + scene_t * 0.002) {
         discard;
     }
-    // Reuse the raymarch light cache: the packed shadow/AO of the surface
-    // behind this pixel - the ground the blade stands on. Grass shadows and
-    // ambient occlusion stay consistent with the world for free.
-    // SYNC: raymarch.wgsl pack_light_cache.
-    // 2x2 average: the cache stores single jittered penumbra samples that
-    // terrain smooths through TAA accumulation; blades read them directly,
-    // so average a quad to keep blade lighting temporally steady.
+
+    // ---- TERRAIN INHERITANCE (the BotW/Genshin field rule, exact) ----
+    // The blade's base colour IS the rendered ground at its root: sample
+    // the raymarch geometry buffer (texture + shadow + AO + GI already
+    // applied) at the root's screen position, 2x2 averaged. A texel only
+    // counts when its depth agrees with the root's distance - texels
+    // showing an occluder or the sky fall back to the palette carpet lit
+    // by the cached light terms. No relighting of the inherited colour:
+    // reconstruction is what drifted from the visible ground before.
     let rp = clamp(vec2<i32>(in.root_px), vec2<i32>(0), vec2<i32>(camera.resolution) - 2);
-    let lc0 = textureLoad(light_cache, rp, 0);
-    let lc1 = textureLoad(light_cache, rp + vec2<i32>(1, 0), 0);
-    let lc2 = textureLoad(light_cache, rp + vec2<i32>(0, 1), 0);
-    let lc3 = textureLoad(light_cache, rp + vec2<i32>(1, 1), 0);
-    let lc = lc0;
+    var inherited = vec3<f32>(0.0);
+    var w_inherit = 0.0;
     var shadow = 0.0;
     var ao = 0.0;
-    var valid = 0.0;
+    var w_light = 0.0;
     for (var k = 0; k < 4; k = k + 1) {
-        var c: vec4<f32>;
-        if (k == 0) { c = lc0; } else if (k == 1) { c = lc1; }
-        else if (k == 2) { c = lc2; } else { c = lc3; }
+        let off = vec2<i32>(k & 1, k >> 1);
+        let p2 = rp + off;
+        let d = textureLoad(scene_depth, p2, 0).r;
+        if (abs(d - in.root_dist) < 3.0) {
+            inherited += textureLoad(terrain_color, p2, 0).rgb;
+            w_inherit += 1.0;
+        }
+        // SYNC: raymarch.wgsl pack_light_cache.
+        let c = textureLoad(light_cache, p2, 0);
         let pw = bitcast<u32>(c.w);
-        // Sky / no-hit texels carry no cache - skip them.
-        if (pw == 0u || c.x >= 1e8) { continue; }
-        shadow += f32(pw >> 24u) / 255.0;
-        ao += f32((pw >> 16u) & 0xFFu) / 255.0;
-        valid += 1.0;
+        if (pw != 0u && c.x < 1e8) {
+            shadow += f32(pw >> 24u) / 255.0;
+            ao += f32((pw >> 16u) & 0xFFu) / 255.0;
+            w_light += 1.0;
+        }
     }
-    if (valid > 0.0) {
-        shadow /= valid;
-        ao /= valid;
+    if (w_light > 0.0) {
+        shadow /= w_light;
+        ao /= w_light;
     } else {
-        // Blade silhouetted against sky: fully exposed - lit, not black.
         shadow = 1.0;
         ao = 1.0;
     }
@@ -313,34 +307,36 @@ fn fs_grass(in: VsOut) -> @location(0) vec4<f32> {
     let sc = sun_color(s);
     let sblade = in.uv.y;
 
-    // MACRO-CALM shading: the field lights as ONE smooth surface - diffuse
-    // uses the terrain's up normal for every blade (no per-blade normal
-    // response, no sheen, no rim: those are micro noise), modulated only by
-    // the root's cached shadow/AO. Deliberate VALUE STEPS along the blade
-    // height replace the continuous gradient (the stylized-art rule):
-    // carpet -> mid step -> tip step, each a clean readable band.
-    let ndl = max(0.0, (s.y + 0.35) / 1.35);
-    let direct = sc * ndl * shadow * s_int;
-    let sky_f = 0.25 + 0.75 * s_int;
-    let ambient = (vec3<f32>(0.26, 0.33, 0.45) * ao
-                   + vec3<f32>(0.10, 0.15, 0.06)) * sky_f;
+    var base: vec3<f32>;
+    if (w_inherit > 0.0) {
+        base = inherited / w_inherit;
+    } else {
+        // Root ground not visible: palette carpet lit like flat ground by
+        // the cached terms (the closest reconstruction available).
+        let ndl = max(0.0, (s.y + 0.35) / 1.35);
+        let sky_f = 0.25 + 0.75 * s_int;
+        base = in.albedo0
+            * (sc * ndl * shadow * s_int
+               + (vec3<f32>(0.26, 0.33, 0.45) * ao + vec3<f32>(0.10, 0.15, 0.06)) * sky_f);
+    }
 
+    // Deliberate VALUE STEPS along the height on top of the inherited
+    // colour (the stylized-art rule: clean readable bands, not a smooth
+    // gradient): carpet -> mid band (+13%) -> tip band (shared lighten).
     let step_w = 0.03 + GRASS_CHUNKY * 0.02;
     let s1 = smoothstep(0.52 - step_w, 0.52 + step_w, sblade);
     let s2 = smoothstep(0.83 - step_w, 0.83 + step_w, sblade);
-    var alb = in.albedo0 * (1.0 + (0.13 + GRASS_CHUNKY * 0.07) * s1);
-    alb = mix(alb, in.albedo1, s2 * 0.9);
+    var col = base * (1.0 + (0.13 + GRASS_CHUNKY * 0.07) * s1);
+    col = mix(col, base * in.tip_mul, s2 * 0.9);
 
-    var col = alb * (direct + ambient);
-
-    // One field-level tip glow toward a low sun (macro term: identical
-    // response across the whole field).
+    // Field-level tip glow toward a low sun (one shared response across
+    // the whole field - kept by request: the glow reads as backlit tips).
     let res = camera.resolution;
-    let ndc = vec2<f32>((in.pos.x / res.x) * 2.0 - 1.0, 1.0 - (in.pos.y / res.y) * 2.0);
-    let aspect = res.x / res.y;
+    let gndc = vec2<f32>((in.pos.x / res.x) * 2.0 - 1.0, 1.0 - (in.pos.y / res.y) * 2.0);
+    let aspect_g = res.x / res.y;
     let vdir2 = normalize(camera.forward
-        + camera.right * ndc.x * camera.tan_half_fov * aspect
-        + camera.up * ndc.y * camera.tan_half_fov);
+        + camera.right * gndc.x * camera.tan_half_fov * aspect_g
+        + camera.up * gndc.y * camera.tan_half_fov);
     if (s_int > 0.0) {
         let back = pow(max(0.0, dot(vdir2, s)), 5.0) * clamp(1.2 - s.y * 1.2, 0.0, 1.0);
         col = col + sc * shadow * back * 0.22 * vec3<f32>(0.70, 0.95, 0.35)
