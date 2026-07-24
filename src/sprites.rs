@@ -844,7 +844,7 @@ pub fn encoded() -> Vec<u32> {
                 // columns stay short, a few spike tall - so occupancy
                 // thins naturally with height and the top is open spikes.
                 let lot = h32(var as u32, x, z);
-                let p_col = 0.92 - r * 0.9;
+                let p_col = 0.80 - r * 0.9;
                 if lot >= p_col {
                     continue;
                 }
@@ -879,26 +879,32 @@ pub fn encoded() -> Vec<u32> {
     // profile, ragged rim - denser than the tussocks (a bush is a mass of
     // leaves; the airiness comes from the cutout faces, not from holes in
     // the volume).
+    // Bush domes (variants 3..5): SAME language as the tussocks - pure
+    // ragged voxels, shape and tone carrying the read - just leafier: a
+    // rounded dome with strongly jittered surface and rim, floating on a
+    // stem waist.
     for var in 3..N_MICRO_TUFTS {
         for z in 0..16u32 {
             for x in 0..16u32 {
                 let dx = (x as f32 + 0.5) / 16.0 - 0.5;
                 let dz = (z as f32 + 0.5) / 16.0 - 0.5;
                 let r = (dx * dx + dz * dz).sqrt();
-                let rag = 0.88 + 0.24 * h32(var as u32 + 11, x, z);
+                let rag = 0.80 + 0.40 * h32(var as u32 + 11, x, z);
                 if r > 0.48 * rag {
                     continue;
                 }
-                // Dome: tall centre, low rim, ground clearance toward the
-                // rim so the silhouette reads as a rounded bush on a stem.
                 let rn = (r / 0.48).min(1.0);
-                let dome_h = (1.0 - rn * rn).sqrt() * 13.0 + 2.0;
+                // Ragged dome: the surface height jitters per column, so
+                // the crown is bumpy leaf clusters, not a smooth shell.
+                let dome_h = (1.0 - rn * rn).max(0.0).sqrt()
+                    * (10.0 + h32(var as u32 + 19, x, z) * 5.5)
+                    + 1.0;
                 let y0 = if rn < 0.30 {
                     0u32
-                } else if rn < 0.62 {
+                } else if rn < 0.60 {
                     2u32
                 } else {
-                    4u32
+                    3u32
                 };
                 for y in y0..16u32 {
                     if (y as f32) >= dome_h {

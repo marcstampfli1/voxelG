@@ -1993,32 +1993,17 @@ fn tuft_volume_march(
         if (c.x < 0 || c.x > 15 || c.y < 0 || c.y > 15 || c.z < 0 || c.z > 15) { break; }
         if (t_cur > t_out) { break; }
         if (micro_tuft_bit(variant, c.x, c.y, c.z)) {
-            // Face-local UV for the cutout pattern.
-            let pm = (o_s + d_s * (t_cur + eps)) * 16.0;
-            var uv = vec2<f32>(fract(pm.x), fract(pm.y));
-            if (axis == 0) { uv = vec2<f32>(fract(pm.z), fract(pm.y)); }
-            if (axis == 2) { uv = vec2<f32>(fract(pm.x), fract(pm.y)); }
-            if (axis == 1) { uv = vec2<f32>(fract(pm.x), fract(pm.z)); }
             let fy = (f32(c.y) + 0.5) / 16.0;
-            var hole = false;
-            if (is_bush) {
-                // Round leaf holes: one lottery per 4x4 uv patch per cell.
-                let u4 = vec2<u32>(uv * 4.0);
-                let hh = hash3f(voxel_min + vec3<f32>(f32(c.x * 4 + i32(u4.x)) * 0.37 + 5.1,
-                                                      f32(c.y) * 0.53 + 6.2,
-                                                      f32(c.z * 4 + i32(u4.y)) * 0.71 + 7.3));
-                hole = hh < 0.28;
-            }
-            // Grass: solid faces - shape carries the read (dense base,
-            // sparse spike top); cutouts are a bush-only device.
-            if (!hole) {
+            // Solid faces for both families: shape and quantized tone carry
+            // the read; cutouts are retired.
+            {
                 out.hit = true;
                 out.t = t_cur;
                 // Crown light: a cell with open sky above is a tip - the
                 // bright accent detail lives in the voxels themselves.
                 let tip = c.y >= 15 || !micro_tuft_bit(variant, c.x, c.y + 1, c.z);
                 var tip_mul = 1.0;
-                if (tip && !is_bush) { tip_mul = 1.15; }
+                if (tip) { tip_mul = select(1.10, 1.15, !is_bush); }
                 var n = vec3<f32>(0.0, 1.0, 0.0);
                 if (axis == 0) { n = vec3<f32>(-f32(step_i.x), 0.0, 0.0); }
                 if (axis == 2) { n = vec3<f32>(0.0, 0.0, -f32(step_i.z)); }
@@ -2028,7 +2013,8 @@ fn tuft_volume_march(
                 let mh = hash3f(voxel_min + vec3<f32>(f32(c.x) * 0.37 + 1.1,
                                                       f32(c.y) * 0.53 + 2.3,
                                                       f32(c.z) * 0.71 + 3.7));
-                out.tone = select(select(1.0, 1.08, mh > 0.66), 0.92, mh < 0.33) * tip_mul;
+                let spread = select(0.08, 0.13, is_bush);
+                out.tone = (1.0 + select(select(0.0, spread, mh > 0.66), -spread, mh < 0.33)) * tip_mul;
                 return out;
             }
         }
@@ -2150,10 +2136,8 @@ fn bush_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>) -> SubHit {
     let wind = wind_offset(voxel_min, phase, 0.18);
     let lean = clamp(wind, vec2<f32>(-0.15), vec2<f32>(0.15));
 
-    let vol = tuft_volume_march(voxel_min, origin, dir, variant, lean, true);
-    let card = tuft_card_hit(voxel_min, origin, dir, 0u, true, wind, vh);
-    var h: TuftHit = vol;
-    if (card.hit && (!vol.hit || card.t < vol.t)) { h = card; }
+    // Volume only, like the tussocks: one visual family, no card faces.
+    let h = tuft_volume_march(voxel_min, origin, dir, variant, lean, true);
     if (!h.hit) { return out; }
 
     // Leafy tint: coupled toward the leaf palette, gentle top-light ramp.
