@@ -3339,8 +3339,10 @@ mod gpu_render_tests {
         }
         // Grass blade field: scan the test world around the camera (wide
         // fixed y-range covers hand-built lab platforms) and draw exactly
-        // like the live renderer does between compose and TAA.
-        if draw_grass {
+        // like the live renderer does between compose and TAA. The carpet
+        // is parked live (VOXELG_RASTER_GRASS opts in), and the harness
+        // honours the same flag so stills show what the game shows.
+        if draw_grass && std::env::var("VOXELG_RASTER_GRASS").is_ok() {
             let mut field = crate::grass::GrassField::new();
             let cy = cam.pos.y as i32;
             field.maybe_rebuild(world, cam.pos, Some((cy - 48, cy + 16)));
