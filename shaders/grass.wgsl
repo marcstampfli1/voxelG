@@ -281,14 +281,18 @@ fn fs_grass(in: VsOut) -> @location(0) vec4<f32> {
     // showing an occluder or the sky fall back to the palette carpet lit
     // by the cached light terms. No relighting of the inherited colour:
     // reconstruction is what drifted from the visible ground before.
-    let rp = clamp(vec2<i32>(in.root_px), vec2<i32>(0), vec2<i32>(camera.resolution) - 2);
+    // 3x3 depth-validated average: the geometry buffer carries THIS frame's
+    // raw jittered shadow samples (terrain smooths them through TAA, blades
+    // cannot on coverage flips) - spatial averaging stands in for the
+    // temporal averaging blades don't get, or moving-camera shadows jitter.
+    let rp = clamp(vec2<i32>(in.root_px), vec2<i32>(1), vec2<i32>(camera.resolution) - 2);
     var inherited = vec3<f32>(0.0);
     var w_inherit = 0.0;
     var shadow = 0.0;
     var ao = 0.0;
     var w_light = 0.0;
-    for (var k = 0; k < 4; k = k + 1) {
-        let off = vec2<i32>(k & 1, k >> 1);
+    for (var k = 0; k < 9; k = k + 1) {
+        let off = vec2<i32>(k % 3 - 1, k / 3 - 1);
         let p2 = rp + off;
         let d = textureLoad(scene_depth, p2, 0).r;
         if (abs(d - in.root_dist) < 3.0) {
@@ -340,8 +344,13 @@ fn fs_grass(in: VsOut) -> @location(0) vec4<f32> {
     let step_w = 0.03 + GRASS_CHUNKY * 0.02;
     let s1 = smoothstep(0.52 - step_w, 0.52 + step_w, band);
     let s2 = smoothstep(0.83 - step_w, 0.83 + step_w, band);
-    let tip_mul = mix(in.tip_mul, 1.16, GRASS_CHUNKY);
-    var col = base * (1.0 + (0.13 - GRASS_CHUNKY * 0.03) * s1);
+    // Lightening follows the sun: a tip only brightens where its ground is
+    // actually lit (gate by the root shadow term). Ungated lightening made
+    // shaded canopies float brighter than their terrain and pushed sunlit
+    // tips over the bloom knee - grass that visibly emitted light.
+    let lg = 0.30 + 0.70 * shadow;
+    let tip_mul = 1.0 + (mix(min(in.tip_mul, 1.22), 1.12, GRASS_CHUNKY) - 1.0) * lg;
+    var col = base * (1.0 + (0.13 - GRASS_CHUNKY * 0.03) * s1 * lg);
     col = mix(col, base * tip_mul, s2 * 0.9);
 
     // Field-level tip glow toward a low sun (one shared response across
@@ -354,7 +363,7 @@ fn fs_grass(in: VsOut) -> @location(0) vec4<f32> {
         + camera.up * gndc.y * camera.tan_half_fov);
     if (s_int > 0.0) {
         let back = pow(max(0.0, dot(vdir2, s)), 5.0) * clamp(1.2 - s.y * 1.2, 0.0, 1.0);
-        col = col + sc * shadow * back * 0.22 * vec3<f32>(0.70, 0.95, 0.35)
+        col = col + sc * shadow * back * 0.15 * vec3<f32>(0.70, 0.95, 0.35)
             * smoothstep(0.6, 1.0, band);
     }
 
