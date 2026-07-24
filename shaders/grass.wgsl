@@ -29,6 +29,7 @@ struct GrassCell {
 // blades INHERIT their base colour from - the exact lit ground the player
 // sees at the blade's root, texture + shadow + AO + GI included.
 @group(0) @binding(4) var terrain_color: texture_2d<f32>;
+@group(0) @binding(5) var lin_sampler: sampler;
 
 override GRASS_BLADES: u32 = 24u;
 override GRASS_SEGS: u32 = 4u;
@@ -281,25 +282,34 @@ fn fs_grass(in: VsOut) -> @location(0) vec4<f32> {
     // showing an occluder or the sky fall back to the palette carpet lit
     // by the cached light terms. No relighting of the inherited colour:
     // reconstruction is what drifted from the visible ground before.
-    // 3x3 depth-validated average: the geometry buffer carries THIS frame's
-    // raw jittered shadow samples (terrain smooths them through TAA, blades
-    // cannot on coverage flips) - spatial averaging stands in for the
-    // temporal averaging blades don't get, or moving-camera shadows jitter.
-    let rp = clamp(vec2<i32>(in.root_px), vec2<i32>(1), vec2<i32>(camera.resolution) - 2);
+    // Motion-stable root lookup. The projected root SLIDES across the
+    // screen while the camera moves: nearest-texel reads snap from texel to
+    // texel (steppy) and the geometry buffer re-renders each frame under
+    // sub-pixel ray jitter (wobbly). BILINEAR samples at the exact
+    // fractional position vary continuously as the lookup slides, and a
+    // 5-tap cross (+-2 px) averages the per-frame jitter noise the way TAA
+    // does for terrain pixels. Each tap is depth-validated at its centre.
+    let resf = camera.resolution;
+    let rpx = clamp(in.root_px, vec2<f32>(2.5), resf - 2.5);
     var inherited = vec3<f32>(0.0);
     var w_inherit = 0.0;
     var shadow = 0.0;
     var ao = 0.0;
     var w_light = 0.0;
-    for (var k = 0; k < 9; k = k + 1) {
-        let off = vec2<i32>(k % 3 - 1, k / 3 - 1);
-        let p2 = rp + off;
+    for (var k = 0; k < 5; k = k + 1) {
+        var off = vec2<f32>(0.0);
+        if (k == 1) { off = vec2<f32>(2.0, 0.0); }
+        if (k == 2) { off = vec2<f32>(-2.0, 0.0); }
+        if (k == 3) { off = vec2<f32>(0.0, 2.0); }
+        if (k == 4) { off = vec2<f32>(0.0, -2.0); }
+        let sp = rpx + off;
+        let p2 = vec2<i32>(sp);
         let d = textureLoad(scene_depth, p2, 0).r;
         if (abs(d - in.root_dist) < 3.0) {
-            inherited += textureLoad(terrain_color, p2, 0).rgb;
+            inherited += textureSampleLevel(terrain_color, lin_sampler, sp / resf, 0.0).rgb;
             w_inherit += 1.0;
         }
-        // SYNC: raymarch.wgsl pack_light_cache.
+        // SYNC: raymarch.wgsl pack_light_cache (packed bits: nearest unpack).
         let c = textureLoad(light_cache, p2, 0);
         let pw = bitcast<u32>(c.w);
         if (pw != 0u && c.x < 1e8) {
