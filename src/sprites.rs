@@ -87,8 +87,14 @@ atlas_consts! {
     SPR_FLOWER_CENTER = 21;
     /// Thin centre-column stem with leaf nubs (columns 7-8, mirror-safe).
     SPR_STEM = 22;
+    /// Fluffy grass tussocks (docs/FLORA_PLAN.md, voxel patches): dense
+    /// full-bodied pixel-art masses with ragged crowns - variant pick is
+    /// `SPR_TUFT_A + n`.
+    SPR_TUFT_A = 23;
+    SPR_TUFT_B = 24;
+    SPR_TUFT_C = 25;
     /// Number of 16x16 sprites in the atlas.
-    N_SPRITES = 23;
+    N_SPRITES = 26;
     /// Word offset of the first 32x32 tuft (after the 16x16 sprites).
     TUFT_BASE_WORDS = N_SPRITES * SPRITE_WORDS;
     /// Better Leaves tuft indices: tuft i lives at word
@@ -567,6 +573,65 @@ const ART: [[&str; SPRITE_DIM]; N_SPRITES] = [
         ".......##.......",
         ".......##.......",
         ".......##.......",
+    ],
+    // SPR_TUFT_A - fluffy tussock: dense full body, bulging middle, ragged
+    // crown. '#' body, 'o' inner-shadow texels, '*' crown highlights. Every
+    // pixel orthogonally connected (floaters read as escaping squares).
+    [
+        "......*...*.....",
+        "....*.#..*#.....",
+        "....#.##.##..*..",
+        "...*#####*##.#..",
+        "...#########*#..",
+        "..*##########...",
+        "..############..",
+        ".##############.",
+        ".####o#####o###.",
+        "###o#####o#####.",
+        "##o###o###o####.",
+        "################",
+        "###o####o###o###",
+        "##o###o####o####",
+        "################",
+        "################",
+    ],
+    // SPR_TUFT_B - broader crown, twin peaks.
+    [
+        "...*......*.....",
+        "..*#..*..#*.....",
+        "..##.*##.##.....",
+        "..###*####*#..*.",
+        ".############.#.",
+        ".*#############.",
+        ".##############.",
+        "################",
+        "####o######o####",
+        "##o#####o#######",
+        "###o###o###o####",
+        "################",
+        "##o####o####o###",
+        "####o######o####",
+        "################",
+        "################",
+    ],
+    // SPR_TUFT_C - narrower, taller centre peak.
+    [
+        ".......*.#*.....",
+        "......#.##......",
+        "....*.####.*....",
+        "....#*#######...",
+        "....########....",
+        "...##########*..",
+        "..############..",
+        ".##############.",
+        ".####o#####o###.",
+        "####o####o######",
+        "##o####o###o####",
+        "################",
+        "###o###o####o###",
+        "##o#####o###o###",
+        "################",
+        "################",
     ],
 ];
 

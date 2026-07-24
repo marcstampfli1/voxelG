@@ -1397,7 +1397,7 @@ pub fn gen_slot_bricks(world_chunk: glam::IVec3, seed: u64) -> Vec<Brick> {
                     let v = h * 0.5 + 0.5; // 0..1
                     let dec_mat = match surface_top {
                         MAT_GRASS => {
-                            let (mut fp, gp) = biome.flora_probs();
+                            let (mut fp, mut gp) = biome.flora_probs();
                             // Meadow patches: low-frequency noise clusters the
                             // flowers into wildflower fields instead of a
                             // uniform sprinkle.
@@ -1407,7 +1407,11 @@ pub fn gen_slot_bricks(world_chunk: glam::IVec3, seed: u64) -> Vec<Brick> {
                                 2,
                             ) > 0.30;
                             if meadow {
+                                // Tussock patches: meadow regions grow
+                                // clustered tuft fields, elsewhere stays
+                                // sparse - patches, not a carpet.
                                 fp *= 3.0;
+                                gp *= 8.0;
                             }
                             if v > 1.0 - fp {
                                 MAT_FLOWER

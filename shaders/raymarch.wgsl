@@ -1933,6 +1933,79 @@ fn turf_blade_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>) -> SubHit
     return out;
 }
 
+// Fluffy voxel tussock (the "voxel patches" style): FOUR full-cell tuft
+// cards - two X pairs yaw-offset ~35 degrees - each carrying a dense
+// ragged pixel-art tuft sprite, wind-sheared together. The card cloud
+// overlaps into one soft volumetric mass (the Better-Leaves recipe applied
+// to grass). Tint follows the carpet rules: bright shared base coupled to
+// the ground palette, quantized value steps by height, zero per-cell
+// colour lotteries; sun/shadow/AO arrive through shade() like any voxel.
+fn grass_tuft_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>) -> SubHit {
+    var out: SubHit;
+    out.hit = false;
+    out.color_tint = vec3<f32>(1.0);
+    let voxel_min = vec3<f32>(f32(voxel.x), f32(voxel.y), f32(voxel.z));
+    let vh = hash3f(voxel_min);
+    let voxel_center = voxel_min + vec3<f32>(0.5);
+    let sprite = SPR_TUFT_A + (u32(fract(vh * 8.0) * 3.0) % 3u);
+    let hs = 0.85 + fract(vh * 4.0) * 0.15; // near-even canopy: field, not solo
+    let phase = voxel_min.x * 0.40 + voxel_min.z * 0.55 + vh * 6.28;
+    let wind = wind_offset(voxel_min, phase, 0.30);
+    // Two X pairs: base yaw from the cell hash, second pair offset ~35 deg.
+    let a0 = fract(vh * 16.0) * 3.1416;
+    var best_t: f32 = 1e30;
+    var best_n = vec3<f32>(0.0, 1.0, 0.0);
+    var tint = vec3<f32>(1.0);
+    for (var i: i32 = 0; i < 4; i = i + 1) {
+        let ang = a0 + f32(i) * 0.7854 + f32(i & 1) * 0.35;
+        let ca = cos(ang);
+        let sa = sin(ang);
+        let pn = vec3<f32>(-sa, 0.0, ca);
+        let pt = vec3<f32>(ca, 0.0, sa);
+        let denom = dot(dir, pn);
+        if (abs(denom) < 1e-4) { continue; }
+        let t = dot(voxel_center - origin, pn) / denom;
+        if (t < 0.0 || t >= best_t) { continue; }
+        let p_hit = origin + dir * t;
+        let local = p_hit - voxel_min;
+        if (local.x < 0.0 || local.x > 1.0
+         || local.y < 0.0 || local.y > 1.0
+         || local.z < 0.0 || local.z > 1.0) { continue; }
+        let v = local.y;
+        if (v > hs) { continue; }
+        let vn = v / hs;
+        // Shared wind shear in world space (both pairs move together).
+        let sx = local.x - wind.x * v;
+        let sz = local.z - wind.y * v;
+        let s_w = (sx - 0.5) * pt.x + (sz - 0.5) * pt.z;
+        let u = clamp(s_w + 0.5, 0.0, 0.99999);
+        let val = sprite_texel(sprite, u32(u * 16.0) & 15u,
+                               u32(clamp(vn * 16.0, 0.0, 15.0)));
+        if (val == 0u) { continue; }
+        best_t = t;
+        best_n = select(pn, -pn, denom > 0.0);
+        // Carpet rules: bright shared base coupled toward the ground
+        // palette, one mid step and a top band by height, texel tones as
+        // gentle inner shadow ('o') and crown light ('*').
+        let ground = mix(vec3<f32>(1.0),
+                         palette[MAT_GRASS].rgb / max(palette[MAT_TALL_GRASS].rgb, vec3<f32>(1e-3)),
+                         0.6);
+        let s1 = smoothstep(0.48, 0.56, vn);
+        let s2 = smoothstep(0.80, 0.88, vn);
+        var b = (0.95 + 0.13 * s1 + 0.14 * s2)
+            * select(1.0, 0.88, val == 2u)
+            * select(1.0, 1.12, val == 3u);
+        tint = vec3<f32>(b) * ground;
+    }
+    if (best_t < 1e30) {
+        out.hit = true;
+        out.t_hit = best_t;
+        out.normal = best_n;
+        out.color_tint = tint;
+    }
+    return out;
+}
+
 fn foliage_subvoxel(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32) -> SubHit {
     var hit: SubHit;
     if (mat == MAT_TURF) {
@@ -1948,10 +2021,10 @@ fn foliage_subvoxel(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u3
         }
         return hit;
     }
-    if (mat == MAT_TALL_GRASS || mat == MAT_TALL_GRASS_DRY) {
-        // Crossed quads at every distance: the card-tussock near tier was
-        // superseded by the raster blade field (rejected on look); sprites
-        // are the voxel-native look at all ranges.
+    if (mat == MAT_TALL_GRASS) {
+        // Fluffy tussock card-cloud (voxel patches over the raster carpet).
+        hit = grass_tuft_hit(voxel, origin, dir);
+    } else if (mat == MAT_TALL_GRASS_DRY) {
         hit = sprite_cross_hit(voxel, origin, dir, mat);
     } else if (mat == MAT_FLOWER) {
         hit = sprite_cross_hit(voxel, origin, dir, mat);
