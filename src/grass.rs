@@ -25,7 +25,7 @@ pub const GRASS_LOD2_T: f32 = 90.0;
 /// larger, bolder shapes.
 pub fn lod_shape() -> [(u32, u32); 3] {
     if std::env::var("VOXELG_GRASS_CHUNKY").is_ok() {
-        [(20, 4), (12, 2), (6, 1)]
+        [(32, 4), (16, 2), (8, 1)]
     } else {
         [(80, 5), (42, 3), (20, 1)]
     }

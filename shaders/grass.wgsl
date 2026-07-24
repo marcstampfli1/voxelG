@@ -125,6 +125,11 @@ struct VsOut {
     // whatever is behind it).
     @location(4) @interpolate(flat) root_px: vec2<f32>,
     @location(5) @interpolate(flat) root_dist: f32,
+    // World height of the fragment and of the ground: the chunky style
+    // draws its value bands at shared WORLD heights, so the strata run as
+    // one horizontal field surface instead of per-blade gradients.
+    @location(6) wy: f32,
+    @location(7) @interpolate(flat) gy: f32,
 };
 
 fn bez(cp0: vec3<f32>, cp1: vec3<f32>, cp2: vec3<f32>, t: f32) -> vec3<f32> {
@@ -168,7 +173,10 @@ fn vs_grass(@builtin(vertex_index) vid: u32,
 
     let fa = clump_ang + (fract(bh * 5.0) - 0.5) * 1.5;
     let fdir = vec2<f32>(cos(fa), sin(fa));
-    let hfrac = 0.55 + 0.45 * fract(bh * 3.0);
+    var hfrac = 0.55 + 0.45 * fract(bh * 3.0);
+    // Chunky field: heights pull toward one even canopy level - an even
+    // surface is what reads as a FIELD instead of individual shapes.
+    hfrac = mix(hfrac, 0.88, GRASS_CHUNKY * 0.55);
     let h = field * clump_h * hfrac * (1.02 + GRASS_CHUNKY * 0.18);
     let curve = 0.16 + 0.30 * fract(bh * 13.0);
     // Wind bends the CURVE (control points), not the whole blade rigidly.
@@ -200,7 +208,7 @@ fn vs_grass(@builtin(vertex_index) vid: u32,
     let spike = 1.0 - t0 * 0.98;
     let paddle = 1.0 - pow(t0, 2.2) * 0.92;
     let plump = mix(spike, paddle, GRASS_CHUNKY);
-    var hw = 0.036 * (1.0 + GRASS_CHUNKY * 1.6) * GRASS_WIDTH_MUL
+    var hw = 0.036 * (1.0 + GRASS_CHUNKY * 1.15) * GRASS_WIDTH_MUL
         * (0.8 + 0.4 * fract(bh * 17.0)) * plump;
 
     let wp0 = p + wide3 * hw * cs;
@@ -230,6 +238,8 @@ fn vs_grass(@builtin(vertex_index) vid: u32,
     o.pos = vec4<f32>(ndc.x * z2, ndc.y * z2, 0.05, z2);
     o.uv = vec2<f32>(cs, t0);
     o.view_t = length(d2);
+    o.wy = wp.y;
+    o.gy = rootw.y;
     // Project the root to screen space (stable: no jitter - a jittered grid
     // made the sampled texel alternate per frame, flickering the lighting).
     let rd = rootw - camera.origin;
@@ -323,11 +333,16 @@ fn fs_grass(in: VsOut) -> @location(0) vec4<f32> {
     // Deliberate VALUE STEPS along the height on top of the inherited
     // colour (the stylized-art rule: clean readable bands, not a smooth
     // gradient): carpet -> mid band (+13%) -> tip band (shared lighten).
+    // Band coordinate: per-blade height for spikes, shared WORLD height
+    // for the chunky style - strata as one horizontal field surface.
+    let hband = clamp((in.wy - in.gy) / 1.05, 0.0, 1.0);
+    let band = mix(sblade, hband, GRASS_CHUNKY);
     let step_w = 0.03 + GRASS_CHUNKY * 0.02;
-    let s1 = smoothstep(0.52 - step_w, 0.52 + step_w, sblade);
-    let s2 = smoothstep(0.83 - step_w, 0.83 + step_w, sblade);
-    var col = base * (1.0 + (0.13 + GRASS_CHUNKY * 0.07) * s1);
-    col = mix(col, base * in.tip_mul, s2 * 0.9);
+    let s1 = smoothstep(0.52 - step_w, 0.52 + step_w, band);
+    let s2 = smoothstep(0.83 - step_w, 0.83 + step_w, band);
+    let tip_mul = mix(in.tip_mul, 1.16, GRASS_CHUNKY);
+    var col = base * (1.0 + (0.13 - GRASS_CHUNKY * 0.03) * s1);
+    col = mix(col, base * tip_mul, s2 * 0.9);
 
     // Field-level tip glow toward a low sun (one shared response across
     // the whole field - kept by request: the glow reads as backlit tips).
@@ -340,7 +355,7 @@ fn fs_grass(in: VsOut) -> @location(0) vec4<f32> {
     if (s_int > 0.0) {
         let back = pow(max(0.0, dot(vdir2, s)), 5.0) * clamp(1.2 - s.y * 1.2, 0.0, 1.0);
         col = col + sc * shadow * back * 0.22 * vec3<f32>(0.70, 0.95, 0.35)
-            * smoothstep(0.6, 1.0, sblade);
+            * smoothstep(0.6, 1.0, band);
     }
 
     // Fog toward the horizon haze so far grass melts into the fogged
