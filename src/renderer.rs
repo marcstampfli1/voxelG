@@ -33,6 +33,23 @@ const GI_PROBE_UPDATE_DIV: u32 = 8;
 const GI_PROBE_DIR_EPOCHS: u32 = 8;
 const RT_PRIMARY_WGSL: &str = include_str!("../shaders/rt_primary.wgsl");
 
+/// The per-voxel light field update pass (docs/VOXEL_LIGHTING_PLAN.md).
+/// Concatenated LAST in both variants because it calls `shadow_occluded`,
+/// whose definition is the RT prelude in one variant and the software
+/// dispatcher appended after the render body in the other.
+const VOXLIGHT_UPDATE_WGSL: &str = include_str!("../shaders/voxlight_update.wgsl");
+
+/// Storage buffers the render layout binds in one compute stage. Named because
+/// it is requested at device creation in two places AND must cover what
+/// `create_compute_bgl` declares; a mismatch fails only at bind-group-layout
+/// creation, deep inside GPU test output, so the two must not drift.
+pub(crate) const COMPUTE_STORAGE_BUFFERS: u32 = 16;
+
+/// Light-field update amortization: 1/VOXLIGHT_UPDATE_DIV of the live blocks
+/// are re-gathered per frame, so the resident field refreshes every
+/// VOXLIGHT_UPDATE_DIV frames. Mirrors the probe grid's cadence.
+pub(crate) const VOXLIGHT_UPDATE_DIV: u32 = 8;
+
 /// Software dispatchers injected into the non-RT variant so the render body's
 /// `shadow_occluded(...)` and `indirect_light(...)` calls resolve to the
 /// pre-RT behaviour: occlusion forwards to the DDA `trace_any`, and there is no
@@ -56,7 +73,7 @@ const SHADOW_SW_WGSL: &str = concat!(
 pub(crate) fn raymarch_source_variant(rt: bool) -> String {
     if rt {
         format!(
-            "enable wgpu_ray_query;\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            "enable wgpu_ray_query;\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
             WORLD_CONSTS_WGSL,
             COMMON_WGSL,
             crate::sprites::wgsl_consts(),
@@ -66,15 +83,17 @@ pub(crate) fn raymarch_source_variant(rt: bool) -> String {
             GI_PROBES_WGSL,
             RT_PRIMARY_WGSL,
             include_str!("../shaders/raymarch.wgsl"),
+            VOXLIGHT_UPDATE_WGSL,
         )
     } else {
         format!(
-            "{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}",
             WORLD_CONSTS_WGSL,
             COMMON_WGSL,
             crate::sprites::wgsl_consts(),
             include_str!("../shaders/raymarch.wgsl"),
             SHADOW_SW_WGSL,
+            VOXLIGHT_UPDATE_WGSL,
         )
     }
 }
@@ -300,6 +319,15 @@ pub struct Renderer {
     compute_bgl: wgpu::BindGroupLayout,
     compute_pipeline: wgpu::ComputePipeline,
     compute_bg: wgpu::BindGroup,
+    /// Per-voxel light field: storage, the amortized update pass, and the round
+    /// counter that selects this frame's slice of the work list and its
+    /// direction epoch (docs/VOXEL_LIGHTING_PLAN.md).
+    vl: VoxLightBuffers,
+    voxlight_pipeline: wgpu::ComputePipeline,
+    voxlight_pipeline_rt: Option<wgpu::ComputePipeline>,
+    voxlight_round: u32,
+    /// Live block count from the last upload; the update dispatch size.
+    voxlight_live_count: u32,
     // Deferred transparent pass (#16): shares compute_bgl/compute_bg.
     transparent_pipeline: wgpu::ComputePipeline,
 
@@ -478,9 +506,11 @@ impl Renderer {
 
         let base_limits = wgpu::Limits {
             max_storage_buffer_binding_size: 256 << 20, // 256 MB headroom
-            // Compute pass binds 9 storage buffers (default cap is 8); the
-            // deferred-transparent record buffer pushed it over.
-            max_storage_buffers_per_shader_stage: 12,
+            // Group 0 binds 14 storage buffers (default cap is 8): the world
+            // pyramid and the deferred-transparent records took it past the
+            // default, and the per-voxel light field adds four more (pool,
+            // brick table, work list, point lights).
+            max_storage_buffers_per_shader_stage: COMPUTE_STORAGE_BUFFERS,
             ..wgpu::Limits::default()
         };
         // Hardware ray tracing is OPT-IN via VOXELG_RT and only when the adapter
@@ -749,24 +779,35 @@ impl Renderer {
             compilation_options: Default::default(),
             cache: None,
         });
+        // The light-field update shares the render module and layout: it reads
+        // the same world data and calls the same `shadow_occluded`.
+        let voxlight_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("voxlight update pipeline"),
+            layout: Some(&compute_pl),
+            module: &compute_shader,
+            entry_point: Some("cs_voxel_light_update"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
 
         // Main bind group: colour -> geom_tex, depth -> depth_tex; slots
         // 20/21 point at unrelated textures (history/beam) for usage-scope
         // cleanliness. Compose bind group: colour -> output_tex, reads
         // geom + depth, dummy in the depth-out slot.
+        let vl_bufs = VoxLightBuffers::new(&device);
         let compute_bg = make_compute_bg(
             &device, &compute_bgl, &camera_buf, &bricks_buf,
             &tile_mask_buf, &chunk_mask_buf, &palette_buf, &geom_view, &beam_view,
             &tile_dirty_buf, &players_buf, &brick_uniform_buf, &tile_uniform_buf, &l4_mask_buf,
             &cloud_sampled_view, &sampler, &light_hist_view, &light_out_view, &transp_buf,
-            &sprites_buf, &depth_view, &history_view, &beam_view,
+            &sprites_buf, &depth_view, &history_view, &beam_view, &vl_bufs,
         );
         let compose_bg = make_compute_bg(
             &device, &compute_bgl, &camera_buf, &bricks_buf,
             &tile_mask_buf, &chunk_mask_buf, &palette_buf, &output_view, &beam_view,
             &tile_dirty_buf, &players_buf, &brick_uniform_buf, &tile_uniform_buf, &l4_mask_buf,
             &cloud_sampled_view, &sampler, &light_hist_view, &light_out_view, &transp_buf,
-            &sprites_buf, &dummy_depth_view, &geom_view, &depth_view,
+            &sprites_buf, &dummy_depth_view, &geom_view, &depth_view, &vl_bufs,
         );
 
         let leaf_bg = make_leaf_bg(&device, &leaf_bgl, &camera_buf, &leaves_buf, &sprites_buf, &depth_view);
@@ -811,6 +852,10 @@ impl Renderer {
         // acceleration structure. cs_clouds needs no occlusion and stays
         // software. The accel + its group-1 bind group are built from the world
         // now and rebuilt when the world changes (see `world_accel_dirty`).
+        // The RT light-field update pipeline needs `rt_pl`/`rt_shader`, which
+        // are local to the branch below; bind it out here instead of widening
+        // that already-fifteen-wide tuple.
+        let mut voxlight_pipeline_rt: Option<wgpu::ComputePipeline> = None;
         let (
             world_accel,
             rt_bgl,
@@ -874,6 +919,9 @@ impl Renderer {
             let p_compose = mk("cs_compose", "compose pipeline (RT)");
             let p_transp = mk("cs_transparent", "transparent pipeline (RT)");
             let p_probe = mk("cs_gi_probe_update", "gi probe update (RT)");
+            // Assigned to the outer binding rather than threaded through the
+            // return tuple below, which is already fifteen elements wide.
+            voxlight_pipeline_rt = Some(mk("cs_voxel_light_update", "voxlight update (RT)"));
             log::info!("RT init: all 4 RT pipelines in {:.2}s total", t_pipe.elapsed().as_secs_f64());
             // Worker: owns nothing persistent; each job carries the spare set in
             // and back out. wgpu Device/Queue are internally refcounted.
@@ -1102,6 +1150,8 @@ impl Renderer {
             history_tex, history_view, resolve_tex, resolve_view, sampler,
             beam_bgl, beam_pipeline, beam_bg,
             compute_bgl, compute_pipeline, compute_bg,
+            vl: vl_bufs, voxlight_pipeline, voxlight_pipeline_rt,
+            voxlight_round: 0, voxlight_live_count: 0,
             rt_shadows, world_accel,
             rt_bgl, rt_bg, compute_pipeline_rt, compose_pipeline_rt, transparent_pipeline_rt,
             gi_probe_buf, gi_probe_pipeline, godray_pipeline, godray_pipeline_rt,
@@ -1192,13 +1242,16 @@ impl Renderer {
             &self.depth_view, &self.light_out_view, &self.geom_view, &self.sampler,
         );
 
+        // The light field is resolution-independent (it is world-space), so a
+        // resize rebinds the SAME buffers rather than reallocating 64 MiB and
+        // throwing away every converged record.
         self.compute_bg = make_compute_bg(
             &self.device, &self.compute_bgl, &self.camera_buf, &self.bricks_buf,
             &self.tile_mask_buf, &self.chunk_mask_buf, &self.palette_buf, &self.geom_view, &self.beam_view,
             &self.tile_dirty_buf, &self.players_buf, &self.brick_uniform_buf, &self.tile_uniform_buf,
             &self.l4_mask_buf, &self.cloud_sampled_view, &self.sampler,
             &self.light_hist_view, &self.light_out_view, &self.transp_buf,
-            &self.sprites_buf, &self.depth_view, &self.history_view, &self.beam_view,
+            &self.sprites_buf, &self.depth_view, &self.history_view, &self.beam_view, &self.vl,
         );
         self.compose_bg = make_compute_bg(
             &self.device, &self.compute_bgl, &self.camera_buf, &self.bricks_buf,
@@ -1206,7 +1259,7 @@ impl Renderer {
             &self.tile_dirty_buf, &self.players_buf, &self.brick_uniform_buf, &self.tile_uniform_buf,
             &self.l4_mask_buf, &self.cloud_sampled_view, &self.sampler,
             &self.light_hist_view, &self.light_out_view, &self.transp_buf,
-            &self.sprites_buf, &self.dummy_depth_view, &self.geom_view, &self.depth_view,
+            &self.sprites_buf, &self.dummy_depth_view, &self.geom_view, &self.depth_view, &self.vl,
         );
         self.cloud_bg = make_cloud_bg(
             &self.device, &self.cloud_bgl, &self.camera_buf, &self.cloud_storage_view,
@@ -1338,13 +1391,21 @@ impl Renderer {
             let tu = pack_u8_to_u32(&world.tile_uniform);
             self.queue.write_buffer(&self.brick_uniform_buf, 0, bytemuck::cast_slice(&bu));
             self.queue.write_buffer(&self.tile_uniform_buf, 0, bytemuck::cast_slice(&tu));
+            // Every brick is new, so bind the light shell from scratch.
+            world.sync_light_shell_all();
+            self.voxlight_live_count = upload_voxlight(&self.queue, &self.vl, world);
             world.all_dirty = false;
             world.dirty_bricks.clear();
             return;
         }
-        if world.dirty_bricks.is_empty() { return; }
         world.dirty_bricks.sort_unstable();
         world.dirty_bricks.dedup();
+        // Before the early-out below: streaming releases blocks through
+        // clear_slot_masks WITHOUT dirtying a brick, so the table can need an
+        // upload on a frame where no brick changed.
+        world.sync_light_shell_dirty();
+        self.voxlight_live_count = upload_voxlight(&self.queue, &self.vl, world);
+        if world.dirty_bricks.is_empty() { return; }
 
         // 1. Brick voxel data — coalesced contiguous spans (one DMA per run).
         let stride = std::mem::size_of::<Brick>() as u64;
@@ -1603,6 +1664,45 @@ impl Renderer {
                     cp.dispatch_workgroups((threads + 63) / 64, 1, 1);
                 }
             }
+            // ---- per-voxel light field update ----
+            // Runs BEFORE the raymarch so this frame shades against a field
+            // that already includes this frame's slice. wgpu inserts the
+            // storage-buffer barrier between the two compute passes.
+            if self.voxlight_live_count > 0 {
+                self.queue.write_buffer(
+                    &self.vl.params,
+                    0,
+                    bytemuck::bytes_of(&VoxLightParamsUniform {
+                        live_count: self.voxlight_live_count,
+                        round: self.voxlight_round,
+                        update_div: VOXLIGHT_UPDATE_DIV,
+                        sun_rays: 4,
+                        // Matches the penumbra width the per-pixel cone used,
+                        // so the soft-shadow LOOK is preserved while the
+                        // mechanism producing it changes.
+                        sun_cone: 0.07,
+                        light_count: 0,
+                        fold: 0.35,
+                        ao_strength: 0.85,
+                    }),
+                );
+                let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("voxlight update"),
+                    timestamp_writes: None,
+                });
+                if self.rt_shadows {
+                    cp.set_pipeline(self.voxlight_pipeline_rt.as_ref().unwrap());
+                    cp.set_bind_group(0, &self.compute_bg, &[]);
+                    cp.set_bind_group(1, &self.rt_bg.as_ref().unwrap()[gi_idx], &[]);
+                } else {
+                    cp.set_pipeline(&self.voxlight_pipeline);
+                    cp.set_bind_group(0, &self.compute_bg, &[]);
+                }
+                // One workgroup per block, one invocation per voxel.
+                let blocks = self.voxlight_live_count.div_ceil(VOXLIGHT_UPDATE_DIV);
+                cp.dispatch_workgroups(blocks, 1, 1);
+            }
+            self.voxlight_round = self.voxlight_round.wrapping_add(1);
             if let Some(pr) = &self.gpu_profiler { pr.stamp(&mut encoder, 3); }
             // ---- main raymarch (skips clean tiles in-shader) ----
             {
@@ -2528,8 +2628,107 @@ fn create_compute_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
             bgl_storage_tex(19, wgpu::TextureFormat::R32Float), // primary-hit depth out
             bgl_tex(20, false), // cs_compose: geometry colour in (main bg: history, unused)
             bgl_tex(21, false), // cs_compose: depth in (main bg: beam, unused)
+            // Per-voxel light field (docs/VOXEL_LIGHTING_PLAN.md). read_write
+            // because the update pass writes the pool through the same layout
+            // the render passes read it through; wgpu inserts the barrier
+            // between the two compute passes.
+            bgl_storage(22, false), // vl_pool: the light records
+            bgl_storage(23, true),  // vl_block_of_brick
+            bgl_storage(24, true),  // vl_live_bricks: the update work list
+            bgl_uniform(25),        // vl_params
+            bgl_storage(26, true),  // vl_lights: dynamic point lights
         ],
     })
+}
+
+/// GPU buffers backing the per-voxel light field.
+///
+/// Grouped in a struct rather than passed as five more positional arguments to
+/// `make_compute_bg`: that function already takes 22 interchangeable
+/// `&Buffer`/`&TextureView` parameters across ~15 call sites, and widening it
+/// further is how a binding silently ends up wired to the wrong resource.
+pub(crate) struct VoxLightBuffers {
+    pub pool: wgpu::Buffer,
+    pub block_of_brick: wgpu::Buffer,
+    pub live_bricks: wgpu::Buffer,
+    pub params: wgpu::Buffer,
+    pub lights: wgpu::Buffer,
+}
+
+/// Uniform mirror of `VoxLightParams` in the shader. Field order and padding
+/// must match exactly.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct VoxLightParamsUniform {
+    pub live_count: u32,
+    pub round: u32,
+    pub update_div: u32,
+    pub sun_rays: u32,
+    pub sun_cone: f32,
+    pub light_count: u32,
+    pub fold: f32,
+    pub ao_strength: f32,
+}
+
+/// A dynamic point light, matching `VlPointLight` in the shader.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct VoxLightPoint {
+    /// xyz = world position, w = radius in voxels.
+    pub pos_radius: [f32; 4],
+    /// rgb = radiance.
+    pub color: [f32; 4],
+}
+
+/// Ceiling on simultaneously uploaded point lights. The update pass walks the
+/// list per lit voxel, so this bounds that inner loop.
+pub(crate) const VOXLIGHT_MAX_LIGHTS: u32 = 256;
+
+impl VoxLightBuffers {
+    pub(crate) fn new(device: &wgpu::Device) -> Self {
+        use wgpu::BufferUsages as U;
+        let pool = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("voxlight pool"),
+            size: crate::voxlight::LIGHT_POOL_WORDS as u64 * 4,
+            usage: U::STORAGE | U::COPY_DST,
+            mapped_at_creation: false,
+        });
+        // Must start as all-LIGHT_BLOCK_NONE, not zero: zero is a VALID block
+        // index, so a zeroed table would claim every brick in the world owns
+        // block 0. Filled at creation so no frame can ever read it unset.
+        let block_of_brick = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("voxlight block_of_brick"),
+            size: crate::voxel::WORLD_BRICKS_TOTAL as u64 * 4,
+            usage: U::STORAGE | U::COPY_DST,
+            mapped_at_creation: true,
+        });
+        block_of_brick
+            .slice(..)
+            .get_mapped_range_mut()
+            .expect("block_of_brick was just created mapped_at_creation, so the full range maps")
+            .slice(..)
+            .fill(0xFFu8);
+        block_of_brick.unmap();
+        let live_bricks = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("voxlight live_bricks"),
+            size: crate::voxlight::LIGHT_BLOCKS_MAX as u64 * 4,
+            usage: U::STORAGE | U::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("voxlight params"),
+            size: std::mem::size_of::<VoxLightParamsUniform>() as u64,
+            usage: U::UNIFORM | U::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let lights = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("voxlight lights"),
+            size: VOXLIGHT_MAX_LIGHTS as u64 * std::mem::size_of::<VoxLightPoint>() as u64,
+            usage: U::STORAGE | U::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Self { pool, block_of_brick, live_bricks, params, lights }
+    }
 }
 
 fn create_transp_buf(device: &wgpu::Device, w: u32, h: u32) -> wgpu::Buffer {
@@ -2643,6 +2842,7 @@ fn make_compute_bg(
     depth_view: &wgpu::TextureView,
     geom_in_view: &wgpu::TextureView,
     depth_in_view: &wgpu::TextureView,
+    vl: &VoxLightBuffers,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("compute bg"),
@@ -2669,8 +2869,45 @@ fn make_compute_bg(
             wgpu::BindGroupEntry { binding: 19, resource: wgpu::BindingResource::TextureView(depth_view) },
             wgpu::BindGroupEntry { binding: 20, resource: wgpu::BindingResource::TextureView(geom_in_view) },
             wgpu::BindGroupEntry { binding: 21, resource: wgpu::BindingResource::TextureView(depth_in_view) },
+            wgpu::BindGroupEntry { binding: 22, resource: vl.pool.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 23, resource: vl.block_of_brick.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 24, resource: vl.live_bricks.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 25, resource: vl.params.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 26, resource: vl.lights.as_entire_binding() },
         ],
     })
+}
+
+/// Push the light field's brick table and work list to the GPU, and report the
+/// live block count (the update pass's dispatch size).
+///
+/// Both arrays are re-uploaded WHOLE, but only on frames where a binding
+/// actually changed: the table is 4 MiB, so pushing it unconditionally would
+/// burn ~570 MB/s of PCIe at 144 Hz to move bytes that did not move.
+fn upload_voxlight(
+    queue: &wgpu::Queue,
+    vl: &VoxLightBuffers,
+    world: &mut crate::voxel::World,
+) -> u32 {
+    let overflow = world.light.take_overflow();
+    if overflow > 0 {
+        // Surfaced, never silent: the shader falls back to probe-only lighting
+        // for any voxel without a block, so this degrades the look rather than
+        // failing, which is exactly the kind of thing that hides for months.
+        log::warn!(
+            "voxlight pool exhausted: {overflow} block(s) refused, {} resident (cap {})",
+            world.light.allocated(),
+            crate::voxlight::LIGHT_BLOCKS_MAX,
+        );
+    }
+    if world.light.take_table_dirty() {
+        queue.write_buffer(&vl.block_of_brick, 0, bytemuck::cast_slice(world.light.block_table()));
+        let live = world.light.live_bricks();
+        if !live.is_empty() {
+            queue.write_buffer(&vl.live_bricks, 0, bytemuck::cast_slice(live));
+        }
+    }
+    world.light.allocated() as u32
 }
 
 /// Group-1 layout for the RT occlusion path (world TLAS + the primitive->brick
@@ -3060,7 +3297,7 @@ mod gpu_render_tests {
                 required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits {
                     max_storage_buffer_binding_size: 256 << 20,
-                    max_storage_buffers_per_shader_stage: 12,
+                    max_storage_buffers_per_shader_stage: COMPUTE_STORAGE_BUFFERS,
                     ..wgpu::Limits::default()
                 },
                 memory_hints: wgpu::MemoryHints::Performance,
@@ -3211,19 +3448,20 @@ mod gpu_render_tests {
         let (_dtex, depth_view) = create_depth_texture(&device, w, h);
         let (_gtex, geom_view) = create_hdr_texture(&device, w, h);
         let (_ddtex, dummy_depth_view) = create_depth_texture(&device, 1, 1);
+        let vl_bufs = VoxLightBuffers::new(&device);
         let bg = make_compute_bg(
             &device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
             &palette_buf, &geom_view, &beam_view, &tile_dirty_buf, &players_buf,
             &brick_uniform_buf, &tile_uniform_buf, &l4_mask_buf,
             &cloud_sampled_view, &cloud_sampler, &light_in_view, &light_out_view, &transp_buf,
-            &sprites_buf, &depth_view, &output_view, &beam_view,
+            &sprites_buf, &depth_view, &output_view, &beam_view, &vl_bufs,
         );
         let bg_compose = make_compute_bg(
             &device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
             &palette_buf, &output_view, &beam_view, &tile_dirty_buf, &players_buf,
             &brick_uniform_buf, &tile_uniform_buf, &l4_mask_buf,
             &cloud_sampled_view, &cloud_sampler, &light_in_view, &light_out_view, &transp_buf,
-            &sprites_buf, &dummy_depth_view, &geom_view, &depth_view,
+            &sprites_buf, &dummy_depth_view, &geom_view, &depth_view, &vl_bufs,
         );
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("test pl"),
@@ -3651,12 +3889,14 @@ mod gpu_render_tests {
         let bgl = create_compute_bgl(&device);
         // main flavour (writes geom+depth) and compose flavour (writes output,
         // reads geom+depth), each in both light parities.
+        let vl_bufs = VoxLightBuffers::new(&device);
         let mk_main = |lin: &wgpu::TextureView, lout: &wgpu::TextureView| {
             make_compute_bg(
                 &device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
                 &palette_buf, &geom_view, &beam_view, &tile_dirty_buf, &players_buf,
                 &bu, &tu, &l4_mask_buf, &cloud_sampled_view, &cloud_sampler,
                 lin, lout, &transp_buf, &sprites_buf, &depth_view, &dummy_depth_view, &beam_view,
+                &vl_bufs,
             )
         };
         let mk_compose = |lin: &wgpu::TextureView, lout: &wgpu::TextureView| {
@@ -3665,6 +3905,7 @@ mod gpu_render_tests {
                 &palette_buf, &output_view, &beam_view, &tile_dirty_buf, &players_buf,
                 &bu, &tu, &l4_mask_buf, &cloud_sampled_view, &cloud_sampler,
                 lin, lout, &transp_buf, &sprites_buf, &dummy_depth_view, &geom_view, &depth_view,
+                &vl_bufs,
             )
         };
         let bg_main = [mk_main(&light_a, &light_b), mk_main(&light_b, &light_a)];
@@ -3849,12 +4090,14 @@ mod gpu_render_tests {
         let (_gtex, geom_view) = create_output_texture(device, w, h);
         let (_ddtex, dummy_depth_view) = create_depth_texture(device, 1, 1);
         let bgl = create_compute_bgl(device);
+        let vl_bufs = VoxLightBuffers::new(device);
         let mk_main = |lin: &wgpu::TextureView, lout: &wgpu::TextureView| {
             make_compute_bg(
                 device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
                 &palette_buf, &geom_view, &beam_view, &tile_dirty_buf, &players_buf,
                 &bu, &tu, &l4_mask_buf, &cloud_sampled_view, &cloud_sampler,
                 lin, lout, &transp_buf, &sprites_buf, &depth_view, &dummy_depth_view, &beam_view,
+                &vl_bufs,
             )
         };
         let mk_compose = |lin: &wgpu::TextureView, lout: &wgpu::TextureView| {
@@ -3863,6 +4106,7 @@ mod gpu_render_tests {
                 &palette_buf, &output_view, &beam_view, &tile_dirty_buf, &players_buf,
                 &bu, &tu, &l4_mask_buf, &cloud_sampled_view, &cloud_sampler,
                 lin, lout, &transp_buf, &sprites_buf, &dummy_depth_view, &geom_view, &depth_view,
+                &vl_bufs,
             )
         };
         let bg_main = [mk_main(&light_a, &light_b), mk_main(&light_b, &light_a)];
@@ -4430,12 +4674,13 @@ mod gpu_render_tests {
         let (_gtex, geom_view) = create_hdr_texture(device, w, h);
         let (_ddtex, dummy_depth_view) = create_depth_texture(device, 1, 1);
         let bgl = create_compute_bgl(device);
+        let vl_bufs = VoxLightBuffers::new(device);
         let bg = make_compute_bg(
             device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
             &palette_buf, &output_view, &beam_view, &tile_dirty_buf, &players_buf,
             &brick_uniform_buf, &tile_uniform_buf, &l4_mask_buf,
             &cloud_sampled_view, &cloud_sampler, &light_in_view, &light_out_view, &transp_buf,
-            &sprites_buf, &dummy_depth_view, &geom_view, &depth_view,
+            &sprites_buf, &dummy_depth_view, &geom_view, &depth_view, &vl_bufs,
         );
         let accel = crate::accel::build_world_accel(device, queue, &world);
         let rt_bgl = create_rt_bgl(device);
@@ -4583,12 +4828,13 @@ mod gpu_render_tests {
         let (_gtex, geom_view) = create_hdr_texture(device, w, h);
         let (_ddtex, dummy_depth_view) = create_depth_texture(device, 1, 1);
         let bgl = create_compute_bgl(device);
+        let vl_bufs = VoxLightBuffers::new(device);
         let bg = make_compute_bg(
             device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
             &palette_buf, &output_view, &beam_view, &tile_dirty_buf, &players_buf,
             &brick_uniform_buf, &tile_uniform_buf, &l4_mask_buf,
             &cloud_sampled_view, &cloud_sampler, &light_in_view, &light_out_view, &transp_buf,
-            &sprites_buf, &dummy_depth_view, &geom_view, &depth_view,
+            &sprites_buf, &dummy_depth_view, &geom_view, &depth_view, &vl_bufs,
         );
 
         // ---- group-1 (RT) bindings, built from the live world ----
@@ -5024,15 +5270,16 @@ mod gpu_render_tests {
         let (_gt, gv) = create_hdr_texture(&device, w, h);
         let (_dd, ddv) = create_depth_texture(&device, 1, 1);
         let bgl = create_compute_bgl(&device);
+        let vl_bufs = VoxLightBuffers::new(&device);
         let bg = make_compute_bg(
             &device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
             &palette_buf, &gv, &bv, &td, &players, &brick_uniform_buf, &tile_uniform_buf,
-            &l4_mask_buf, &csv, &csamp, &liv, &lov, &tpb, &spr, &dv, &ov, &bv,
+            &l4_mask_buf, &csv, &csamp, &liv, &lov, &tpb, &spr, &dv, &ov, &bv, &vl_bufs,
         );
         let bg_compose = make_compute_bg(
             &device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
             &palette_buf, &ov, &bv, &td, &players, &brick_uniform_buf, &tile_uniform_buf,
-            &l4_mask_buf, &csv, &csamp, &liv, &lov, &tpb, &spr, &ddv, &gv, &dv,
+            &l4_mask_buf, &csv, &csamp, &liv, &lov, &tpb, &spr, &ddv, &gv, &dv, &vl_bufs,
         );
         let pll = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None, bind_group_layouts: &[Some(&bgl)], immediate_size: 0,
@@ -5572,8 +5819,9 @@ mod gpu_render_tests {
             let (_hh, hv) = create_output_texture(&device, w, h);
             let (_dd, ddv) = create_depth_texture(&device, 1, 1);
             let bgl = create_compute_bgl(&device);
-            let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &gv, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &dv, &hv, &bv);
-            let bg_compose = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &ov, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &ddv, &gv, &dv);
+            let vl_bufs = VoxLightBuffers::new(&device);
+            let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &gv, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &dv, &hv, &bv, &vl_bufs);
+            let bg_compose = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &ov, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &ddv, &gv, &dv, &vl_bufs);
             let accel = crate::accel::build_world_accel(&device, &queue, &world);
             let rt_bgl = create_rt_bgl(&device);
             let (_gi_i, gi_iv) = create_lighting_texture(&device, w, h);
@@ -6916,11 +7164,12 @@ mod gpu_render_tests {
         let (_hh, hv) = create_output_texture(&device, w, h);
         let (_dd, ddv) = create_depth_texture(&device, 1, 1);
         let bgl = create_compute_bgl(&device);
+        let vl_bufs = VoxLightBuffers::new(&device);
         // Main bg: output -> geom_tex; the geom_in/depth_in slots (20/21) point at
         // unrelated textures (history/beam) so cs_main's write target is never
         // also read - matches the live renderer's compute_bg.
-        let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &gv, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &dv, &hv, &bv);
-        let bg_compose = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &ov, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &ddv, &gv, &dv);
+        let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &gv, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &dv, &hv, &bv, &vl_bufs);
+        let bg_compose = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &ov, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &ddv, &gv, &dv, &vl_bufs);
 
         // Group-1 (RT).
         let accel = crate::accel::build_world_accel(&device, &queue, &world);
@@ -7147,7 +7396,8 @@ mod gpu_render_tests {
         let (_g, gv) = create_hdr_texture(&device, w, h);
         let (_hh, hv) = create_output_texture(&device, w, h);
         let bgl = create_compute_bgl(&device);
-        let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &gv, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &dv, &hv, &bv);
+        let vl_bufs = VoxLightBuffers::new(&device);
+        let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &gv, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &dv, &hv, &bv, &vl_bufs);
         let accel = crate::accel::build_world_accel(&device, &queue, &world);
         let rt_bgl = create_rt_bgl(&device);
         let (_gi_i, gi_iv) = create_lighting_texture(&device, w, h);
@@ -7301,8 +7551,9 @@ mod gpu_render_tests {
         let (_hh, hv) = create_output_texture(&device, w, h);
         let (_dd, ddv) = create_depth_texture(&device, 1, 1);
         let bgl = create_compute_bgl(&device);
-        let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &gv, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &dv, &hv, &bv);
-        let bg_compose = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &_ov, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &ddv, &gv, &dv);
+        let vl_bufs = VoxLightBuffers::new(&device);
+        let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &gv, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &dv, &hv, &bv, &vl_bufs);
+        let bg_compose = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &_ov, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &ddv, &gv, &dv, &vl_bufs);
         let accel = crate::accel::build_world_accel(&device, &queue, &world);
         let rt_bgl = create_rt_bgl(&device);
         let (_gi_i, gi_iv) = create_lighting_texture(&device, w, h);
@@ -7524,8 +7775,9 @@ mod gpu_render_tests {
         let (_dtex, dv) = create_depth_texture(&device, w, h);
         let (_gt2, gv2) = create_hdr_texture(&device, w, h);
         let (_dd2, ddv2) = create_depth_texture(&device, 1, 1);
-        let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &gv2, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &dv, &ov, &bv);
-        let bg_compose = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &ov, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &ddv2, &gv2, &dv);
+        let vl_bufs = VoxLightBuffers::new(&device);
+        let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &gv2, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &dv, &ov, &bv, &vl_bufs);
+        let bg_compose = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &ov, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &ddv2, &gv2, &dv, &vl_bufs);
         let pll = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
         let src = raymarch_source();
         let m = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(src.into()) });

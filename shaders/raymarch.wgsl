@@ -343,6 +343,154 @@ fn voxel_material_at(world_v: vec3<i32>) -> u32 {
     return brick_voxel_material(bi, vi);
 }
 
+// ---------------------------------------------------------------------------
+// Per-voxel light field (docs/VOXEL_LIGHTING_PLAN.md).
+//
+// Shadows, AO and local light are properties of AIR voxels touching geometry,
+// not of pixels. Shading fetches and interpolates them; nothing here traces.
+// Sited after the voxel accessors above because the sampler needs
+// is_voxel_solid / world_brick_idx / brick_voxel_idx, and before shade().
+// ---------------------------------------------------------------------------
+
+const VL_NONE: u32 = 0xFFFFFFFFu;
+const VL_RECORD_WORDS: u32 = 2u;
+// 64 voxels per brick * 2 words per record.
+const VL_BLOCK_WORDS: u32 = 128u;
+
+struct VoxLightParams {
+    live_count: u32,
+    round: u32,
+    update_div: u32,
+    sun_rays: u32,
+    sun_cone: f32,
+    light_count: u32,
+    fold: f32,
+    ao_strength: f32,
+};
+
+struct VlPointLight {
+    // xyz = WORLD position, w = radius in voxels.
+    pos_radius: vec4<f32>,
+    // rgb = radiance, a unused.
+    color: vec4<f32>,
+};
+
+// Group 0, continuing the render layout: the light field is world data with a
+// single owner, exactly like the brick pyramid it sits beside. A separate group
+// would have to be added to every pipeline layout and bound in every pass,
+// including eleven test harnesses, for no isolation benefit.
+@group(0) @binding(22) var<storage, read_write> vl_pool: array<u32>;
+@group(0) @binding(23) var<storage, read> vl_block_of_brick: array<u32>;
+@group(0) @binding(24) var<storage, read> vl_live_bricks: array<u32>;
+@group(0) @binding(25) var<uniform> vl_params: VoxLightParams;
+@group(0) @binding(26) var<storage, read> vl_lights: array<VlPointLight>;
+
+// Shared-exponent HDR packing for the local-light term. One word holds a
+// radiance that can exceed 1.0 without an extra buffer.
+fn vl_unpack_rgb9e5(p: u32) -> vec3<f32> {
+    let e = i32((p >> 27u) & 0x1Fu);
+    let scale = exp2(f32(e - 24));
+    return vec3<f32>(f32(p & 0x1FFu), f32((p >> 9u) & 0x1FFu), f32((p >> 18u) & 0x1FFu)) * scale;
+}
+
+fn vl_pack_rgb9e5(c: vec3<f32>) -> u32 {
+    let cc = max(c, vec3<f32>(0.0));
+    let m = max(max(cc.r, cc.g), max(cc.b, 1e-6));
+    let e = clamp(i32(floor(log2(m))) + 16, 0, 31);
+    let q = clamp(vec3<i32>(round(cc * exp2(f32(24 - e)))), vec3<i32>(0), vec3<i32>(511));
+    return u32(q.x) | (u32(q.y) << 9u) | (u32(q.z) << 18u) | (u32(e) << 27u);
+}
+
+/// First pool word of a WORLD voxel's record, or VL_NONE when the voxel is
+/// outside the window or its brick has no light block.
+fn vl_record_word(world_v: vec3<i32>) -> u32 {
+    let rel = world_v - camera.world_origin;
+    if (rel.x < 0 || rel.x >= WORLD_VOXELS_X
+     || rel.y < 0 || rel.y >= WORLD_VOXELS_Y
+     || rel.z < 0 || rel.z >= WORLD_VOXELS_Z) {
+        return VL_NONE;
+    }
+    let v = world_to_slot_voxel(world_v);
+    let bp = v >> vec3<u32>(2u);
+    let bi = world_brick_idx(bp.x, bp.y, bp.z);
+    let block = vl_block_of_brick[u32(bi)];
+    if (block == VL_NONE) { return VL_NONE; }
+    let local = v - bp * BRICK_DIM;
+    let vi = brick_voxel_idx(local.x, local.y, local.z);
+    return block * VL_BLOCK_WORDS + u32(vi) * VL_RECORD_WORDS;
+}
+
+struct VoxLight {
+    sun: f32,
+    ao: f32,
+    point: vec3<f32>,
+    valid: bool,
+};
+
+fn vl_load(word: u32) -> VoxLight {
+    var o: VoxLight;
+    let w0 = vl_pool[word];
+    o.sun = f32(w0 & 0xFFu) * (1.0 / 255.0);
+    o.ao = f32((w0 >> 8u) & 0xFFu) * (1.0 / 255.0);
+    o.point = vl_unpack_rgb9e5(vl_pool[word + 1u]);
+    // epoch 0 means the record has never held a converged estimate (freshly
+    // bound block, or a solid voxel), so it must not be blended in.
+    o.valid = ((w0 >> 16u) & 0xFFu) != 0u;
+    return o;
+}
+
+/// Solidity-gated trilinear fetch of the light field for a surface point.
+///
+/// This is the whole point of the rework: `sun` comes back as a CONTINUOUS
+/// value, so no binary visibility test survives into the pixel and the
+/// penumbra is smooth by construction rather than by TAA convergence.
+fn voxlight_sample(p_world: vec3<f32>, n: vec3<f32>) -> VoxLight {
+    var o: VoxLight;
+    o.sun = 0.0;
+    o.ao = 1.0;
+    o.point = vec3<f32>(0.0);
+    o.valid = false;
+
+    // Step into the air voxel against the face, then place the lattice on
+    // voxel CENTRES so the eight taps straddle the surface.
+    let g = (p_world + n * 0.5) - vec3<f32>(0.5);
+    let b = floor(g);
+    let f = g - b;
+    let base = vec3<i32>(b);
+
+    var acc_sun = 0.0;
+    var acc_ao = 0.0;
+    var acc_pt = vec3<f32>(0.0);
+    var wsum = 0.0;
+    for (var k = 0u; k < 8u; k = k + 1u) {
+        let off = vec3<i32>(i32(k & 1u), i32((k >> 1u) & 1u), i32((k >> 2u) & 1u));
+        let fw = select(1.0 - f, f, vec3<bool>(off.x == 1, off.y == 1, off.z == 1));
+        let w = fw.x * fw.y * fw.z;
+        if (w <= 0.0) { continue; }
+        let c = base + off;
+        // Light lives in AIR. Interpolating through a solid cell is exactly
+        // how light leaks across a one-voxel wall, so solid taps are dropped
+        // and the surviving weights renormalised below.
+        if (is_voxel_solid(c)) { continue; }
+        let rw = vl_record_word(c);
+        if (rw == VL_NONE) { continue; }
+        let s = vl_load(rw);
+        if (!s.valid) { continue; }
+        acc_sun = acc_sun + s.sun * w;
+        acc_ao = acc_ao + s.ao * w;
+        acc_pt = acc_pt + s.point * w;
+        wsum = wsum + w;
+    }
+    if (wsum > 0.0) {
+        let inv = 1.0 / wsum;
+        o.sun = acc_sun * inv;
+        o.ao = acc_ao * inv;
+        o.point = acc_pt * inv;
+        o.valid = true;
+    }
+    return o;
+}
+
 fn sky(dir: vec3<f32>) -> vec3<f32> {
     return sky_color(dir);
 }
@@ -3861,8 +4009,19 @@ fn shade(
     // AO on a fringe cell would re-introduce the invisible-shell darkening.)
     let skip_ao = hit.last_axis < 0 || hit.t_hit > AO_DIST
         || is_leaf_block_mat(hit.mat) || hit.mat == MAT_LEAF_FRINGE;
+    // Per-voxel light field: ONE fetch stands in for the AO evaluation, the
+    // sun-shadow ray and the screen-space reprojection lookup. Sampled off the
+    // GEOMETRIC normal (hit.normal), not the foliage-perturbed shading normal,
+    // because it addresses the air voxel against the real face.
+    //
+    // The explicit reuse_* flags still win: callers that pass them are
+    // asserting a PROVEN constant (the refracted-water hit below the surface
+    // has shadow 0 and flat AO by construction), and honouring the field there
+    // would pay for a lookup to re-derive a known answer.
+    let vlf = voxlight_sample(p_hit, hit.normal);
     var ao: f32;
     if (reuse_ao) { ao = (*light).y; }
+    else if (vlf.valid && !skip_ao) { ao = vlf.ao; }
     else {
         ao = select(compute_ao(hit, origin, dir), 1.0, skip_ao);
         // NOTE: the old sky_access() hack (a straight-up + 4 side shadow rays to
@@ -3966,6 +4125,13 @@ fn shade(
     var shadow_term = 0.0;
     if (reuse_shadow) {
         shadow_term = (*light).x;
+    } else if (vlf.valid) {
+        // CONTINUOUS sun visibility straight from the field. This is the
+        // smooth-shadow fix: no binary occlusion test survives into the pixel,
+        // so the penumbra is a real gradient rather than a dither pattern that
+        // only resolves once TAA converges (and never resolved at all while
+        // the camera moved, because jit_phase froze).
+        shadow_term = vlf.sun;
     } else if (n_dot_l > 0.0 && s_int > 0.0) {
         // ONE jittered shadow ray (was 2). The per-pixel + per-frame jitter
         // (pix_jit rotates each frame) plus the TAA history accumulation average
@@ -3998,7 +4164,11 @@ fn shade(
     // the binary trace flip outright (single-pixel pops read as "little
     // shadows jumping around"). Converges in 2-3 refreshes (~0.3-0.9 s), the
     // physical sweep speed.
-    if (blend_shadow) {
+    // The staleness cross-fade exists only to stop a BINARY per-pixel trace
+    // flipping outright as the sun drifts. A field sample has no such edge to
+    // hide: every epoch re-samples against the current sun and the stored
+    // value moves continuously, so blending here would only add lag.
+    if (blend_shadow && !vlf.valid) {
         shadow_term = mix(shadow_term, (*light).x, 0.6);
     }
     // Hand the (fresh or reused) terms back so the caller re-caches them.
@@ -4008,7 +4178,9 @@ fn shade(
     let ambient = ambient_color() * ao;
     // One-bounce indirect passed in by the caller (temporally accumulated in
     // cs_main for the RT variant; 0 for software and for secondary rays).
-    var lit = base * (direct + ambient + indirect);
+    // Local lights arrive already gathered and shadow-tested in the field, so
+    // adding lights costs the per-pixel path nothing.
+    var lit = base * (direct + ambient + indirect + vlf.point);
 
     // Grass turf specular terms (see the comb block above): Kajiya-Kay
     // sheen along the combed blade tangent - the gloss real grass throws

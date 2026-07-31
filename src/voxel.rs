@@ -343,6 +343,10 @@ pub struct World {
     pub tile_uniform: Vec<u8>,
     pub active_bricks: Vec<u32>,
     pub dirty_bricks: Vec<u32>,
+    /// Sparse per-voxel light field allocation (docs/VOXEL_LIGHTING_PLAN.md).
+    /// Only the brick -> block binding lives here; the light records themselves
+    /// are GPU-side and never read back.
+    pub light: crate::voxlight::LightField,
     /// Reusable physics scratch buffers (a sorted snapshot of active_bricks and
     /// the per-tick "touched" set), kept here so the CA tick allocates nothing —
     /// previously it cloned active_bricks twice per tick (checklist: physics).
@@ -420,6 +424,7 @@ impl World {
             tile_uniform: vec![0u8; WORLD_TILES_TOTAL as usize],
             active_bricks: Vec::with_capacity(4096),
             dirty_bricks: Vec::with_capacity(4096),
+            light: crate::voxlight::LightField::new(),
             phys_scratch: Vec::with_capacity(4096),
             phys_touched: Vec::with_capacity(8192),
             all_dirty: true,
@@ -635,11 +640,16 @@ impl World {
         let base_bx = slot_cx * STORAGE_CHUNK_BRICKS;
         let base_by = slot_cy * STORAGE_CHUNK_BRICKS;
         let base_bz = slot_cz * STORAGE_CHUNK_BRICKS;
-        // Stop physics touching the slot's now-hidden bricks.
+        // Stop physics touching the slot's now-hidden bricks, and hand the
+        // slot's light blocks back to the pool. The block records are left as
+        // they are: nothing maps to them while unbound, and rebinding queues a
+        // reset, so recycling a slot never touches GPU memory.
         for dz in 0..STORAGE_CHUNK_BRICKS {
             for dy in 0..STORAGE_CHUNK_BRICKS {
                 for dx in 0..STORAGE_CHUNK_BRICKS {
-                    self.movable_mask[brick_idx(base_bx + dx, base_by + dy, base_bz + dz) as usize] = 0;
+                    let bi = brick_idx(base_bx + dx, base_by + dy, base_bz + dz);
+                    self.movable_mask[bi as usize] = 0;
+                    self.light.release(bi);
                 }
             }
         }
@@ -872,6 +882,95 @@ impl World {
         if !self.all_dirty {
             self.dirty_bricks.push(bi);
         }
+    }
+
+    /// Bring light-field block bindings in line with the bricks that changed.
+    ///
+    /// Called ONCE PER FRAME from the renderer over the existing dirty list,
+    /// deliberately NOT from `mark_brick_dirty`: physics calls that for every
+    /// touched brick every tick, and running the shell test there would tax the
+    /// CPU hot path to compute something consumed only once, at draw time.
+    pub fn sync_light_shell_dirty(&mut self) {
+        // Move the list out so the shell walk can take &mut self, then put it
+        // back: the caller still needs it for the brick upload. Moving a Vec
+        // costs nothing, so this stays allocation-free.
+        let changed = std::mem::take(&mut self.dirty_bricks);
+        for &bi in &changed {
+            // A brick's own change can flip its NEIGHBOURS' shell membership
+            // too: the empty brick above a surface joins the shell the moment
+            // that surface appears. Evaluate the closed neighbourhood.
+            self.eval_light_shell(bi);
+            let (nb, n) = self.brick_neighbours(bi);
+            for k in 0..n {
+                self.eval_light_shell(nb[k]);
+            }
+            // The geometry under this brick's light moved, so whatever it had
+            // accumulated is stale.
+            self.light.invalidate(bi);
+        }
+        self.dirty_bricks = changed;
+    }
+
+    /// Rebind the whole world's light shell. Used on a full-dirty frame (world
+    /// init, teleport), where every brick is effectively new.
+    pub fn sync_light_shell_all(&mut self) {
+        for bi in 0..WORLD_BRICKS_TOTAL {
+            self.eval_light_shell(bi);
+        }
+    }
+
+    fn eval_light_shell(&mut self, bi: u32) {
+        if self.brick_needs_light(bi) {
+            self.light.allocate(bi);
+        } else {
+            self.light.release(bi);
+        }
+    }
+
+    /// A brick needs light storage when it can hold air next to solid: either
+    /// it is non-empty (so it holds both), or it is empty but touches a
+    /// non-empty brick (the open air directly above a surface). Conservative by
+    /// one brick, which is exactly what keeps the sampler's eight-tap
+    /// neighbourhood populated right at a surface instead of falling off the
+    /// edge of the allocated region.
+    fn brick_needs_light(&self, bi: u32) -> bool {
+        if !self.bricks[bi as usize].is_empty() {
+            return true;
+        }
+        let (nb, n) = self.brick_neighbours(bi);
+        for k in 0..n {
+            if !self.bricks[nb[k] as usize].is_empty() {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The face-adjacent storage bricks. x/z wrap toroidally (the storage
+    /// window is periodic on those axes); y is clamped, so a brick at the world
+    /// floor or ceiling simply reports fewer neighbours.
+    fn brick_neighbours(&self, bi: u32) -> ([u32; 6], usize) {
+        let (bx, by, bz) = brick_coords(bi);
+        let wrap = |v: i64, m: u32| -> u32 { v.rem_euclid(m as i64) as u32 };
+        let mut out = [0u32; 6];
+        let mut n = 0usize;
+        out[n] = brick_idx(wrap(bx as i64 + 1, WORLD_BRICKS_X), by, bz);
+        n += 1;
+        out[n] = brick_idx(wrap(bx as i64 - 1, WORLD_BRICKS_X), by, bz);
+        n += 1;
+        out[n] = brick_idx(bx, by, wrap(bz as i64 + 1, WORLD_BRICKS_Z));
+        n += 1;
+        out[n] = brick_idx(bx, by, wrap(bz as i64 - 1, WORLD_BRICKS_Z));
+        n += 1;
+        if by + 1 < WORLD_BRICKS_Y {
+            out[n] = brick_idx(bx, by + 1, bz);
+            n += 1;
+        }
+        if by > 0 {
+            out[n] = brick_idx(bx, by - 1, bz);
+            n += 1;
+        }
+        (out, n)
     }
 
     /// Refresh tile/chunk bits for a brick after the brick's occupancy may
