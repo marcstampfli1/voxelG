@@ -104,10 +104,16 @@ atlas_consts! {
     TUFT_PINE = 2;
     /// Number of 32x32 tufts in the atlas.
     N_TUFTS = 3;
+    /// Tree TEST (docs/FLORA_PLAN.md exploration): one 128^3 dual-volume
+    /// tree - wood bits then leaf bits - spanning an 8x8x8 cell block at
+    /// 16 micro cells per cell. 65536 words per volume.
+    TREE_TEST_WORDS = 65536;
     /// Micro-voxel tussock volumes (16x16x16 occupancy bits, 128 words each)
     /// appended after the BL tufts: variant i lives at
     /// MICRO_TUFT_BASE_WORDS + i * MICRO_TUFT_WORDS.
     MICRO_TUFT_BASE_WORDS = TUFT_BASE_WORDS + N_TUFTS * BL_TUFT_WORDS;
+    TREE_WOOD_BASE_WORDS = MICRO_TUFT_BASE_WORDS + N_MICRO_TUFTS * MICRO_TUFT_WORDS;
+    TREE_LEAF_BASE_WORDS = TREE_WOOD_BASE_WORDS + TREE_TEST_WORDS;
     MICRO_TUFT_WORDS = 128;
     /// 0..2 = grass tussocks, 3..5 = bush domes.
     N_MICRO_TUFTS = 6;
@@ -917,6 +923,84 @@ pub fn encoded() -> Vec<u32> {
             }
         }
     }
+    // ---- TREE TEST: procedural 128^3 wood + leaf volumes ----
+    out.resize(TREE_LEAF_BASE_WORDS + TREE_TEST_WORDS, 0);
+    {
+        let mut set = |wood: bool, x: i32, y: i32, z: i32| {
+            if !(0..128).contains(&x) || !(0..128).contains(&y) || !(0..128).contains(&z) {
+                return;
+            }
+            let bit = (x + z * 128 + y * 128 * 128) as usize;
+            let base = if wood { TREE_WOOD_BASE_WORDS } else { TREE_LEAF_BASE_WORDS };
+            out[base + bit / 32] |= 1 << (bit % 32);
+        };
+        let mut stamp = |wood: bool, cx: f32, cy: f32, cz: f32, r: f32| {
+            let ri = r.ceil() as i32;
+            for dz in -ri..=ri {
+                for dy in -ri..=ri {
+                    for dx in -ri..=ri {
+                        let d2 = (dx * dx + dy * dy + dz * dz) as f32;
+                        if d2 <= r * r {
+                            set(wood, cx as i32 + dx, cy as i32 + dy, cz as i32 + dz);
+                        }
+                    }
+                }
+            }
+        };
+        // Trunk: tapered, slight sway, filling most of the volume height.
+        for i in 0..100 {
+            let t = i as f32 / 100.0;
+            let y = t * 98.0;
+            let sway = (t * 2.2).sin() * 4.0;
+            let r = 7.0 * (1.0 - t * 0.68);
+            stamp(true, 64.0 + sway, y, 64.0 + sway * 0.6, r);
+        }
+        // Branches: golden-angle fan from the upper trunk, arcing out and
+        // up, each dressed with hundreds of REAL voxel leaves - small
+        // blobs scattered around the branch tips with true air between.
+        let ga = 2.399963f32;
+        for b in 0..9 {
+            let bt = b as f32 / 9.0;
+            let ang = b as f32 * ga;
+            let y0 = 42.0 + bt * 50.0;
+            let up0 = 0.55 + 0.35 * (1.0 - bt);
+            let len = 52.0 - bt * 18.0;
+            let dirx = ang.cos();
+            let dirz = ang.sin();
+            let sx = 64.0 + (y0 * 2.2 / 58.0).sin() * 3.0;
+            let sz = 64.0 + (y0 * 2.2 / 58.0).sin() * 1.8;
+            for i in 0..40 {
+                let t = i as f32 / 40.0;
+                let arc = t * t * 14.0;
+                let px = sx + dirx * len * t;
+                let py = y0 + up0 * len * t * 0.8 + arc * 0.3 - t * t * 6.0;
+                let pz = sz + dirz * len * t;
+                let r = 2.6 * (1.0 - t * 0.7);
+                stamp(true, px, py, pz, r.max(0.8));
+                // Leaves bloom along the outer 60% of every branch.
+                if t > 0.4 {
+                    let n_leaf = 3;
+                    for l in 0..n_leaf {
+                        let h = {
+                            let mut v = (b as u32)
+                                .wrapping_mul(1664525)
+                                .wrapping_add((i as u32).wrapping_mul(22695477))
+                                .wrapping_add((l as u32).wrapping_mul(747796405));
+                            v ^= v >> 16;
+                            v = v.wrapping_mul(2654435769);
+                            v
+                        };
+                        let f = |s: u32| ((h >> s) & 0xFF) as f32 / 255.0 - 0.5;
+                        let lx = px + f(0) * 16.0;
+                        let ly = py + f(8) * 13.0 + 2.5;
+                        let lz = pz + f(16) * 16.0;
+                        let lr = 1.2 + ((h >> 24) & 0x3) as f32 * 0.4;
+                        stamp(false, lx, ly, lz, lr);
+                    }
+                }
+            }
+        }
+    }
     out
 }
 
@@ -940,7 +1024,7 @@ mod tests {
     #[test]
     fn encodes_all_sprites() {
         let w = encoded();
-        assert_eq!(w.len(), MICRO_TUFT_BASE_WORDS + N_MICRO_TUFTS * MICRO_TUFT_WORDS);
+        assert_eq!(w.len(), TREE_LEAF_BASE_WORDS + TREE_TEST_WORDS);
         assert_eq!(TUFT_BASE_WORDS, N_SPRITES * SPRITE_WORDS);
         assert_eq!(MICRO_TUFT_BASE_WORDS, TUFT_BASE_WORDS + N_TUFTS * BL_TUFT_WORDS);
     }

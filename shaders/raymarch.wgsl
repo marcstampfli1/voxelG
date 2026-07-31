@@ -886,6 +886,7 @@ const MAT_LEAF_FRINGE:     u32 = 33u;
 const MAT_TALL_GRASS_DRY:  u32 = 34u;
 const MAT_TURF:            u32 = 35u;
 const MAT_BUSH:            u32 = 36u;
+const MAT_TREE_TEST:       u32 = 37u;
 
 fn is_water_mat(m: u32) -> bool {
     return m >= MAT_WATER_L1 && m <= MAT_WATER_L8;
@@ -902,7 +903,7 @@ fn is_foliage_mat(m: u32) -> bool {
         || m == MAT_LEAVES_PINE || m == MAT_LEAVES_AUTUMN
         || m == MAT_FLOWER || m == MAT_TALL_GRASS
         || m == MAT_LEAF_FRINGE || m == MAT_TALL_GRASS_DRY
-        || m == MAT_TURF || m == MAT_BUSH;
+        || m == MAT_TURF || m == MAT_BUSH || m == MAT_TREE_TEST;
 }
 fn is_leaf_block_mat(m: u32) -> bool {
     return m == MAT_LEAVES || m == MAT_LEAVES_BIRCH
@@ -914,7 +915,8 @@ fn is_leaf_block_mat(m: u32) -> bool {
 // don't disappear.
 fn is_decoration_mat(m: u32) -> bool {
     return m == MAT_FLOWER || m == MAT_TALL_GRASS || m == MAT_LEAF_FRINGE
-        || m == MAT_TALL_GRASS_DRY || m == MAT_TURF || m == MAT_BUSH;
+        || m == MAT_TALL_GRASS_DRY || m == MAT_TURF || m == MAT_BUSH
+        || m == MAT_TREE_TEST;
 }
 
 struct SubHit {
@@ -2193,6 +2195,98 @@ fn bush_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>) -> SubHit {
     return out;
 }
 
+// TREE TEST: march the shared 128^3 wood+leaf volume. The block anchors
+// to the 8-cell lattice; each cell marches its slice at 16 micro cells
+// per world cell. Leaves are REAL 3D blobs - see-through comes from true
+// air between them, no cutouts anywhere.
+fn tree_bit(wood: bool, x: i32, y: i32, z: i32) -> bool {
+    let bit = u32(x + z * 128 + y * 16384);
+    let base = select(TREE_LEAF_BASE_WORDS, TREE_WOOD_BASE_WORDS, wood);
+    let w = sprites[base + (bit >> 5u)];
+    return ((w >> (bit & 31u)) & 1u) != 0u;
+}
+
+fn tree_test_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>) -> SubHit {
+    var out: SubHit;
+    out.hit = false;
+    out.color_tint = vec3<f32>(1.0);
+    let anchor = vec3<f32>(f32(voxel.x & -8), f32(voxel.y & -8), f32(voxel.z & -8));
+    let voxel_min = vec3<f32>(f32(voxel.x), f32(voxel.y), f32(voxel.z));
+    // Super space: the volume spans 8 cells from the anchor.
+    let o_s = (origin - anchor) / 8.0;
+    let d_s = dir / 8.0;
+    let inv = 1.0 / d_s;
+    let t0v = (vec3<f32>(0.0) - o_s) * inv;
+    let t1v = (vec3<f32>(1.0) - o_s) * inv;
+    let tmin3 = min(t0v, t1v);
+    let tmax3 = max(t0v, t1v);
+    let o_c = origin - voxel_min;
+    let tc0 = (vec3<f32>(0.0) - o_c) / dir;
+    let tc1 = (vec3<f32>(1.0) - o_c) / dir;
+    let tcmin = min(tc0, tc1);
+    let tcmax = max(tc0, tc1);
+    let t_in = max(max(max(tmin3.x, tmin3.y), max(tmin3.z, 0.0)),
+                   max(max(tcmin.x, tcmin.y), tcmin.z));
+    let t_out = min(min(min(tmax3.x, tmax3.y), tmax3.z),
+                    min(min(tcmax.x, tcmax.y), tcmax.z));
+    if (t_in >= t_out) { return out; }
+    let eps = 1e-4;
+    var p = (o_s + d_s * (t_in + eps)) * 128.0;
+    var c = vec3<i32>(clamp(floor(p), vec3<f32>(0.0), vec3<f32>(127.0)));
+    let step_i = vec3<i32>(sign(d_s));
+    let invm = 1.0 / (d_s * 128.0);
+    var t_next = vec3<f32>(1e30);
+    if (d_s.x != 0.0) { t_next.x = t_in + (select(f32(c.x), f32(c.x + 1), d_s.x > 0.0) - p.x) * invm.x; }
+    if (d_s.y != 0.0) { t_next.y = t_in + (select(f32(c.y), f32(c.y + 1), d_s.y > 0.0) - p.y) * invm.y; }
+    if (d_s.z != 0.0) { t_next.z = t_in + (select(f32(c.z), f32(c.z + 1), d_s.z > 0.0) - p.z) * invm.z; }
+    let t_delta = abs(invm);
+    var t_cur = t_in;
+    var axis = 1;
+    for (var s = 0; s < 56; s = s + 1) {
+        if (c.x < 0 || c.x > 127 || c.y < 0 || c.y > 127 || c.z < 0 || c.z > 127) { break; }
+        if (t_cur > t_out) { break; }
+        let wood = tree_bit(true, c.x, c.y, c.z);
+        let leaf = !wood && tree_bit(false, c.x, c.y, c.z);
+        if (wood || leaf) {
+            out.hit = true;
+            out.t_hit = t_cur;
+            var n = vec3<f32>(0.0, 1.0, 0.0);
+            if (axis == 0) { n = vec3<f32>(-f32(step_i.x), 0.0, 0.0); }
+            if (axis == 2) { n = vec3<f32>(0.0, 0.0, -f32(step_i.z)); }
+            if (axis == 1) { n = vec3<f32>(0.0, -f32(step_i.y), 0.0); }
+            out.normal = n;
+            let mh = hash3f(anchor + vec3<f32>(f32(c.x) * 0.37, f32(c.y) * 0.53, f32(c.z) * 0.71));
+            let tone = 1.0 + select(select(0.0, 0.12, mh > 0.66), -0.12, mh < 0.33);
+            if (wood) {
+                // Bark: palette-absolute (MAT_TREE_TEST palette is white).
+                out.color_tint = vec3<f32>(0.34, 0.23, 0.13) * tone;
+            } else {
+                let tip = c.y >= 127 || !(tree_bit(false, c.x, c.y + 1, c.z) || tree_bit(true, c.x, c.y + 1, c.z));
+                out.color_tint = vec3<f32>(0.26, 0.52, 0.16) * tone
+                    * select(1.0, 1.14, tip);
+            }
+            return out;
+        }
+        if (t_next.x <= t_next.y && t_next.x <= t_next.z) {
+            c.x = c.x + step_i.x;
+            t_cur = t_next.x;
+            t_next.x = t_next.x + t_delta.x;
+            axis = 0;
+        } else if (t_next.y <= t_next.z) {
+            c.y = c.y + step_i.y;
+            t_cur = t_next.y;
+            t_next.y = t_next.y + t_delta.y;
+            axis = 1;
+        } else {
+            c.z = c.z + step_i.z;
+            t_cur = t_next.z;
+            t_next.z = t_next.z + t_delta.z;
+            axis = 2;
+        }
+    }
+    return out;
+}
+
 fn foliage_subvoxel(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32) -> SubHit {
     var hit: SubHit;
     if (mat == MAT_TURF) {
@@ -2213,6 +2307,8 @@ fn foliage_subvoxel(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u3
         hit = grass_tuft_hit(voxel, origin, dir);
     } else if (mat == MAT_BUSH) {
         hit = bush_hit(voxel, origin, dir);
+    } else if (mat == MAT_TREE_TEST) {
+        hit = tree_test_hit(voxel, origin, dir);
     } else if (mat == MAT_TALL_GRASS_DRY) {
         hit = sprite_cross_hit(voxel, origin, dir, mat);
     } else if (mat == MAT_FLOWER) {

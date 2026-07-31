@@ -152,6 +152,9 @@ pub const MAT_TURF: u8 = 35;
 /// Leafy bush decoration: a micro-voxel dome with leaf-cutout faces and
 /// oak-tuft crown cards (renderer bush_hit). Scattered on grass tops.
 pub const MAT_BUSH: u8 = 36;
+/// Tree TEST cells (lab only, no worldgen): an 8x8x8 block of these
+/// marches one shared 128^3 wood+leaf volume - real 3D voxel leaves.
+pub const MAT_TREE_TEST: u8 = 37;
 
 #[inline(always)]
 pub fn is_leaf_mat(m: u8) -> bool {

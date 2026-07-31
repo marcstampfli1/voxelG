@@ -239,6 +239,8 @@ fn default_palette() -> [PaletteEntry; PALETTE_SIZE] {
     p[MAT_TALL_GRASS_DRY as usize] = PaletteEntry([0.78, 0.68, 0.38, 1.0]); // pale straw
     p[crate::voxel::MAT_TURF as usize] = PaletteEntry([0.34, 0.66, 0.22, 1.0]); // ground blades
     p[crate::voxel::MAT_BUSH as usize] = PaletteEntry([0.28, 0.55, 0.19, 1.0]); // leafy bush
+    // White: the tree-test tint carries absolute bark/leaf colours.
+    p[crate::voxel::MAT_TREE_TEST as usize] = PaletteEntry([1.0, 1.0, 1.0, 1.0]);
     p
 }
 
@@ -5214,6 +5216,59 @@ mod gpu_render_tests {
     /// layer above every block - analytic 3D blades out of the ground, the
     /// combed sheen shading between and beyond them - at a day and an
     /// evening sun, walking and grazing cameras.
+    /// TREE TEST: one tree built ONLY from real 3D micro-voxels - a 128^3
+    /// wood+leaf volume over an 8x8x8 cell block. Hundreds of individual
+    /// voxel leaf blobs with true air between them; see-through happens
+    /// naturally, no cutouts anywhere.
+    #[test]
+    #[ignore]
+    fn dump_tree_test() {
+        use crate::voxel::{MAT_DIRT, MAT_GRASS, MAT_TREE_TEST};
+        let mut world = World::new();
+        for z in 180u32..260 {
+            for x in 180u32..260 {
+                world.set_voxel(x, 63, z, MAT_DIRT);
+                world.set_voxel(x, 64, z, MAT_GRASS);
+            }
+        }
+        // The tree block must sit on the 8-lattice for the shared anchor.
+        // Lattice-aligned in ALL axes (64 & -8 == 64; the anchor is pure
+        // lattice arithmetic, so absent cells are fine). The lawn survives:
+        // ground-level tree cells exist only under the trunk footprint.
+        for z in 216u32..224 {
+            for y in 65u32..72 {
+                for x in 216u32..224 {
+                    world.set_voxel(x, y, z, MAT_TREE_TEST);
+                }
+            }
+        }
+        for (x, z) in [(219u32, 219u32), (220, 219), (219, 220), (220, 220)] {
+            world.set_voxel(x, 64, z, MAT_TREE_TEST);
+        }
+        std::fs::create_dir_all("target/lookdev").unwrap();
+        let views: [(&str, glam::Vec3, f32, f32); 2] = [
+            ("tree_test_full", glam::Vec3::new(207.0, 69.5, 205.0), 0.75, -0.05),
+            ("tree_test_close", glam::Vec3::new(213.5, 70.5, 212.5), 0.72, -0.02),
+        ];
+        for (name, pos, yaw, pitch) in views {
+            let mut cam = Camera::new();
+            cam.pos = pos;
+            cam.yaw = yaw;
+            cam.pitch = pitch;
+            let Some(rgba) = render_rgba_time_sun(&world, &cam, 1920, 1080, 30.0, 30.0) else {
+                eprintln!("no GPU - skipping");
+                return;
+            };
+            let path = format!("target/lookdev/{name}.png");
+            let file = std::fs::File::create(&path).unwrap();
+            let mut enc = png::Encoder::new(std::io::BufWriter::new(file), 1920, 1080);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            enc.write_header().unwrap().write_image_data(&rgba).unwrap();
+            eprintln!("wrote {path}");
+        }
+    }
+
     /// Close-up tussock lab: a handful of micro-voxel tufts three voxels
     /// from the camera, so the tuft SHAPE is judged at art scale before any
     /// field verdicts.
