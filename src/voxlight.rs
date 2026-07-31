@@ -31,10 +31,31 @@ pub const LIGHT_RECORDS_PER_BLOCK: u32 = BRICK_VOXELS;
 ///   word1: point-light radiance, packed RGB9E5
 pub const LIGHT_RECORD_WORDS: u32 = 2;
 
-/// Resident light blocks. The lit shell of the streamed window is roughly a
-/// 128x128 brick sheet in xz spread over several brick layers by relief,
-/// caves, overhangs and trees, which lands in the 65k-130k range; this is the
-/// ceiling, and exhaustion degrades gracefully (see `allocate`).
+/// Resident light blocks.
+///
+/// MEASURED, no longer estimated. The demo world (a fully generated 512x256x512
+/// streamed window, `World::fill_demo_terrain`) has 1,048,576 bricks: 699,991
+/// empty, 38,040 partially solid, 310,545 fully solid. `brick_needs_light`
+/// binds a block for every brick that can hold an air voxel next to solid,
+/// which on that world is 60,174 blocks = 30.8 MB of the 67.1 MB pool, so the
+/// whole streamed window is covered with 2.18x headroom and NOTHING falls back
+/// to the per-pixel path for want of storage.
+///
+/// The 65k-130k estimate this ceiling was originally derived from was right for
+/// that rule. What was wrong was the rule: it also bound a block for every
+/// FULLY SOLID brick, so the demo world asked for 370,719 and 239,647 requests
+/// were refused. Because `allocate` fills blocks in brick-index order and
+/// `brick_idx` is z-major, that did not degrade evenly - it covered a solid
+/// slab over world z 0..192 of 512 and left every camera past it on the old
+/// per-pixel path. The fix was to stop binding storage that nothing can read
+/// (see `World::brick_needs_light`), not to buy a 192 MiB pool to hold it.
+/// Both were built and benchmarked; the numbers are in
+/// docs/rt/BASELINE-per-voxel-lighting.md, round D.
+///
+/// Exhaustion still degrades gracefully rather than failing (see `allocate`),
+/// and refusals are now reported at ERROR level with a running total
+/// (`overflow_total`) so a world class that does outgrow this cannot saturate
+/// unnoticed the way this one did.
 pub const LIGHT_BLOCKS_MAX: u32 = 131_072;
 
 /// u32 words of GPU storage backing the whole pool (64 MiB).
@@ -99,6 +120,15 @@ pub struct LightField {
     /// Allocation requests refused because the pool was full, since the last
     /// `take_overflow`. Surfaced rather than silently dropped.
     overflow: u32,
+    /// Requests refused since the field was built, NEVER cleared.
+    ///
+    /// The per-frame counter above resets on every `take_overflow`, so a world
+    /// that saturates once on its full-dirty init frame and then goes quiet
+    /// reports zero for every frame after - which is exactly how this field ran
+    /// saturated through several benchmark rounds without anyone noticing. The
+    /// running total is the number that says "this world does not fit", and it
+    /// is reported alongside the delta.
+    overflow_total: u32,
     /// Set whenever a binding changed, so the renderer re-uploads the brick
     /// table and work list only when they actually differ. Without this the
     /// frame would push 4 MB of unchanged table every time.
@@ -121,6 +151,7 @@ impl LightField {
             free: Vec::new(),
             pending_reset: Vec::new(),
             overflow: 0,
+            overflow_total: 0,
             // The GPU table starts all-NONE and the pool starts zeroed
             // (epoch 0 = invalid), which is exactly the empty state, so the
             // first frame has nothing to re-upload.
@@ -192,6 +223,7 @@ impl LightField {
             None => {
                 if self.slots.len() as u32 >= self.blocks_max {
                     self.overflow = self.overflow.saturating_add(1);
+                    self.overflow_total = self.overflow_total.saturating_add(1);
                     return None;
                 }
                 let b = self.slots.len() as u32;
@@ -252,6 +284,14 @@ impl LightField {
         std::mem::replace(&mut self.overflow, 0)
     }
 
+    /// Requests refused over this field's whole life. Never cleared, so a
+    /// caller that reports only the per-frame delta can still say how much of
+    /// the world has been turned away in total.
+    #[inline]
+    pub fn overflow_total(&self) -> u32 {
+        self.overflow_total
+    }
+
     /// Word offset of `block`'s records within the LIGHT pool buffer.
     #[inline]
     pub fn block_word_offset(block: u32) -> u32 {
@@ -298,6 +338,133 @@ impl LightField {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Face-adjacent bricks of `bi`, x/z wrapping and y clamped. CPU mirror of
+    /// `World::brick_neighbours`, which is private; kept local so this test
+    /// states the adjacency it needs instead of the allocator handing it over.
+    fn brick_face_neighbours(bi: u32) -> Vec<u32> {
+        use crate::voxel::{brick_coords, brick_idx};
+        use crate::world_dims::{WORLD_BRICKS_X, WORLD_BRICKS_Y, WORLD_BRICKS_Z};
+        let (bx, by, bz) = brick_coords(bi);
+        let wrap = |v: i64, m: u32| -> u32 { v.rem_euclid(m as i64) as u32 };
+        let mut out = vec![
+            brick_idx(wrap(bx as i64 + 1, WORLD_BRICKS_X), by, bz),
+            brick_idx(wrap(bx as i64 - 1, WORLD_BRICKS_X), by, bz),
+            brick_idx(bx, by, wrap(bz as i64 + 1, WORLD_BRICKS_Z)),
+            brick_idx(bx, by, wrap(bz as i64 - 1, WORLD_BRICKS_Z)),
+        ];
+        if by + 1 < WORLD_BRICKS_Y {
+            out.push(brick_idx(bx, by + 1, bz));
+        }
+        if by > 0 {
+            out.push(brick_idx(bx, by - 1, bz));
+        }
+        out
+    }
+
+    /// The pool ceiling, checked against a REAL streamed world rather than an
+    /// estimate of one.
+    ///
+    /// This is the test whose absence let the field run saturated: the ceiling
+    /// was derived from the shape of the terrain shell, the crafted scenes bind
+    /// a couple of thousand blocks, and nothing ever asked a fully generated
+    /// world whether it fit. It did not - the demo world asked for 370,719
+    /// blocks against a 131,072 ceiling, and because `allocate` fills brick
+    /// indices in order and `brick_idx` is z-major, the refusals were not spread
+    /// thin but concentrated into a hard geographic cliff.
+    ///
+    /// Both halves are asserted, because either one alone can pass while the
+    /// feature is broken:
+    ///  - it FITS, with headroom, and refuses nothing;
+    ///  - and it still covers every air voxel that touches solid, so "it fits"
+    ///    was not bought by leaving lit surfaces without storage.
+    #[test]
+    fn the_demo_world_light_shell_fits_the_pool_and_still_covers_it() {
+        use crate::voxel::World;
+        let mut w = World::new();
+        w.fill_demo_terrain();
+
+        let (mut empty, mut partial, mut full) = (0u32, 0u32, 0u32);
+        for b in &w.bricks {
+            if b.is_empty() {
+                empty += 1;
+            } else if b.is_full() {
+                full += 1;
+            } else {
+                partial += 1;
+            }
+        }
+
+        w.sync_light_shell_all();
+        w.sync_refl_shell_all();
+        let (light, refl) = (w.light.allocated(), w.refl.allocated());
+        eprintln!(
+            "demo world bricks: {empty} empty, {partial} partial, {full} full, {} total",
+            WORLD_BRICKS_TOTAL,
+        );
+        eprintln!(
+            "demo world binds: light {light} / {LIGHT_BLOCKS_MAX} blocks ({:.1} MB of {:.1} MB), \
+             refl {refl} / {REFL_BLOCKS_MAX} blocks",
+            light as f64 * (LIGHT_RECORDS_PER_BLOCK * LIGHT_RECORD_WORDS * 4) as f64 / 1e6,
+            LIGHT_POOL_WORDS as f64 * 4.0 / 1e6,
+        );
+
+        assert_eq!(
+            w.light.take_overflow(),
+            0,
+            "the demo world's lit shell ({light} blocks) does not fit the {LIGHT_BLOCKS_MAX}-block \
+             pool; the refused bricks render through the per-pixel path, and because blocks are \
+             handed out in z-major brick order the loss is a contiguous slab of the world rather \
+             than an even thinning"
+        );
+        assert_eq!(w.refl.take_overflow(), 0, "the demo world's reflective set does not fit");
+        // Headroom, not just a fit: terrain seeds vary, and a ceiling that a
+        // real world only just clears is one cave system away from the cliff
+        // above.
+        assert!(
+            light * 2 <= LIGHT_BLOCKS_MAX as usize,
+            "the lit shell ({light}) uses more than half the {LIGHT_BLOCKS_MAX}-block pool; \
+             there is no headroom for a rougher world"
+        );
+
+        // Coverage, brick by brick, stated from what the SAMPLER needs rather
+        // than copied from `brick_needs_light`: every air voxel that touches a
+        // solid voxel must lie in a brick that has a block, or shading there
+        // silently falls back to the per-pixel path.
+        //
+        // An air voxel's solid neighbour is either in its own brick (then that
+        // brick is non-empty and, holding air, not full) or in a face-adjacent
+        // one (then that neighbour is non-empty), so these two cases are the
+        // whole requirement.
+        let mut missing = Vec::new();
+        let mut stray = Vec::new();
+        for bi in 0..WORLD_BRICKS_TOTAL {
+            let b = &w.bricks[bi as usize];
+            let has_block = w.light.block_of(bi).is_some();
+            if b.is_full() {
+                // No air at all: every tap into it is dropped by the sampler's
+                // solidity gate, so a block here is 512 bytes and a workgroup
+                // of update work that nothing can ever read.
+                if has_block && stray.len() < 8 {
+                    stray.push(bi);
+                }
+                continue;
+            }
+            let needs = !b.is_empty()
+                || brick_face_neighbours(bi).iter().any(|&n| !w.bricks[n as usize].is_empty());
+            if needs && !has_block && missing.len() < 8 {
+                missing.push(bi);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "bricks holding lit air voxels have no light block (first few: {missing:?})"
+        );
+        assert!(
+            stray.is_empty(),
+            "fully solid bricks hold light blocks nothing can read (first few: {stray:?})"
+        );
+    }
 
     #[test]
     fn pool_sizing_matches_the_documented_budget() {

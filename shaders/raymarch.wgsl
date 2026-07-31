@@ -590,6 +590,27 @@ fn refl_record_word(world_v: vec3<i32>) -> u32 {
 /// the record has never been written, or when the query direction lies so far
 /// outside the recorded hemisphere that the linear fit reconstructs a strongly
 /// negative radiance, which is proof the record does not describe it.
+///
+/// BILINEAR IN THE SURFACE PLANE. A nearest-voxel read of this field renders
+/// water as a patchwork of flat axis-aligned tiles, one per voxel footprint,
+/// each a slightly different blue - the record set is per-voxel, so reading it
+/// per-voxel makes the storage grid itself visible and erases every
+/// wave-scale gradient. Blending the four records around the sample point in
+/// the surface plane is what turns a set of samples back into a surface, and
+/// is the same reason `voxlight_sample` interpolates rather than point-sampling.
+///
+/// Bilinear rather than trilinear ON PURPOSE: a reflective surface is a sheet
+/// one voxel thick (a lake top, a window pane), so across the NORMAL there is
+/// no second record to blend with - the cell on one side is submerged and the
+/// one on the other is air, and both are cleared to "never written". A
+/// trilinear tap set would spend four of its eight taps on cells that are
+/// rejected by construction.
+///
+/// Taps are gated exactly as `voxlight_sample` gates its own: a neighbour with
+/// no reflection block (the shore of a lake) or an unwritten record (a
+/// non-reflective voxel sharing the block) is DROPPED and the surviving
+/// weights renormalised, so an edge blends toward its own interior instead of
+/// toward garbage.
 fn voxlight_reflection(p_world: vec3<f32>, n: vec3<f32>, refl_dir: vec3<f32>,
                        ok: ptr<function, bool>) -> vec3<f32> {
     *ok = false;
@@ -597,7 +618,8 @@ fn voxlight_reflection(p_world: vec3<f32>, n: vec3<f32>, refl_dir: vec3<f32>,
     // cell: a glass hit sits exactly on the cube face, and a water plate can
     // sit flush with its cell's top face, so plain floor(p) can name the air
     // voxel in front instead.
-    let v = vec3<i32>(floor(p_world - n * 0.02));
+    let q = p_world - n * 0.02;
+    let v = vec3<i32>(floor(q));
     let w = refl_record_word(v);
     if (w == VL_NONE) { return vec3<f32>(0.0); }
     let w0 = refl_pool[w];
@@ -606,13 +628,86 @@ fn voxlight_reflection(p_world: vec3<f32>, n: vec3<f32>, refl_dir: vec3<f32>,
     let w3 = refl_pool[w + 3u];
     // All zero == never written. Guaranteed distinct from converged-to-black by
     // the update pass's DC floor (see the block comment above).
+    //
+    // Checked on the HIT voxel's OWN record and treated as a full miss, not as
+    // one dropped tap: the cache describes the surface that was hit, so a voxel
+    // it has nothing for must fall back to the per-pixel trace rather than
+    // borrow its neighbours' reflections.
     if ((w0 | w1 | w2 | w3) == 0u) { return vec3<f32>(0.0); }
 
-    let m0 = vl_unpack_rgb9e5(w0);
-    // Undo the DC bias to recover the signed directional moments.
-    let mx = vl_unpack_rgb9e5(w1) - m0;
-    let my = vl_unpack_rgb9e5(w2) - m0;
-    let mz = vl_unpack_rgb9e5(w3) - m0;
+    // The two axes of the surface plane: everything but the dominant axis of
+    // the normal. Both reflective materials present axis-aligned faces (water
+    // reflects off its cell top, glass off one cube face), so the dominant
+    // component IS the face axis even when `n` is a slightly tilted wave facet.
+    var e0 = vec3<f32>(1.0, 0.0, 0.0);
+    var e1 = vec3<f32>(0.0, 0.0, 1.0);
+    let an = abs(n);
+    if (an.x >= an.y && an.x >= an.z) {
+        e0 = vec3<f32>(0.0, 1.0, 0.0);
+        e1 = vec3<f32>(0.0, 0.0, 1.0);
+    } else if (an.z >= an.x && an.z >= an.y) {
+        e0 = vec3<f32>(1.0, 0.0, 0.0);
+        e1 = vec3<f32>(0.0, 1.0, 0.0);
+    }
+
+    // Weights about the CELL CENTRE, so the lattice is the voxel centres and
+    // not the voxel corners: a point in the middle of its cell reads that cell
+    // alone, a point on a cell boundary reads both sides equally, and the
+    // result is continuous ACROSS the boundary. The centre tap therefore always
+    // carries at least a quarter of the weight, which is what makes it the
+    // right record to gate the whole sample on above.
+    let d = (q - floor(q)) - vec3<f32>(0.5);
+    // sign() is 0 for a component that sits exactly on the centre, which pairs
+    // with a zero weight below, so the degenerate tap costs nothing.
+    let s = vec3<i32>(sign(d));
+    let o0 = vec3<i32>(e0) * s;
+    let o1 = vec3<i32>(e1) * s;
+    let f0 = abs(dot(d, e0));
+    let f1 = abs(dot(d, e1));
+
+    // Accumulate the SH COEFFICIENTS and fit ONCE, rather than fitting each
+    // record and blending four colours. The reconstruction is linear in the
+    // moments for a fixed (n, refl_dir), so the two agree everywhere except at
+    // this function's two nonlinearities - the out-of-hemisphere reject and the
+    // clamp at zero - and both of those are judgements about "does this surface
+    // describe this direction", which belong on the blended record rather than
+    // on each tap. It is also three reconstructions cheaper.
+    var wsum = (1.0 - f0) * (1.0 - f1);
+    let cm0 = vl_unpack_rgb9e5(w0);
+    var acc0 = cm0 * wsum;
+    // The DC bias is undone PER TAP, before the blend: each record is biased by
+    // its OWN dc, so blending the packed words would mix four different biases.
+    var accx = (vl_unpack_rgb9e5(w1) - cm0) * wsum;
+    var accy = (vl_unpack_rgb9e5(w2) - cm0) * wsum;
+    var accz = (vl_unpack_rgb9e5(w3) - cm0) * wsum;
+    for (var k = 1u; k < 4u; k = k + 1u) {
+        let b0 = (k & 1u) != 0u;
+        let b1 = (k & 2u) != 0u;
+        let tw = select(1.0 - f0, f0, b0) * select(1.0 - f1, f1, b1);
+        if (tw <= 0.0) { continue; }
+        let c = v + select(vec3<i32>(0), o0, b0) + select(vec3<i32>(0), o1, b1);
+        let rw = refl_record_word(c);
+        if (rw == VL_NONE) { continue; }
+        let r0 = refl_pool[rw];
+        let r1 = refl_pool[rw + 1u];
+        let r2 = refl_pool[rw + 2u];
+        let r3 = refl_pool[rw + 3u];
+        if ((r0 | r1 | r2 | r3) == 0u) { continue; }
+        let n0 = vl_unpack_rgb9e5(r0);
+        acc0 = acc0 + n0 * tw;
+        accx = accx + (vl_unpack_rgb9e5(r1) - n0) * tw;
+        accy = accy + (vl_unpack_rgb9e5(r2) - n0) * tw;
+        accz = accz + (vl_unpack_rgb9e5(r3) - n0) * tw;
+        wsum = wsum + tw;
+    }
+    // wsum >= 0.25 by construction (the centre tap survived the gate above), so
+    // no divide-by-zero guard is needed here - unlike voxlight_sample, whose
+    // centre tap can itself be dropped by the solidity test.
+    let inv = 1.0 / wsum;
+    let m0 = acc0 * inv;
+    let mx = accx * inv;
+    let my = accy * inv;
+    let mz = accz * inv;
 
     // Per-channel dot products of the moment VECTOR (mx, my, mz) with the pole
     // and with the query direction. Written component-wise so all three colour

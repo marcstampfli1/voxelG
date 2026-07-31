@@ -61,24 +61,92 @@ the adjacent air voxel.
 ## Sparse storage: a per-brick block pool
 
 A brick is 4^3 = 64 voxels (`world_dims.rs:9`), so a brick's light block is
-64 * 8 = 512 bytes. Blocks are allocated ONLY for bricks that contain at
-least one lit-shell air voxel. Solid interior bricks and open sky bricks get
-nothing, which is the overwhelming majority of the 1,048,576-brick world.
+64 * 8 = 512 bytes. Blocks are allocated ONLY for bricks that can hold a
+lit-shell AIR voxel. Solid interior bricks and open sky bricks get nothing,
+which is the overwhelming majority of the 1,048,576-brick world.
 
-Pool: 131,072 blocks = 64 MiB, with an explicit free list. Sizing rationale:
-the terrain shell is roughly a 128x128 brick sheet in xz, and relief, caves,
-trees and overhangs spread that over several brick layers, so the resident
-lit shell lands in the 65k-130k block range for the streamed window.
+Pool: 131,072 blocks = 64 MiB, with an explicit free list.
 
-Resulting GPU budget alongside what already exists:
+MEASURED against the demo world (`World::fill_demo_terrain`, a fully
+generated 512x256x512 window), not estimated:
 
-    voxel bricks      75.5 MB   (existing)
-    light field       64.0 MB   (new)
-    GI probe grid     25.2 MB   (existing)
+    1,048,576 bricks   699,991 empty   38,040 partial   310,545 fully solid
+    lit shell bound     60,174 blocks = 30.8 MB, 46% of the pool
+
+So the whole streamed window is covered with 2.18x headroom and nothing falls
+back to the per-pixel path for want of storage. Pinned by the test
+`the_demo_world_light_shell_fits_the_pool_and_still_covers_it`
+(`src/voxlight.rs`), which asserts both halves: it fits, AND it still covers
+every air voxel that touches solid.
+
+That measurement was taken only after a real defect. `brick_needs_light`
+originally bound a block for every NON-EMPTY brick, which includes every
+fully solid one, so the demo world asked for 370,719 blocks and 239,647
+requests were refused. Because `allocate` hands out blocks in brick-index
+order and `brick_idx` is z-major, that did not thin out evenly: it filled a
+solid slab over world z 0..192 of 512 and left every camera past it on the
+old per-pixel path, a hard geographic cliff rather than graceful degradation.
+A block on a fully solid brick is dead by construction - the update pass
+writes epoch 0 for every solid voxel and `voxlight_sample` drops every tap
+that lands in one - so those 310,545 blocks were five sixths of the storage
+and five sixths of the update dispatch, buying nothing any pixel could read.
+The fix was to stop binding them, not to buy a bigger buffer.
 
 Full voxel resolution is deliberate. Storing at half resolution would be 8x
 cheaper but could not resolve a one-voxel step, which is exactly where
 contact shadows and AO carry their detail.
+
+## GPU memory budget
+
+World-resident, independent of resolution:
+
+    voxel bricks               75.5 MB   1,048,576 * 72 B
+    light pool                 67.1 MB   131,072 blocks * 512 B (60,174 live)
+    light brick->block table    4.2 MB   one u32 per brick
+    light work list             0.5 MB
+    reflection pool            16.8 MB   16,384 blocks * 1 KiB (2,050 live)
+    reflection table + list     4.3 MB
+    GI probe grid              25.2 MB   131,072 probes * 192 B
+    occupancy pyramid + hints   1.2 MB
+    ------------------------------------
+                              194.8 MB
+
+Screen-space, at 1920x1080 in the shipped RT + probe-GI configuration:
+
+    transp records + godray scratch + refl history   74.6 MB
+    GI accumulation (gi_in + gi_out, Rgba32Float)    66.4 MB
+    lighting reprojection cache (out + hist)         66.4 MB
+    HDR scene + geometry (Rgba16Float)               33.2 MB
+    depth, LDR, resolve, bloom, cloud, beam          33.4 MB
+    ------------------------------------------------------
+                                                    274.0 MB
+
+Total ~469 MB, plus the RT acceleration structures (not accounted here). The
+light field is 14% of that and the SECOND largest world-resident item after
+the brick pyramid it sits beside, which is proportionate for the thing that
+carries all shadowing, AO and local light.
+
+It would NOT have been proportionate the other way round, and that is
+measured rather than argued. The 393,216-block pool the broken membership
+rule needs (201.3 MB, i.e. 329 MB of world data and ~604 MB total) was built
+and benchmarked: it binds all 370,719 blocks, and every FIELD A/B delta comes
+out the same to within noise (terrain -0.92 vs -0.92 ms, foliage -0.00 vs
+-0.00, water-close -2.86 vs -2.91, terrain-covered -2.11 vs -2.10). Nothing
+renders differently, exactly as the "solid taps are dropped" argument says it
+should. What differs is +134 MB of VRAM and a light update pass at 1.41 ms
+instead of 1.19 ms per frame - +0.22 ms, +18%. The extra blocks are cheap
+rather than free because `cs_voxel_light_update` early-outs on a solid voxel
+before tracing anything, so 6.2x the blocks costs 1.18x the time; the price
+is overwhelmingly memory, not milliseconds. Either way it is a price paid for
+records nothing can read.
+
+If a future world class genuinely outgrows 131,072 lit-shell blocks, the
+answer is still not a bigger buffer: it is to bound allocation to a radius
+around the camera, so cost tracks what can be seen rather than what has been
+generated. The pool is already a free list with O(1) release
+(`LightField::release`), and streaming already frees recycled slots, so that
+bound is a policy change in `sync_light_shell_*` rather than a storage
+redesign. `LightField::overflow_total` now makes the trigger for it visible.
 
 ## Update pass: amortized and deterministic
 
@@ -140,6 +208,25 @@ per-voxel scheme can:
   direction retains coarse view dependence for free instead of collapsing the
   surface to a single wash.
 - One reflection ray per reflective voxel per round, folded into the SH.
+- SAMPLING IS BILINEAR IN THE SURFACE PLANE, not nearest-voxel. This is not a
+  refinement, it is the difference between a surface and a grid: read
+  per-voxel, the field renders water as a patchwork of flat axis-aligned
+  tiles, each a slightly different blue, with a hard step at every voxel
+  boundary. Blending the four records around the sample point across the two
+  axes perpendicular to the normal is what turns the samples back into a
+  surface, and it is the same reason `voxlight_sample` interpolates.
+  Bilinear rather than trilinear because a reflective surface is a sheet one
+  voxel thick, so across the normal there is no second record to blend with.
+  Taps are gated like the light field's: a neighbour with no block or an
+  unwritten record is dropped and the surviving weights renormalised, so the
+  shore of a lake blends toward its own interior rather than toward garbage.
+  The SH COEFFICIENTS are blended and the fit evaluated once; the
+  reconstruction is linear in the moments, so that agrees with blending four
+  evaluated colours everywhere except at the out-of-hemisphere reject and the
+  clamp at zero, both of which are judgements that belong on the blended
+  record. Measured by `voxlight_refl_is_continuous_across_voxel_boundaries`:
+  the step across a cell boundary is 4% of the difference between the two
+  cells' own centres, against 100% for a nearest lookup.
 
 ## Point lights
 
@@ -213,9 +300,18 @@ Nothing here is judged by eye alone or declared done off a compile.
 5. PARTIAL - point lights are gathered by the update pass, uploaded, and
    surfaced through `Renderer::set_point_lights`. Nothing in the game calls it
    yet, and there is no test covering a lit point light.
-6. NOT STARTED - per-voxel reflections.
-7. NOT STARTED - secondary rays read the field.
-8. IN PROGRESS - baseline captured in `docs/rt/BASELINE-per-voxel-lighting.md`.
+6. DONE - per-voxel reflections: SH-L1 records for water tops and glass faces,
+   an amortized update pass on the same round counter as the light field, and
+   a bilinear surface-plane sampler. The look cost the decision predicted is
+   REAL and is recorded honestly in round D of
+   `docs/rt/BASELINE-per-voxel-lighting.md`: the tiling is gone, the grazing
+   under-reconstruction is not.
+7. DONE BY CONSTRUCTION - secondary rays read the field. Reflection and glass
+   hits are shaded through the same `shade`, which fetches `voxlight_sample`
+   (`raymarch.wgsl`, search `let vlf =`), so a secondary hit pays one field
+   fetch instead of a shadow ray plus an AO evaluation.
+8. DONE - rounds A through D in `docs/rt/BASELINE-per-voxel-lighting.md`,
+   including the populated-field A/B that rounds A-C could not measure.
 
 ### Known follow-ups found while building
 
@@ -230,10 +326,30 @@ Nothing here is judged by eye alone or declared done off a compile.
 - AO IS RECOMPUTED EVERY ROUND for no reason. It is purely geometric, so
   eighteen occupancy lookups per voxel per round are repeated work; it only
   needs recomputing when the record is reset or its brick is edited.
-- POOL SIZING IS UNVALIDATED AGAINST A REAL STREAMED WORLD. The 131072-block
-  ceiling was derived from the shape of the terrain shell, and the crafted test
-  worlds bind only ~2300 blocks. `take_overflow` will log if it is short, but
-  nobody has yet flown a real world far enough to find out.
+- POOL SIZING IS NOW VALIDATED, and it was short. See "Sparse storage" above:
+  the membership rule bound a block for every fully solid brick, the demo
+  world overflowed by 239,647 requests, and the loss was a contiguous z slab
+  rather than an even thinning. Fixed at the rule, and pinned by
+  `the_demo_world_light_shell_fits_the_pool_and_still_covers_it`. The
+  overflow report was also part of the failure: it fired once, at `warn`, on
+  the init frame and then read zero forever after, so several benchmark rounds
+  ran saturated without it being noticed. It is now `log::error!` and quotes a
+  running total (`LightField::overflow_total`).
+- GRAZING WATER READS DARKER THAN HEAD-ON, and interpolation did not change
+  it. Measured by `voxlight_refl_reads_back_plausible_radiance` over an
+  open-sky sheet: grazing (19 degrees) luma 0.269 against head-on 0.513,
+  identical before and after the bilinear sampler. It is definitely not a
+  sampling artifact - over that sheet every record is identical, so the blend
+  is a no-op - but WHICH of two causes it is has NOT been tested:
+  (a) the SH-L1 fit under-reconstructing toward the rim, which is where
+  Fresnel weights the reflection most, or (b) the real sky simply being
+  dimmer at 19 degrees than at the zenith, in which case 0.269 is correct.
+  The comment at the reconstruction asserts (a) is harmless ("falls the right
+  way here"); nothing has tested that either. The cheapest discriminating
+  check is to have `cs_vl_probe` also return `sky(refl_dir)` and compare, so
+  the fit is measured against the radiance it is fitting rather than against
+  its own value in another direction. OPEN, and open at the level of the
+  diagnosis, not just the fix.
 
 ### What is NOT yet true
 

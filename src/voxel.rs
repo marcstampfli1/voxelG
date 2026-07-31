@@ -311,6 +311,14 @@ impl Brick {
         self.occupancy == 0
     }
 
+    /// Every voxel occupied, i.e. the brick holds no air at all. The exact
+    /// complement of `is_empty` on the same word, so the two can never disagree
+    /// about what "occupied" means.
+    #[inline(always)]
+    pub fn is_full(&self) -> bool {
+        self.occupancy == u64::MAX
+    }
+
     #[inline(always)]
     pub fn set(&mut self, x: u32, y: u32, z: u32, mat: u8) {
         let i = brick_voxel_idx(x, y, z);
@@ -937,14 +945,36 @@ impl World {
         }
     }
 
-    /// A brick needs light storage when it can hold air next to solid: either
-    /// it is non-empty (so it holds both), or it is empty but touches a
-    /// non-empty brick (the open air directly above a surface). Conservative by
-    /// one brick, which is exactly what keeps the sampler's eight-tap
-    /// neighbourhood populated right at a surface instead of falling off the
-    /// edge of the allocated region.
+    /// A brick needs light storage when it can hold air next to solid: it holds
+    /// at least one AIR voxel, and either it is non-empty (so it holds both) or
+    /// it touches a non-empty brick (the open air directly above a surface).
+    /// Conservative by one brick on the air side, which is exactly what keeps
+    /// the sampler's eight-tap neighbourhood populated right at a surface
+    /// instead of falling off the edge of the allocated region.
+    ///
+    /// A FULLY SOLID brick is excluded, and that exclusion is the difference
+    /// between a shell and a volume. Light lives in air: the update pass writes
+    /// epoch 0 for every solid voxel and `voxlight_sample` drops every tap that
+    /// lands in one, so a block bound to a brick with no air holds 64 records
+    /// that nothing can ever read - while still costing 512 bytes of pool and a
+    /// workgroup of update work every time its slice of the work list comes
+    /// round. On the demo world that is 310,545 of the 370,719 bricks the old
+    /// rule asked for (measured), i.e. five sixths of the storage and of the
+    /// update dispatch, and it is what made the pool overflow by 3x and strand
+    /// whole cameras on the per-pixel fallback.
+    ///
+    /// Excluding them changes nothing the sampler can observe: every voxel of a
+    /// full brick is solid, so every tap into it was already dropped. That is an
+    /// argument, so it was also measured - benchmarking both rules side by side
+    /// moves every FIELD A/B delta by at most 0.05 ms while saving 134 MB of
+    /// pool and 0.22 ms of update per frame (docs/rt/BASELINE-per-voxel-
+    /// lighting.md, round D).
     fn brick_needs_light(&self, bi: u32) -> bool {
-        if !self.bricks[bi as usize].is_empty() {
+        let brick = &self.bricks[bi as usize];
+        if brick.is_full() {
+            return false;
+        }
+        if !brick.is_empty() {
             return true;
         }
         let (nb, n) = self.brick_neighbours(bi);
