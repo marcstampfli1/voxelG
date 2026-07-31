@@ -367,13 +367,25 @@ struct VoxLightParams {
     fold: f32,
     ao_strength: f32,
     // Reflection cache (see the block after voxlight_sample). It rides the same
-    // params buffer, round counter and update_div as the light field because it
-    // is the same amortization: one more uniform would be one more thing that
-    // can drift out of step with `round`.
+    // params buffer and round counter as the light field, but NOT the same
+    // divisor: see `refl_update_div`.
     refl_live_count: u32,
     refl_rays: u32,
     refl_fold: f32,
-    _pad: u32,
+    // The reflection pass's own amortization divisor.
+    //
+    // It cannot share the light field's. The two passes fold estimates with
+    // completely different variance: a sun-visibility estimate samples a disc a
+    // couple of degrees wide, so any subset of its rays agrees with any other
+    // and a partial estimate is nearly a whole one. A reflection estimate
+    // samples a whole HEMISPHERE whose radiance spans an order of magnitude
+    // between the sky above and the terrain at the rim, so a partial estimate
+    // is not an approximation of the full one - it is a different number. The
+    // reflection pass therefore visits each block RARELY and gathers a COMPLETE
+    // stratified hemisphere every visit (`refl_rays` = VL_REFL_EPOCHS), for the
+    // same rays per frame as the old visit-often-gather-one shape and without
+    // its round-to-round walk. See the block comment on cs_voxel_refl_update.
+    refl_update_div: u32,
 };
 
 struct VlPointLight {
@@ -584,12 +596,39 @@ fn refl_record_word(world_v: vec3<i32>) -> u32 {
 /// the other way round - visibility belongs to the air cell against the face -
 /// which is why the two samplers do not share a lookup.)
 ///
-/// `n` is the shading normal and identifies the hemisphere the record was
-/// fitted over; `refl_dir` is the direction to evaluate. `*ok` comes back false
-/// - leaving the caller on its per-pixel path - when there is no block, when
-/// the record has never been written, or when the query direction lies so far
-/// outside the recorded hemisphere that the linear fit reconstructs a strongly
-/// negative radiance, which is proof the record does not describe it.
+/// `n` is the SHADING normal and `refl_dir` is the direction to evaluate.
+/// `*ok` comes back false - leaving the caller on its per-pixel path - when
+/// there is no block, when the record has never been written, or when the query
+/// direction lies so far outside the recorded hemisphere that the linear fit
+/// reconstructs a strongly negative radiance, which is proof the record does
+/// not describe it.
+///
+/// `n` IS NOT EXACTLY THE POLE THE RECORD WAS FITTED ABOUT, and the fit below
+/// uses it as though it were. The update pass gathers water about world +Y and
+/// glass about `vlr_glass_face`, both axis aligned; the callers pass
+/// `hit.normal`, which for water is the animated Gerstner facet or, at a
+/// terrace step, the connected surface's own slope. Only the pole-dependent
+/// terms (`m_n` and `c`) are affected - the view-dependent `m_r` term uses
+/// `refl_dir` directly either way - so the error is the size of the tilt, and
+/// the two cases are very different:
+///
+///   - OPEN WATER: the Gerstner facet is bounded at 3.0 degrees of tilt (max
+///     slope 0.0525, from the four amplitudes and wavenumbers in `wave_param`),
+///     so the cosine of the pole error is 0.9986 and the pole term moves by
+///     under 0.2%. Negligible, and MEASURED negligible: sweeping a full facet
+///     cone moves the reconstruction by 0.107 luma where the true mirror moves
+///     0.323 over the same sweep (`voxlight_refl_diagnose`, section B).
+///   - TERRACE STEPS AND PINNED CORNERS: the surface connection reaches 45
+///     degrees, where the pole error is large. Re-poling the fit onto the
+///     query surface's own normal also makes `c = dot(refl_dir, n)` read near
+///     1, so the fit believes every query is a POLE query and the
+///     out-of-hemisphere reject cannot fire: the record answers confidently
+///     for a direction it never sampled. Measured at 45 degrees: 0 misses in
+///     16 azimuths, cache spanning 0.43 luma where the mirror spans 1.88.
+///
+/// That is a real limitation at shorelines. It is NOT fixed here, and it is
+/// recorded in docs/VOXEL_LIGHTING_PLAN.md rather than left implied by a
+/// comment claiming `n` identifies the fitted hemisphere, which it does not.
 ///
 /// BILINEAR IN THE SURFACE PLANE. A nearest-voxel read of this field renders
 /// water as a patchwork of flat axis-aligned tiles, one per voxel footprint,
@@ -635,17 +674,27 @@ fn voxlight_reflection(p_world: vec3<f32>, n: vec3<f32>, refl_dir: vec3<f32>,
     // borrow its neighbours' reflections.
     if ((w0 | w1 | w2 | w3) == 0u) { return vec3<f32>(0.0); }
 
-    // The two axes of the surface plane: everything but the dominant axis of
-    // the normal. Both reflective materials present axis-aligned faces (water
-    // reflects off its cell top, glass off one cube face), so the dominant
-    // component IS the face axis even when `n` is a slightly tilted wave facet.
+    // The DOMINANT AXIS of the normal, which is both the pole the record was
+    // gathered about and the axis the surface plane is perpendicular to. Both
+    // reflective materials present axis-aligned faces - water reflects off its
+    // cell top (gathered about world +Y), glass off one cube face (gathered
+    // about `vlr_glass_face`) - so quantising `n` to its dominant axis RECOVERS
+    // the gather axis from a shading normal that has been tilted away from it
+    // by the wave field or by a terrace connection.
+    //
+    // Deriving the pole and the two in-plane axes from one branch keeps them
+    // consistent by construction: the plane axes are exactly the two the pole
+    // is not.
+    var pole = vec3<f32>(0.0, sign(n.y), 0.0);
     var e0 = vec3<f32>(1.0, 0.0, 0.0);
     var e1 = vec3<f32>(0.0, 0.0, 1.0);
     let an = abs(n);
     if (an.x >= an.y && an.x >= an.z) {
+        pole = vec3<f32>(sign(n.x), 0.0, 0.0);
         e0 = vec3<f32>(0.0, 1.0, 0.0);
         e1 = vec3<f32>(0.0, 0.0, 1.0);
     } else if (an.z >= an.x && an.z >= an.y) {
+        pole = vec3<f32>(0.0, 0.0, sign(n.z));
         e0 = vec3<f32>(1.0, 0.0, 0.0);
         e1 = vec3<f32>(0.0, 1.0, 0.0);
     }
@@ -712,20 +761,55 @@ fn voxlight_reflection(p_world: vec3<f32>, n: vec3<f32>, refl_dir: vec3<f32>,
     // Per-channel dot products of the moment VECTOR (mx, my, mz) with the pole
     // and with the query direction. Written component-wise so all three colour
     // channels resolve in one set of multiply-adds.
-    let m_n = mx * n.x + my * n.y + mz * n.z;
+    //
+    // Against `pole`, NOT the shading normal. The moments were gathered about
+    // the axis-aligned gather axis, so that is the axis their moment matrix was
+    // solved for; feeding the tilted shading normal in here solves a hemisphere
+    // the update pass never sampled. It also destroyed the out-of-hemisphere
+    // reject, because `dot(refl_dir, n)` for a mirror direction about `n` is
+    // `dot(-dir, n)`, which is large whenever the facet faces the viewer - so
+    // every query looked like a POLE query no matter where it actually pointed,
+    // and a 45-degree terrace facet answered confidently for directions the
+    // record had never seen. Measured over a 45-degree facet cone, using the
+    // pole widens the reconstruction from a washed 0.27..0.70 to 0.00..1.93
+    // against the true mirror's own 0.05..1.93; on open water, where the facet
+    // is within 3 degrees of the pole, it changes nothing (0.759 vs 0.757
+    // correlation with the mirror over a grazing lake still).
+    let m_n = mx * pole.x + my * pole.y + mz * pole.z;
     let m_r = mx * refl_dir.x + my * refl_dir.y + mz * refl_dir.z;
-    let c = clamp(dot(refl_dir, n), 0.0, 1.0);
-    // Least-squares SH-L1 reconstruction over the hemisphere about `n`, solved
-    // from that hemisphere's moment matrix (E[1] = 1, E[d.n] = 1/2,
-    // E[(d.n)^2] = 1/3, E[(d.t)^2] = 1/4). Exact for any field that IS linear
-    // and the least-squares projection otherwise, and frame-free: the tangent
-    // terms collapse into m_r, so no tangent basis is built at sample time.
+    let c = clamp(dot(refl_dir, pole), 0.0, 1.0);
+    // Least-squares SH-L1 reconstruction over the hemisphere about `pole`, solved
+    // from that hemisphere's moment matrix. The measure is the one the update
+    // pass samples with - cos(theta) uniform in (0,1], i.e. uniform in SOLID
+    // ANGLE - which gives E[1] = 1, E[d.n] = 1/2 and, for the second moments,
+    //
+    //     E[(d.n)^2] = integral of c^2 dc over (0,1] = 1/3
+    //     E[(d.t)^2] = E[(d.b)^2] = (1 - 1/3) / 2 = 1/3
+    //
+    // so E[d d^T] is exactly I/3 and the fit is
+    //
+    //     a = 4*m0 - 6*m_n,   b = 3*m - (6*m0 - 9*m_n)*n
+    //     f(r) = a + b.r = 4*m0 - 6*m_n + c*(9*m_n - 6*m0) + 3*m_r
+    //
+    // Exact for any field that IS linear and the least-squares projection
+    // otherwise, and frame-free: the tangent terms collapse into m_r, so no
+    // tangent basis is built at sample time.
+    //
+    // THIS USED TO READ 8*m_n and 4*m_r, which is the same solve with
+    // E[(d.t)^2] = 1/4 - the value for a COSINE-WEIGHTED hemisphere, not the
+    // uniform one the update pass actually samples. Mixing the two measures
+    // (E[d.n] = 1/2 and E[(d.n)^2] = 1/3 are both uniform; 1/4 is not)
+    // over-weighted the tangential term by exactly 4/3, so every horizontal
+    // swing of the reflection - which is the whole view-dependent part of it -
+    // came out a third too strong, and so did the estimator's noise. Checked
+    // against a linear field: with 3*m_r the reconstruction returns A + B.r to
+    // the digit, with 4*m_r it returns A + (4/3)*B.r.
     //
     // A linear fit OVERSHOOTS a peaked field at the pole (c = 1) and is
     // accurate near the rim (c = 0). That falls the right way here: c = 1 is
     // head-on, where Fresnel weights the reflection at ~2%, and c -> 0 is
     // grazing, where Fresnel weights it most.
-    let e = 4.0 * m0 - 6.0 * m_n + c * (8.0 * m_n - 6.0 * m0) + 4.0 * m_r;
+    let e = 4.0 * m0 - 6.0 * m_n + c * (9.0 * m_n - 6.0 * m0) + 3.0 * m_r;
 
     // A small negative excursion is the ordinary rim behaviour of a linear fit
     // to a non-negative field and is simply clamped. An excursion past the DC

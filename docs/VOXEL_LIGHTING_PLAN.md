@@ -301,11 +301,25 @@ Nothing here is judged by eye alone or declared done off a compile.
    surfaced through `Renderer::set_point_lights`. Nothing in the game calls it
    yet, and there is no test covering a lit point light.
 6. DONE - per-voxel reflections: SH-L1 records for water tops and glass faces,
-   an amortized update pass on the same round counter as the light field, and
-   a bilinear surface-plane sampler. The look cost the decision predicted is
-   REAL and is recorded honestly in round D of
-   `docs/rt/BASELINE-per-voxel-lighting.md`: the tiling is gone, the grazing
-   under-reconstruction is not.
+   an amortized update pass on the same round counter as the light field but on
+   its OWN divisor (`VOXLIGHT_REFL_UPDATE_DIV`, eight times rarer and a
+   COMPLETE hemisphere gather each visit), and a bilinear surface-plane
+   sampler. The look cost the decision predicted is REAL and is recorded
+   honestly in round D of `docs/rt/BASELINE-per-voxel-lighting.md`: the tiling
+   is gone, the under-reconstruction is not.
+
+   Two defects behind the "flickery and not correctly reflecting" report were
+   found and fixed after round D, both in the estimator/fit rather than in the
+   storage or the sampling (round E):
+   - the update pass folded ONE ray of a rotating direction set per visit, so
+     the record random-walked instead of converging (22.7-46.8% peak-to-peak on
+     a static scene; now 0.0%);
+   - the reconstruction solved its moment matrix with a COSINE-weighted
+     `E[(d.t)^2] = 1/4` while the update pass samples uniformly in solid angle,
+     over-weighting the whole view-dependent term by exactly 4/3;
+   - and the sampler evaluated the fit about the SHADING normal rather than the
+     axis the moments were gathered about, which at a steep terrace facet both
+     mis-solved the hemisphere and disabled the out-of-hemisphere reject.
 7. DONE BY CONSTRUCTION - secondary rays read the field. Reflection and glass
    hits are shaded through the same `shade`, which fetches `voxlight_sample`
    (`raymarch.wgsl`, search `let vlf =`), so a secondary hit pays one field
@@ -315,14 +329,53 @@ Nothing here is judged by eye alone or declared done off a compile.
 
 ### Known follow-ups found while building
 
-- TEMPORAL STABILITY IS UNMEASURED. Each round folds a 4-ray estimate at
-  `fold = 0.35`, an effective window of roughly three rounds or twelve rays, so
-  the stored value may shimmer between rounds even though the SPATIAL gradient
-  measures clean. The `flicker_probe_rt_views` rig exists precisely for this
-  and has not been run against the field yet. If it shimmers, the fix is the
-  probe grid's shape: accumulate a complete epoch cycle in a staging slot and
-  fold only finished estimates (`gi_probes.wgsl:255`), rather than lowering the
-  fold and adding lag.
+- TEMPORAL STABILITY WAS UNMEASURED, IS NOW MEASURED, AND IT WAS BROKEN. This
+  was the whole of the "flickery" half of the user report and it is FIXED. The
+  reflection pass used to visit a block every `VOXLIGHT_UPDATE_DIV` rounds and
+  fold ONE ray of a rotating eight-direction set at 0.125. A hemisphere over
+  water spans an order of magnitude in radiance between the sky overhead and
+  the terrain at the rim, so those eight directions are not eight noisy looks
+  at one number - they are eight different numbers, and an exponential average
+  over them is not the hemisphere mean at any instant. It random-walks behind
+  the direction cycle for ever.
+
+  Measured on a static scene, a static sun and a FIXED query direction
+  (`voxlight_refl_diagnose`, section C): 22.7-46.8% peak-to-peak, with a stored
+  `E[L*d.z]` of -0.17 where the true moment is unambiguously positive. The fix
+  is the one this entry predicted - the probe grid's shape, "fold only finished
+  estimates" - applied as: visit each block eight times more RARELY
+  (`VOXLIGHT_REFL_UPDATE_DIV`) and gather a COMPLETE stratified hemisphere on
+  each visit, for identical rays per frame. The direction set no longer depends
+  on the round either, because rotating it converts a fixed quadrature bias
+  into a varying one, which is flicker by another name.
+
+  The same measurement now reads 0.0% - the record is BITWISE constant once
+  converged - and `m_z` reads +0.035, the right sign. Pinned by
+  `voxlight_refl_record_is_stable_across_rounds`, which fails at 16.6% on the
+  old estimator. `flicker_probe_rt_views` was also finally run against a
+  grazing water view as an A/B, and that is the number that matters most: the
+  per-voxel cache flickers 26x LESS than the per-pixel reflection it replaces
+  (0.023% of pixels strongly flickering against 0.593%) at the same mean luma.
+- THE SAMPLER RE-POLES THE FIT ONTO THE SHADING NORMAL, which is not the axis
+  the record was gathered about. The update pass fits water about world +Y and
+  glass about `vlr_glass_face`; `shade_water_top` and `shade_glass` both pass
+  `hit.normal`. Only the pole-dependent terms move (`m_r` uses `refl_dir`
+  either way), so the error tracks the tilt:
+  - Open water is FINE and this was checked rather than assumed. The Gerstner
+    facet is bounded at 3.0 degrees (max slope 0.0525 from `wave_param`), so
+    the pole term moves under 0.2%, and a full facet-cone sweep moves the
+    reconstruction 0.107 luma against the mirror's own 0.323. The update pass's
+    "a per-facet pole would buy nothing" comment is therefore CORRECT, and the
+    leading theory that the animated normal is what makes water flicker is
+    WRONG - the cache moves LESS than the mirror it replaces, not more.
+  - Terrace steps and pinned corners are NOT fine. The connected surface
+    reaches 45 degrees there, and re-poling also makes `c = dot(refl_dir, n)`
+    read near 1, so the fit believes every query is a pole query and the
+    out-of-hemisphere reject can never fire. Measured at 45 degrees of tilt: 0
+    misses in 16 azimuths, cache spanning 0.43 luma where the mirror spans
+    1.88. Those voxels should be falling back to the per-pixel trace and are
+    not. OPEN; the fix is to pass the gather axis (the dominant axis of `n`)
+    as the pole and keep `refl_dir` as the query, which restores the reject.
 - AO IS RECOMPUTED EVERY ROUND for no reason. It is purely geometric, so
   eighteen occupancy lookups per voxel per round are repeated work; it only
   needs recomputing when the record is reset or its brick is edited.
@@ -335,21 +388,44 @@ Nothing here is judged by eye alone or declared done off a compile.
   the init frame and then read zero forever after, so several benchmark rounds
   ran saturated without it being noticed. It is now `log::error!` and quotes a
   running total (`LightField::overflow_total`).
-- GRAZING WATER READS DARKER THAN HEAD-ON, and interpolation did not change
-  it. Measured by `voxlight_refl_reads_back_plausible_radiance` over an
-  open-sky sheet: grazing (19 degrees) luma 0.269 against head-on 0.513,
-  identical before and after the bilinear sampler. It is definitely not a
-  sampling artifact - over that sheet every record is identical, so the blend
-  is a no-op - but WHICH of two causes it is has NOT been tested:
-  (a) the SH-L1 fit under-reconstructing toward the rim, which is where
-  Fresnel weights the reflection most, or (b) the real sky simply being
-  dimmer at 19 degrees than at the zenith, in which case 0.269 is correct.
-  The comment at the reconstruction asserts (a) is harmless ("falls the right
-  way here"); nothing has tested that either. The cheapest discriminating
-  check is to have `cs_vl_probe` also return `sky(refl_dir)` and compare, so
-  the fit is measured against the radiance it is fitting rather than against
-  its own value in another direction. OPEN, and open at the level of the
-  diagnosis, not just the fix.
+- THE GRAZING QUESTION IS SETTLED, AND THE ANSWER IS STRUCTURAL. `cs_vl_probe`
+  now returns `sky(refl_dir)` and the per-pixel mirror alongside the
+  reconstruction, which is the discriminating check this entry asked for
+  (`voxlight_refl_diagnose`, section A). It is cause (a), the fit, and not
+  cause (b), a genuinely dim sky - but the mechanism is sharper than "under-
+  reconstructing toward the rim", and it is a hard limit rather than a tuning
+  error.
+
+  Sweeping elevation over an open-sky point, the true sky luma runs
+  0.83 (horizon) -> 0.62 (19 deg) -> 0.54 (30 deg) -> 0.83 (70 deg) ->
+  0.75 (zenith). It has an INTERIOR MINIMUM. The L1 reconstruction restricted
+  to a great circle of elevations is
+
+      a + b.d  with  d = (0, sin e, +-cos e)   =>   a + R*cos(e - phi)
+
+  and over e in [0,90] that sinusoid admits an interior MAXIMUM only; its
+  minimum over the interval always sits at an endpoint. A linear fit therefore
+  cannot be bright at both the horizon and the zenith with a dip between them,
+  and the least-squares answer to a shape it cannot express is to go FLAT. That
+  is exactly what is measured: the cache reads 0.60 -> 0.65 -> 0.64 across the
+  same sweep, a span of 0.06 against the sky's 0.30, and it errs in the
+  predicted direction at every point - too DARK at the two bright ends
+  (horizon, zenith) and too BRIGHT in the dip. Over the whole sweep the cache
+  sits between 0.67x and 1.96x the per-pixel mirror.
+
+  So the residual is not a defect to be fixed at the fit; it is the L1 basis.
+  Raising it needs an L2 term (the quadratic is precisely what "bright at both
+  ends, dark in the middle" requires), which is 9 coefficients per channel
+  instead of 4 and roughly 37 MB of reflection pool instead of 16.8 MB. That is
+  a design decision with a memory price, not a bug fix, and it is NOT taken
+  here. What IS fixed is the separate arithmetic defect found next to it: the
+  reconstruction solved its moment matrix with `E[(d.t)^2] = 1/4`, the
+  cosine-weighted value, while the update pass samples uniformly in solid angle
+  and the rest of the same solve used the uniform `E[d.n] = 1/2` and
+  `E[(d.n)^2] = 1/3`. That over-weighted the tangential term by exactly 4/3, so
+  every horizontal swing of the reflection - the entire view-dependent part -
+  came out a third too strong, and it amplified the estimator's swing as well
+  as its steady-state error. See `voxlight_reflection` in `raymarch.wgsl`.
 
 ### What is NOT yet true
 

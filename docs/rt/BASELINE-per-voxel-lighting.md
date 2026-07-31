@@ -252,10 +252,167 @@ Stills re-captured with `dump_lookdev_views` and read directly.
   itself the check that dropping the fully solid bricks' blocks changes
   nothing observable.
 
+## Round E: the "flickery and not correctly reflecting" report
+
+Round D shipped a reflection cache that a user then reported as broken:
+flickery, and not reflecting correctly. Both halves were real, both were found
+by measurement, and neither was the thing the report's leading theory blamed.
+
+### What it was NOT
+
+The leading theory was that the cache is static while the water surface is
+animated, so the SH is evaluated far from where it was gathered and the wave
+motion sweeps the query across a coarse fit. That is testable and it is WRONG.
+
+- The Gerstner facet is bounded at 3.0 degrees of tilt - max slope 0.0525 from
+  the four amplitudes and wavenumbers in `wave_param` - so the reflected
+  direction swings at most 6.0 degrees.
+- Over a full facet cone the CACHE moves 0.107 luma where the true per-pixel
+  mirror moves 0.323 over the same sweep (`voxlight_refl_diagnose`, section B).
+  The cache is SMOOTHER than the thing it replaces, which is the opposite of a
+  flicker source, and a linear fit is smooth in direction by construction.
+- The animated surface HEIGHT cannot mis-address the record either: the plate
+  lives at `WATER_BASE` 0.72 plus at most `WATER_WAVE_MAX` 0.12, and a pinned
+  corner caps at 1.00, so with the sampler's 0.02 step-back along the normal
+  `floor(q)` always names the water cell. Ruled out by construction.
+- The per-pixel fallback is not flipping either: 0 `ok` flips over 128 rounds.
+
+### What it actually was
+
+Three defects, all in the estimator and the fit, none in the storage:
+
+1. THE ESTIMATOR. The update pass visited a block every `VOXLIGHT_UPDATE_DIV`
+   rounds and folded ONE ray of a rotating eight-direction set at fold 0.125.
+   A hemisphere over water spans an order of magnitude in radiance between the
+   sky overhead and the terrain at the rim, so those are eight different
+   numbers, not eight noisy looks at one. Measured on a static scene, static
+   sun, fixed query direction: 22.7-46.8% peak-to-peak, with a stored
+   `E[L*d.z]` of -0.17 where the true moment is unambiguously positive.
+   Fixed by visiting eight times more rarely and gathering a COMPLETE
+   stratified hemisphere each visit, over a direction set that does not depend
+   on the round. Same rays per frame. Now 0.0% - bitwise constant - and
+   `m_z` = +0.035. Pinned by `voxlight_refl_record_is_stable_across_rounds`,
+   which fails at 16.6% on the old estimator.
+2. THE FIT'S MEASURE. The reconstruction solved its moment matrix with
+   `E[(d.t)^2] = 1/4`, the cosine-weighted value, while using the uniform
+   `E[d.n] = 1/2` and `E[(d.n)^2] = 1/3` in the same solve and sampling
+   uniformly in solid angle. That over-weighted the tangential term by exactly
+   4/3, so the entire view-dependent part of every reflection came out a third
+   too strong - and amplified the estimator's swing on top of it.
+3. THE FIT'S POLE. The sampler evaluated the fit about the SHADING normal
+   instead of the axis the moments were gathered about. On open water that is a
+   3-degree error and worth nothing either way, but at a terrace step or pinned
+   corner the facet reaches 45 degrees, and re-poling also makes
+   `c = dot(refl_dir, n)` read near 1 for a mirror direction, so the
+   out-of-hemisphere reject could never fire and the record answered
+   confidently for directions it had never sampled. Over a 45-degree facet cone
+   the cache read a washed 0.27..0.70 against the mirror's 0.05..1.93; with the
+   gather axis as the pole it reads 0.00..1.93.
+
+### Temporal stability, finally measured on real frames
+
+`flicker_probe_rt_views` gained a grazing water view and was run as an A/B -
+once on the per-pixel fallback, once with the fields live. Every number this
+rig had ever produced before was taken against an empty field.
+
+| view                        | strong flickering | faint  | breathing | mean luma |
+|-----------------------------|-------------------|--------|-----------|-----------|
+| water_graze, per-pixel      | 12290 (0.593%)    | 68651  | 19496     | 127       |
+| water_graze, per-voxel field|   476 (0.023%)    |  6552  |   249     | 130       |
+
+The cache flickers 26x LESS than the per-pixel reflection it replaces, at the
+same brightness. That is the report's "flickery" answered, and it answers it in
+the opposite direction from the theory: the per-voxel cache is the STABLE one.
+
+### Look, round E: what the cache still costs
+
+`dump_lookdev_views` now captures the grazing water view BOTH ways
+(`water_graze_nofield` is the per-pixel mirror, `water_graze` the cache), which
+is the A/B the reflection decision always needed and never had. Read directly,
+and measured over the band where the reflection carries scene content (the
+shoreline vegetation mirrored in the water, y 325-400):
+
+| quantity                          | per-pixel mirror | per-voxel cache |
+|-----------------------------------|------------------|-----------------|
+| mean luma                         | 90.10            | 93.55           |
+| spatial sd (contrast)             | 7.07             | 4.43 (62.6%)    |
+| correlation with the mirror       | 1.000            | 0.757           |
+
+So the cache keeps about 63% of the reflection's contrast and tracks it at
+r = 0.76. In the frames that reads as recognisable tree shapes in the per-pixel
+still becoming smooth voxel-scale blobs in the cached one, and the dark
+reflected foliage lifted 3.45 luma toward the hemisphere mean. Open water
+further out (y > 400) is within 0.3-0.7 luma either way, because out there the
+reflection is sky only, which a linear fit handles well.
+
+That residual is STRUCTURAL, not a remaining bug, and the shape of it is now
+understood rather than guessed. The true sky luma over an elevation sweep runs
+0.83 (horizon) -> 0.54 (30 deg) -> 0.83 (70 deg) -> 0.75 (zenith): it has an
+INTERIOR MINIMUM. An L1 reconstruction restricted to a great circle of
+elevations is `a + R*cos(e - phi)`, which over [0,90] admits an interior
+MAXIMUM only, so a linear fit cannot be bright at both ends with a dip between
+them and the least-squares answer is to go flat. Measured: the cache reads
+0.60 -> 0.65 -> 0.64 across that sweep, a span of 0.06 against the sky's 0.30,
+and it errs in the predicted direction everywhere - too dark at the two bright
+ends, too bright in the dip. Over the whole sweep it sits between 0.67x and
+1.96x the per-pixel mirror.
+
+Raising that needs an L2 term, which is what "bright at both ends, dark in the
+middle" requires: 9 coefficients per channel instead of 4, and roughly 37 MB of
+reflection pool instead of 16.8 MB. That is a design decision with a memory
+price and it is NOT taken here.
+
+### Round E perf
+
+Re-run on the same machine and harness. Read the FIELD A/B column, not the
+absolutes: this whole run sits 10-15% hotter than round D (terrain's EMPTY
+field reads 15.75 ms against round D's 13.64 on a path neither round changed),
+which is the documented run-to-run spread on this machine.
+
+| scenario        | populated     | empty field | delta round E     | delta round D |
+|-----------------|---------------|-------------|-------------------|---------------|
+| terrain         | 14.43 / 14.68 | 15.75 ms    | -1.19 ms (-7.6%)  | -0.92 ms      |
+| foliage         | 17.42 / 17.45 | 17.47 ms    | -0.04 ms (-0.2%)  | -0.01 ms      |
+| water-close     |  5.80 /  5.62 |  8.55 ms    | -2.84 ms (-33.2%) | -2.91 ms      |
+| terrain-covered |  8.23 /  8.88 | 11.10 ms    | -2.54 ms (-22.9%) | -2.10 ms      |
+
+The shading side is unchanged within noise, which is the expected result: none
+of the three fixes touches how much work a pixel does, only what the record
+holds and how the fit reads it.
+
+The UPDATE side did move, and not for free:
+
+    round D:  light pass 1.19 ms + reflection pass 0.23 ms = 1.39 ms
+    round E:  light pass 1.38 ms + reflection pass 0.51 ms = 1.64 ms
+
+The light pass's +0.19 is the run-to-run drift above. The reflection pass's
++0.28 (+122%) is the estimator reshape and it is NOT drift. Rays per frame
+really are unchanged - 16,448 ray slots before, 16,896 after - but the DISPATCH
+SHAPE is not: 2050 live reflection blocks at div 8 is 257 workgroups, and at
+div 64 it is 33, so eight serial traces per thread replace eight workgroups'
+worth of latency hiding. It is worth paying here (water-close still saves
+2.84 ms against a 1.64 ms total update) and it is worst exactly where there is
+least reflective geometry to fill the machine, but "same rays per frame" should
+never have been read as "same cost". OPEN as a perf follow-up: the complete
+gather is what fixed the flicker and must stay, so the lever is the dispatch -
+e.g. splitting a visit's rays across lanes rather than looping them in one
+thread, which keeps the estimate whole and puts the parallelism back.
+
+Net per frame, as in round D:
+
+| scenario        | shading saves | update costs | NET      |
+|-----------------|---------------|--------------|----------|
+| terrain         | 1.19 ms       | 1.64 ms      | +0.45 ms |
+| foliage         | 0.04 ms       | 1.64 ms      | +1.60 ms |
+| water-close     | 2.84 ms       | 1.64 ms      | -1.20 ms |
+| terrain-covered | 2.54 ms       | 1.64 ms      | -0.90 ms |
+
 ## Reproducing
 
     cargo test --lib rt_vs_software_timing -- --nocapture --ignored
     cargo test --lib dump_lookdev_views -- --ignored --nocapture
+    cargo test --lib flicker_probe_rt_views -- --ignored --nocapture
+    cargo test --lib voxlight_refl_diagnose -- --ignored --nocapture
 
 Re-run on the SAME machine after the rework and compare against this table,
 not against docs/PERF.md.
