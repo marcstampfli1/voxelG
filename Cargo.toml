@@ -55,8 +55,21 @@ png = "0.17"
 name = "trace"
 harness = false
 
-# TEMP: local wgpu fork with the acceleration-structure scratch-buffer cache
-# (prepared upstream PR); remove when the PR lands upstream.
-[patch."https://github.com/gfx-rs/wgpu"]
-wgpu = { path = "/home/parrot/wgpu-contrib/wgpu" }
-naga = { path = "/home/parrot/wgpu-contrib/naga" }
+# NOTE on the local wgpu fork.
+#
+# docs/rt/wgpu-prs/0003-scratch-buffer-reuse.patch (acceleration-structure build
+# scratch reuse) is a prepared upstream PR, not yet landed. It is a wgpu-core
+# INTERNAL change with no public API surface, so this crate builds identically
+# with or without it -- the fork only makes a large AABB BLAS rebuild cost
+# 1.2-2.0 ms of CPU per call instead of 12-28 ms (RT streaming updates only).
+#
+# The `[patch]` override therefore does NOT belong here: an absolute path to a
+# working copy makes the repository unbuildable on every machine that lacks it.
+# Keep it per-machine in a user-global `~/.cargo/config.toml` instead:
+#
+#     [patch."https://github.com/gfx-rs/wgpu"]
+#     wgpu = { path = "/abs/path/to/wgpu-contrib/wgpu" }
+#     naga = { path = "/abs/path/to/wgpu-contrib/naga" }
+#
+# where that checkout is wgpu at the rev pinned above with the patch applied.
+# Without the override the build simply uses the pinned upstream rev.
