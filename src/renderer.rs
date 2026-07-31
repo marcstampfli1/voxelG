@@ -1,4 +1,4 @@
-use std::sync::Arc;
+﻿use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
@@ -39,11 +39,21 @@ const RT_PRIMARY_WGSL: &str = include_str!("../shaders/rt_primary.wgsl");
 /// dispatcher appended after the render body in the other.
 const VOXLIGHT_UPDATE_WGSL: &str = include_str!("../shaders/voxlight_update.wgsl");
 
+/// The per-voxel REFLECTED RADIANCE update pass. Concatenated last for the same
+/// reason as the light update: it calls `shade` and `trace_secondary`, whose
+/// definitions differ between the software and RT variants.
+const VOXLIGHT_REFL_UPDATE_WGSL: &str = include_str!("../shaders/voxlight_refl_update.wgsl");
+
 /// Storage buffers the render layout binds in one compute stage. Named because
 /// it is requested at device creation in two places AND must cover what
 /// `create_compute_bgl` declares; a mismatch fails only at bind-group-layout
 /// creation, deep inside GPU test output, so the two must not drift.
-pub(crate) const COMPUTE_STORAGE_BUFFERS: u32 = 16;
+///
+/// Group 0 declares 17 of them: the world pyramid, the deferred-transparent
+/// records, the sprite atlas, the light field's four, and the reflection
+/// field's three. The RT variant binds group 1 in the SAME stage, so its
+/// storage buffers count against this limit too.
+pub(crate) const COMPUTE_STORAGE_BUFFERS: u32 = 20;
 
 /// Light-field update amortization: 1/VOXLIGHT_UPDATE_DIV of the live blocks
 /// are re-gathered per frame, so the resident field refreshes every
@@ -73,7 +83,7 @@ const SHADOW_SW_WGSL: &str = concat!(
 pub(crate) fn raymarch_source_variant(rt: bool) -> String {
     if rt {
         format!(
-            "enable wgpu_ray_query;\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            "enable wgpu_ray_query;\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
             WORLD_CONSTS_WGSL,
             COMMON_WGSL,
             crate::sprites::wgsl_consts(),
@@ -84,16 +94,18 @@ pub(crate) fn raymarch_source_variant(rt: bool) -> String {
             RT_PRIMARY_WGSL,
             include_str!("../shaders/raymarch.wgsl"),
             VOXLIGHT_UPDATE_WGSL,
+            VOXLIGHT_REFL_UPDATE_WGSL,
         )
     } else {
         format!(
-            "{}\n{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
             WORLD_CONSTS_WGSL,
             COMMON_WGSL,
             crate::sprites::wgsl_consts(),
             include_str!("../shaders/raymarch.wgsl"),
             SHADOW_SW_WGSL,
             VOXLIGHT_UPDATE_WGSL,
+            VOXLIGHT_REFL_UPDATE_WGSL,
         )
     }
 }
@@ -168,7 +180,7 @@ fn upload_words_for(
 }
 
 /// Project a set of tile indices up to their parent chunks (via `scratch`, which
-/// is sorted+deduped) and DMA the touched chunk_mask runs. Does NOT refresh L4 —
+/// is sorted+deduped) and DMA the touched chunk_mask runs. Does NOT refresh L4 â€”
 /// the caller decides that.
 fn upload_chunks_for_tiles(
     scratch: &mut Vec<u32>, tiles: &[u32], chunk_mask: &[u64], queue: &wgpu::Queue, buf: &wgpu::Buffer,
@@ -278,7 +290,7 @@ pub struct Renderer {
     /// Dispatch counts, temporal-differential tile counts and the camera
     /// uniform's `resolution` all use this.
     pub size: (u32, u32),
-    /// Swapchain / window size — used for surface configuration and the blit
+    /// Swapchain / window size â€” used for surface configuration and the blit
     /// pass. Stays at the native resolution the OS gives us.
     pub surface_size: (u32, u32),
 
@@ -325,9 +337,18 @@ pub struct Renderer {
     vl: VoxLightBuffers,
     voxlight_pipeline: wgpu::ComputePipeline,
     voxlight_pipeline_rt: Option<wgpu::ComputePipeline>,
+    /// The reflection field's update pass. A separate dispatch over a separate
+    /// work list, not extra work inside the light pass: the reflective set is a
+    /// small subset of the lit shell, so folding it in would idle a workgroup
+    /// per non-reflective block.
+    voxlight_refl_pipeline: wgpu::ComputePipeline,
+    voxlight_refl_pipeline_rt: Option<wgpu::ComputePipeline>,
     voxlight_round: u32,
     /// Live block count from the last upload; the update dispatch size.
     voxlight_live_count: u32,
+    /// Live REFLECTION block count from the last upload; that pass's dispatch
+    /// size, and 0 in a world with no water or glass.
+    voxlight_refl_live_count: u32,
     /// Dynamic point lights currently uploaded (see `set_point_lights`).
     voxlight_light_count: u32,
     // Deferred transparent pass (#16): shares compute_bgl/compute_bg.
@@ -405,7 +426,7 @@ pub struct Renderer {
     post_bg_final: wgpu::BindGroup,
 
     // Half-res volumetric (cloud) pass. The texture handle is dropped after
-    // creation — its views keep the GPU resource alive.
+    // creation â€” its views keep the GPU resource alive.
     cloud_bgl: wgpu::BindGroupLayout,
     cloud_pipeline: wgpu::ComputePipeline,
     cloud_bg: wgpu::BindGroup,
@@ -427,10 +448,10 @@ pub struct Renderer {
     taa_pipeline: wgpu::ComputePipeline,
     taa_bg: wgpu::BindGroup,
     /// Set after (re)creating the history texture so the next frame skips the
-    /// TAA blend — otherwise it would read uninitialised history (garbage).
+    /// TAA blend â€” otherwise it would read uninitialised history (garbage).
     taa_reset: bool,
 
-    // Reused per-frame scratch for incremental mask/uniform uploads — derived
+    // Reused per-frame scratch for incremental mask/uniform uploads â€” derived
     // from the dirty-brick list so no extra dirty tracking is needed and no
     // allocation happens on the upload hot path.
     dirty_tiles_scratch: Vec<u32>,
@@ -508,10 +529,11 @@ impl Renderer {
 
         let base_limits = wgpu::Limits {
             max_storage_buffer_binding_size: 256 << 20, // 256 MB headroom
-            // Group 0 binds 14 storage buffers (default cap is 8): the world
+            // Group 0 binds 17 storage buffers (default cap is 8): the world
             // pyramid and the deferred-transparent records took it past the
-            // default, and the per-voxel light field adds four more (pool,
-            // brick table, work list, point lights).
+            // default, the per-voxel light field adds four more (pool, brick
+            // table, work list, point lights) and the reflection field three
+            // (pool, brick table, work list).
             max_storage_buffers_per_shader_stage: COMPUTE_STORAGE_BUFFERS,
             ..wgpu::Limits::default()
         };
@@ -599,7 +621,7 @@ impl Renderer {
             height: surface_h,
             // Explicit present policy: prefer Mailbox (low-latency, tear-free,
             // capped to the display refresh) and fall back to Fifo (vsync,
-            // always supported). We deliberately avoid Immediate — it was the
+            // always supported). We deliberately avoid Immediate â€” it was the
             // source of the uncapped ~1800 fps idle GPU burn.
             present_mode: if std::env::var("VOXELG_UNCAPPED").is_ok()
                 && caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
@@ -724,7 +746,7 @@ impl Renderer {
         let (resolve_tex, resolve_view) = create_output_texture(&device, width, height);
         let (history_tex, history_view) = create_history_texture(&device, width, height);
 
-        // Bilinear filtering for the half-res → full-res blit upscale.
+        // Bilinear filtering for the half-res â†’ full-res blit upscale.
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("blit sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -788,6 +810,17 @@ impl Renderer {
             layout: Some(&compute_pl),
             module: &compute_shader,
             entry_point: Some("cs_voxel_light_update"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        // Same module and layout again: the reflection pass traces the world
+        // and shades a hit exactly as the light pass does, so a second shader
+        // would only be a second copy of the same world-access code.
+        let voxlight_refl_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("voxlight reflection update pipeline"),
+            layout: Some(&compute_pl),
+            module: &compute_shader,
+            entry_point: Some("cs_voxel_refl_update"),
             compilation_options: Default::default(),
             cache: None,
         });
@@ -858,6 +891,7 @@ impl Renderer {
         // are local to the branch below; bind it out here instead of widening
         // that already-fifteen-wide tuple.
         let mut voxlight_pipeline_rt: Option<wgpu::ComputePipeline> = None;
+        let mut voxlight_refl_pipeline_rt: Option<wgpu::ComputePipeline> = None;
         let (
             world_accel,
             rt_bgl,
@@ -924,6 +958,8 @@ impl Renderer {
             // Assigned to the outer binding rather than threaded through the
             // return tuple below, which is already fifteen elements wide.
             voxlight_pipeline_rt = Some(mk("cs_voxel_light_update", "voxlight update (RT)"));
+            voxlight_refl_pipeline_rt =
+                Some(mk("cs_voxel_refl_update", "voxlight reflection update (RT)"));
             log::info!("RT init: all 4 RT pipelines in {:.2}s total", t_pipe.elapsed().as_secs_f64());
             // Worker: owns nothing persistent; each job carries the spare set in
             // and back out. wgpu Device/Queue are internally refcounted.
@@ -1021,7 +1057,7 @@ impl Renderer {
         });
         // Opt-in (default off): GPU sand physics replaces the CPU CA. When on, the
         // CPU world.bricks is not kept in sync (raycast picking sees the pre-physics
-        // state) — that CPU<->GPU sync is the next migration stage in the design doc.
+        // state) â€” that CPU<->GPU sync is the next migration stage in the design doc.
         let gpu_physics_enabled = std::env::var("VOXELG_GPU_PHYSICS").is_ok();
 
         // -- beam pipeline (1/8-res coarse pre-pass) --
@@ -1153,7 +1189,9 @@ impl Renderer {
             beam_bgl, beam_pipeline, beam_bg,
             compute_bgl, compute_pipeline, compute_bg,
             vl: vl_bufs, voxlight_pipeline, voxlight_pipeline_rt,
-            voxlight_round: 0, voxlight_live_count: 0, voxlight_light_count: 0,
+            voxlight_refl_pipeline, voxlight_refl_pipeline_rt,
+            voxlight_round: 0, voxlight_live_count: 0, voxlight_refl_live_count: 0,
+            voxlight_light_count: 0,
             rt_shadows, world_accel,
             rt_bgl, rt_bg, compute_pipeline_rt, compose_pipeline_rt, transparent_pipeline_rt,
             gi_probe_buf, gi_probe_pipeline, godray_pipeline, godray_pipeline_rt,
@@ -1315,7 +1353,7 @@ impl Renderer {
             self.gi_out_tex = Some(got);
             self.gi_out_view = Some(gov);
         }
-        // History texture is newly (re)created and uninitialised — skip the TAA
+        // History texture is newly (re)created and uninitialised â€” skip the TAA
         // blend next frame so it isn't read as garbage.
         self.taa_reset = true;
     }
@@ -1408,7 +1446,7 @@ impl Renderer {
         }
 
         // Whole-world refresh (first frame / explicit invalidate only). A chunk
-        // cross must NEVER reach this path — it goes through the incremental
+        // cross must NEVER reach this path â€” it goes through the incremental
         // path below, which is why crossing a boundary no longer re-DMAs ~75 MB.
         if world.all_dirty {
             self.queue.write_buffer(&self.bricks_buf, 0, bytemuck::cast_slice(&world.bricks));
@@ -1419,9 +1457,12 @@ impl Renderer {
             let tu = pack_u8_to_u32(&world.tile_uniform);
             self.queue.write_buffer(&self.brick_uniform_buf, 0, bytemuck::cast_slice(&bu));
             self.queue.write_buffer(&self.tile_uniform_buf, 0, bytemuck::cast_slice(&tu));
-            // Every brick is new, so bind the light shell from scratch.
+            // Every brick is new, so bind both sparse fields from scratch.
             world.sync_light_shell_all();
-            self.voxlight_live_count = upload_voxlight(&self.queue, &self.vl, world);
+            world.sync_refl_shell_all();
+            let counts = upload_voxlight(&self.queue, &self.vl, world);
+            self.voxlight_live_count = counts.light;
+            self.voxlight_refl_live_count = counts.refl;
             world.all_dirty = false;
             world.dirty_bricks.clear();
             return;
@@ -1432,10 +1473,13 @@ impl Renderer {
         // clear_slot_masks WITHOUT dirtying a brick, so the table can need an
         // upload on a frame where no brick changed.
         world.sync_light_shell_dirty();
-        self.voxlight_live_count = upload_voxlight(&self.queue, &self.vl, world);
+        world.sync_refl_shell_dirty();
+        let counts = upload_voxlight(&self.queue, &self.vl, world);
+        self.voxlight_live_count = counts.light;
+        self.voxlight_refl_live_count = counts.refl;
         if world.dirty_bricks.is_empty() { return; }
 
-        // 1. Brick voxel data — coalesced contiguous spans (one DMA per run).
+        // 1. Brick voxel data â€” coalesced contiguous spans (one DMA per run).
         let stride = std::mem::size_of::<Brick>() as u64;
         upload_spans(&world.dirty_bricks, |s, e| {
             let slice = &world.bricks[s as usize..=e as usize];
@@ -1443,7 +1487,7 @@ impl Renderer {
         });
 
         // 2. Per-brick uniform-material table (packed 4 bricks / u32 word).
-        //    Re-pack and upload only the words touched by dirty bricks — this
+        //    Re-pack and upload only the words touched by dirty bricks â€” this
         //    is the table the DDA's uniform-skip reads, and it was previously
         //    NEVER refreshed incrementally, so streamed chunks rendered with
         //    stale skip data.
@@ -1452,7 +1496,7 @@ impl Renderer {
             &self.queue, &self.brick_uniform_buf,
         );
 
-        // 3. Tiles touched by the dirty bricks → tile_mask (u64) + tile_uniform.
+        // 3. Tiles touched by the dirty bricks â†’ tile_mask (u64) + tile_uniform.
         self.dirty_tiles_scratch.clear();
         for &b in &world.dirty_bricks {
             let (bx, by, bz) = brick_coords(b);
@@ -1469,12 +1513,12 @@ impl Renderer {
             &self.queue, &self.tile_uniform_buf,
         );
 
-        // 4. Chunks touched by those tiles → chunk_mask (u64).
+        // 4. Chunks touched by those tiles â†’ chunk_mask (u64).
         upload_chunks_for_tiles(
             &mut self.dirty_chunks_scratch, &self.dirty_tiles_scratch, &world.chunk_mask,
             &self.queue, &self.chunk_mask_buf,
         );
-        // L4 mask is only a handful of u64s — if any chunk changed, just push
+        // L4 mask is only a handful of u64s â€” if any chunk changed, just push
         // the whole thing.
         if !self.dirty_chunks_scratch.is_empty() {
             self.queue.write_buffer(&self.l4_mask_buf, 0, bytemuck::cast_slice(&world.l4_mask));
@@ -1483,7 +1527,7 @@ impl Renderer {
         world.dirty_bricks.clear();
     }
 
-    /// Upload mask-only clears (slots recycled by shift_origin) — just the
+    /// Upload mask-only clears (slots recycled by shift_origin) â€” just the
     /// touched tile_mask / tile_uniform + their chunk_mask + L4, no brick data.
     /// This is what makes a recycled slot render as sky immediately and cheaply.
     pub fn upload_mask_clears(&mut self, world: &mut World) {
@@ -1561,9 +1605,9 @@ impl Renderer {
     }
 
     /// Run one GPU-compute physics step (#25): dispatch the pull-only sand CA
-    /// (bricks_buf → bricks_buf_b) then copy the result back so the render path
+    /// (bricks_buf â†’ bricks_buf_b) then copy the result back so the render path
     /// (which reads bricks_buf) sees it. Opt-in via `gpu_physics`. NOTE: the CPU
-    /// `World.bricks` is not updated here — raycast picking sees the pre-physics
+    /// `World.bricks` is not updated here â€” raycast picking sees the pre-physics
     /// state until the design doc's CPU<->GPU sync stage lands.
     pub fn run_gpu_physics(&self) {
         let total = crate::voxel::WORLD_BRICKS_TOTAL;
@@ -1696,7 +1740,11 @@ impl Renderer {
             // Runs BEFORE the raymarch so this frame shades against a field
             // that already includes this frame's slice. wgpu inserts the
             // storage-buffer barrier between the two compute passes.
-            if self.voxlight_live_count > 0 {
+            // ONE params write covering both passes, and gated on EITHER count:
+            // the reflection pass reads its dispatch size out of the same
+            // uniform, so a world with water but no bound light blocks would
+            // otherwise run it against last frame's numbers.
+            if self.voxlight_live_count > 0 || self.voxlight_refl_live_count > 0 {
                 self.queue.write_buffer(
                     &self.vl.params,
                     0,
@@ -1704,8 +1752,11 @@ impl Renderer {
                         self.voxlight_live_count,
                         self.voxlight_round,
                         self.voxlight_light_count,
+                        self.voxlight_refl_live_count,
                     )),
                 );
+            }
+            if self.voxlight_live_count > 0 {
                 let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("voxlight update"),
                     timestamp_writes: None,
@@ -1720,6 +1771,28 @@ impl Renderer {
                 }
                 // One workgroup per block, one invocation per voxel.
                 let blocks = self.voxlight_live_count.div_ceil(VOXLIGHT_UPDATE_DIV);
+                cp.dispatch_workgroups(blocks, 1, 1);
+            }
+            // ---- per-voxel reflection update ----
+            // Straight after the light pass and on the same round counter, so a
+            // reflection ray that shades its hit reads a field already carrying
+            // this frame's slice.
+            if self.voxlight_refl_live_count > 0 {
+                let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("voxlight reflection update"),
+                    timestamp_writes: None,
+                });
+                if self.rt_shadows {
+                    cp.set_pipeline(self.voxlight_refl_pipeline_rt.as_ref().unwrap());
+                    cp.set_bind_group(0, &self.compute_bg, &[]);
+                    cp.set_bind_group(1, &self.rt_bg.as_ref().unwrap()[gi_idx], &[]);
+                } else {
+                    cp.set_pipeline(&self.voxlight_refl_pipeline);
+                    cp.set_bind_group(0, &self.compute_bg, &[]);
+                }
+                // One workgroup per block, one invocation per voxel, sliced by
+                // the same round counter as the light pass.
+                let blocks = self.voxlight_refl_live_count.div_ceil(VOXLIGHT_UPDATE_DIV);
                 cp.dispatch_workgroups(blocks, 1, 1);
             }
             self.voxlight_round = self.voxlight_round.wrapping_add(1);
@@ -2657,6 +2730,12 @@ fn create_compute_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
             bgl_storage(24, true),  // vl_live_bricks: the update work list
             bgl_uniform(25),        // vl_params
             bgl_storage(26, true),  // vl_lights: dynamic point lights
+            // Per-voxel reflected radiance: the same three-buffer shape as the
+            // light field above, over its own (much smaller) pool, because only
+            // water and glass bricks bind a block.
+            bgl_storage(27, false), // refl_pool: the SH-L1 records
+            bgl_storage(28, true),  // refl_block_of_brick
+            bgl_storage(29, true),  // refl_live_bricks: the reflection work list
         ],
     })
 }
@@ -2673,6 +2752,12 @@ pub(crate) struct VoxLightBuffers {
     pub live_bricks: wgpu::Buffer,
     pub params: wgpu::Buffer,
     pub lights: wgpu::Buffer,
+    /// The reflection field's three buffers. Same roles as `pool` /
+    /// `block_of_brick` / `live_bricks`, over a separate pool with a wider
+    /// record; `params` and the round counter are shared with the light pass.
+    pub refl_pool: wgpu::Buffer,
+    pub refl_block_of_brick: wgpu::Buffer,
+    pub refl_live_bricks: wgpu::Buffer,
 }
 
 /// Uniform mirror of `VoxLightParams` in the shader. Field order and padding
@@ -2688,6 +2773,12 @@ pub(crate) struct VoxLightParamsUniform {
     pub light_count: u32,
     pub fold: f32,
     pub ao_strength: f32,
+    /// Live REFLECTION blocks: the reflection pass's dispatch size, and zero
+    /// whenever the world holds no water or glass.
+    pub refl_live_count: u32,
+    pub refl_rays: u32,
+    pub refl_fold: f32,
+    pub _pad: u32,
 }
 
 /// A dynamic point light, matching `VlPointLight` in the shader.
@@ -2719,19 +2810,23 @@ impl VoxLightBuffers {
         // Must start as all-LIGHT_BLOCK_NONE, not zero: zero is a VALID block
         // index, so a zeroed table would claim every brick in the world owns
         // block 0. Filled at creation so no frame can ever read it unset.
-        let block_of_brick = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("voxlight block_of_brick"),
-            size: crate::voxel::WORLD_BRICKS_TOTAL as u64 * 4,
-            usage: U::STORAGE | U::COPY_DST,
-            mapped_at_creation: true,
-        });
-        block_of_brick
-            .slice(..)
-            .get_mapped_range_mut()
-            .expect("block_of_brick was just created mapped_at_creation, so the full range maps")
-            .slice(..)
-            .fill(0xFFu8);
-        block_of_brick.unmap();
+        // Shared by both fields so neither can be given the zeroed version.
+        let none_filled_table = |label: &'static str| {
+            let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: crate::voxel::WORLD_BRICKS_TOTAL as u64 * 4,
+                usage: U::STORAGE | U::COPY_DST,
+                mapped_at_creation: true,
+            });
+            buf.slice(..)
+                .get_mapped_range_mut()
+                .expect("the table was just created mapped_at_creation, so the full range maps")
+                .slice(..)
+                .fill(0xFFu8);
+            buf.unmap();
+            buf
+        };
+        let block_of_brick = none_filled_table("voxlight block_of_brick");
         let live_bricks = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("voxlight live_bricks"),
             size: crate::voxlight::LIGHT_BLOCKS_MAX as u64 * 4,
@@ -2750,7 +2845,26 @@ impl VoxLightBuffers {
             usage: U::STORAGE | U::COPY_DST,
             mapped_at_creation: false,
         });
-        Self { pool, block_of_brick, live_bricks, params, lights }
+        let refl_pool = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("voxlight refl pool"),
+            size: crate::voxlight::REFL_POOL_WORDS as u64 * 4,
+            // COPY_SRC for the same reason as the light pool: the records are
+            // write-only in a frame, so reading them back in a GPU test is the
+            // only way to see what the reflection pass actually stored.
+            usage: U::STORAGE | U::COPY_DST | U::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let refl_block_of_brick = none_filled_table("voxlight refl block_of_brick");
+        let refl_live_bricks = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("voxlight refl live_bricks"),
+            size: crate::voxlight::REFL_BLOCKS_MAX as u64 * 4,
+            usage: U::STORAGE | U::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Self {
+            pool, block_of_brick, live_bricks, params, lights,
+            refl_pool, refl_block_of_brick, refl_live_bricks,
+        }
     }
 }
 
@@ -2897,37 +3011,59 @@ fn make_compute_bg(
             wgpu::BindGroupEntry { binding: 24, resource: vl.live_bricks.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 25, resource: vl.params.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 26, resource: vl.lights.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 27, resource: vl.refl_pool.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 28, resource: vl.refl_block_of_brick.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 29, resource: vl.refl_live_bricks.as_entire_binding() },
         ],
     })
 }
 
-/// Push the light field's brick table and work list to the GPU, and report the
-/// live block count (the update pass's dispatch size).
+/// Live block counts from `upload_voxlight`: the dispatch sizes of the two
+/// update passes. A named pair rather than a bare tuple because both are u32
+/// live counts and swapping them at the call site would compile.
+#[derive(Copy, Clone, Debug, Default)]
+pub(crate) struct VoxLightCounts {
+    /// Blocks bound in the light field.
+    pub light: u32,
+    /// Blocks bound in the reflection field.
+    pub refl: u32,
+}
+
+/// Push ONE sparse field's brick table and work list to the GPU, and report the
+/// live block count (its update pass's dispatch size).
 ///
 /// Both arrays are re-uploaded WHOLE, but only on frames where a binding
 /// actually changed: the table is 4 MiB, so pushing it unconditionally would
 /// burn ~570 MB/s of PCIe at 144 Hz to move bytes that did not move.
-fn upload_voxlight(
+///
+/// Shared by the light and reflection fields, which differ only in their
+/// buffers, their record stride and what they are called in the log: two copies
+/// of this would be two places for the recycled-block zeroing below to rot.
+fn upload_light_field(
     queue: &wgpu::Queue,
-    vl: &VoxLightBuffers,
-    world: &mut crate::voxel::World,
+    field: &mut crate::voxlight::LightField,
+    pool: &wgpu::Buffer,
+    table: &wgpu::Buffer,
+    work_list: &wgpu::Buffer,
+    record_words: u32,
+    what: &str,
 ) -> u32 {
-    let overflow = world.light.take_overflow();
+    let overflow = field.take_overflow();
     if overflow > 0 {
         // Surfaced, never silent: the shader falls back to probe-only lighting
         // for any voxel without a block, so this degrades the look rather than
         // failing, which is exactly the kind of thing that hides for months.
         log::warn!(
-            "voxlight pool exhausted: {overflow} block(s) refused, {} resident (cap {})",
-            world.light.allocated(),
-            crate::voxlight::LIGHT_BLOCKS_MAX,
+            "{what} pool exhausted: {overflow} block(s) refused, {} resident (cap {})",
+            field.allocated(),
+            field.blocks_max(),
         );
     }
-    if world.light.take_table_dirty() {
-        queue.write_buffer(&vl.block_of_brick, 0, bytemuck::cast_slice(world.light.block_table()));
-        let live = world.light.live_bricks();
+    if field.take_table_dirty() {
+        queue.write_buffer(table, 0, bytemuck::cast_slice(field.block_table()));
+        let live = field.live_bricks();
         if !live.is_empty() {
-            queue.write_buffer(&vl.live_bricks, 0, bytemuck::cast_slice(live));
+            queue.write_buffer(work_list, 0, bytemuck::cast_slice(live));
         }
     }
     // Zero every RECYCLED block before anything can sample it. Its records
@@ -2940,17 +3076,47 @@ fn upload_voxlight(
     // Collected rather than drained in place so the mutable borrow ends before
     // the live count is read below. An empty Vec does not allocate, so the
     // common no-churn frame still costs nothing.
-    let resets: Vec<u32> = world.light.take_pending_reset().collect();
+    let resets: Vec<u32> = field.take_pending_reset().collect();
     if !resets.is_empty() {
-        let words = crate::voxlight::LIGHT_RECORDS_PER_BLOCK * crate::voxlight::LIGHT_RECORD_WORDS;
+        let words = crate::voxlight::LIGHT_RECORDS_PER_BLOCK * record_words;
         let zeros = vec![0u32; words as usize];
         let bytes: &[u8] = bytemuck::cast_slice(&zeros);
         for block in resets {
-            let off = crate::voxlight::LightField::block_word_offset(block) as u64 * 4;
-            queue.write_buffer(&vl.pool, off, bytes);
+            let off =
+                crate::voxlight::LightField::block_word_offset_with(record_words, block) as u64 * 4;
+            queue.write_buffer(pool, off, bytes);
         }
     }
-    world.light.allocated() as u32
+    field.allocated() as u32
+}
+
+/// Push both sparse fields' brick tables and work lists to the GPU, and report
+/// their live block counts.
+fn upload_voxlight(
+    queue: &wgpu::Queue,
+    vl: &VoxLightBuffers,
+    world: &mut crate::voxel::World,
+) -> VoxLightCounts {
+    VoxLightCounts {
+        light: upload_light_field(
+            queue,
+            &mut world.light,
+            &vl.pool,
+            &vl.block_of_brick,
+            &vl.live_bricks,
+            crate::voxlight::LIGHT_RECORD_WORDS,
+            "voxlight",
+        ),
+        refl: upload_light_field(
+            queue,
+            &mut world.refl,
+            &vl.refl_pool,
+            &vl.refl_block_of_brick,
+            &vl.refl_live_bricks,
+            crate::voxlight::REFL_RECORD_WORDS,
+            "voxlight reflection",
+        ),
+    }
 }
 
 /// The light-field update parameters for one frame.
@@ -2958,7 +3124,9 @@ fn upload_voxlight(
 /// ONE definition shared by the renderer and the GPU tests: a test that
 /// converged the field with a different ray count or fold than the shipping
 /// path would be measuring something the game never renders.
-pub(crate) fn voxlight_params(live_count: u32, round: u32, light_count: u32) -> VoxLightParamsUniform {
+pub(crate) fn voxlight_params(
+    live_count: u32, round: u32, light_count: u32, refl_live_count: u32,
+) -> VoxLightParamsUniform {
     VoxLightParamsUniform {
         live_count,
         round,
@@ -2970,6 +3138,17 @@ pub(crate) fn voxlight_params(live_count: u32, round: u32, light_count: u32) -> 
         light_count,
         fold: 0.35,
         ao_strength: 0.85,
+        refl_live_count,
+        // ONE reflection ray per reflective voxel per round: a reflection ray
+        // is a full secondary trace plus a shade, far dearer than a sun-disc
+        // occlusion ray, and the SH fold below is what turns the sequence of
+        // single samples into a converged estimate.
+        refl_rays: 1,
+        // Slower than the light field's 0.35 because each round contributes a
+        // quarter of the rays: a wider window is what keeps a one-ray estimate
+        // from shimmering round to round.
+        refl_fold: 0.125,
+        _pad: 0,
     }
 }
 
@@ -3254,7 +3433,7 @@ fn make_blit_bg(
 #[cfg(test)]
 mod shader_tests {
     //! Headless WGSL parse + validation. Catches shader regressions in
-    //! `cargo test` without a window or a GPU — the shaders are otherwise only
+    //! `cargo test` without a window or a GPU â€” the shaders are otherwise only
     //! validated at runtime when the pipelines are created. The const-prepending
     //! mirrors exactly what `Renderer::new` does, so the validated source is the
     //! source that actually runs.
@@ -3394,7 +3573,7 @@ mod gpu_render_tests {
         let wo = world.world_origin_voxel();
 
         // Camera high above the centre of the loaded window, tilted toward the
-        // horizon so the frame contains terrain (lower) and sky (upper) — never
+        // horizon so the frame contains terrain (lower) and sky (upper) â€” never
         // inside a voxel.
         let mut cam = Camera::new();
         cam.pos.x = wo.x as f32 + 256.0;
@@ -3485,7 +3664,7 @@ mod gpu_render_tests {
             contents: bytemuck::cast_slice(&palette),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-        // All tiles dirty → render every pixel.
+        // All tiles dirty â†’ render every pixel.
         let tiles_w = (w + 7) / 8;
         let tiles_h = (h + 7) / 8;
         let words = ((tiles_w * tiles_h) as usize + 31) / 32;
@@ -3609,7 +3788,7 @@ mod gpu_render_tests {
             wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
         );
         queue.submit(std::iter::once(enc.finish()));
-        // Frame 2: reproject ON with the same camera as prev → every pixel should
+        // Frame 2: reproject ON with the same camera as prev â†’ every pixel should
         // reproject to itself, match position, and reuse frame 1's shadow/AO.
         // A static camera means the result must equal frame 1 (validates the
         // reuse path: reprojection math, position match, unpack).
@@ -5068,14 +5247,14 @@ mod gpu_render_tests {
     fn assert_sane(label: &str, min: f32, max: f32, mean: f32) {
         eprintln!("headless render [{label}] luma: min={min:.3} max={max:.3} mean={mean:.3}");
         // Bright sky pixels present (catches all-black / DDA-returns-nothing).
-        assert!(max > 0.55, "[{label}] no bright sky pixels (max luma {max:.3}) — render likely broken");
+        assert!(max > 0.55, "[{label}] no bright sky pixels (max luma {max:.3}) â€” render likely broken");
         // Dark terrain pixels present (catches all-sky / DDA never hits geometry).
-        assert!(min < 0.45, "[{label}] no dark terrain pixels (min luma {min:.3}) — DDA not hitting voxels");
+        assert!(min < 0.45, "[{label}] no dark terrain pixels (min luma {min:.3}) â€” DDA not hitting voxels");
         assert!(mean > 0.05 && mean < 0.95, "[{label}] implausible mean luma {mean:.3}");
     }
 
     /// Densest water / leaf 32x32-column cells of a filled world (columns
-    /// sampled at stride 4), plus the ground height under the leaf cell —
+    /// sampled at stride 4), plus the ground height under the leaf cell â€”
     /// deterministic camera anchors shared by the water/foliage content test
     /// and the timing benchmark.
     fn find_scene_anchors(world: &World) -> (glam::IVec2, glam::IVec2, i32) {
@@ -5211,7 +5390,7 @@ mod gpu_render_tests {
             &world, &cam, w as u32, h as u32,
             &[leaf(228.0), leaf(240.0), leaf(252.0)],
         ) else {
-            eprintln!("no GPU adapter — skipping leaf occlusion test");
+            eprintln!("no GPU adapter â€” skipping leaf occlusion test");
             return;
         };
         let mut red = 0usize;
@@ -5444,7 +5623,7 @@ mod gpu_render_tests {
         // rays active over the whole ground view.
         let Some(frame) = render_checkerboard_probe(&world, &cam, w as u32, h as u32, 77.4, 77.4 + 1.0 / 60.0)
         else {
-            eprintln!("no GPU adapter — skipping checkerboard probe");
+            eprintln!("no GPU adapter â€” skipping checkerboard probe");
             return;
         };
         let luma = |x: usize, y: usize| -> f32 {
@@ -5509,7 +5688,7 @@ mod gpu_render_tests {
         cam.pitch = 0.06;
         for (name, at) in [("godrays_f0", 30.000f32), ("godrays_f1", 30.033f32)] {
             let Some(rgba) = render_rgba_time_sun(&world, &cam, 960, 540, at, 68.0) else {
-                eprintln!("no GPU — skipping");
+                eprintln!("no GPU â€” skipping");
                 return;
             };
             let path = format!("target/lookdev/{name}.png");
@@ -6034,7 +6213,7 @@ mod gpu_render_tests {
         cam.yaw = 2.3;
         cam.pitch = -0.12;
         let Some(rgba) = render_rgba_at_time(&world, &cam, 1920, 1080, 30.0) else {
-            eprintln!("no GPU — skipping");
+            eprintln!("no GPU â€” skipping");
             return;
         };
         let path = "target/lookdev/day_meadow.png".to_string();
@@ -6067,7 +6246,7 @@ mod gpu_render_tests {
         cam.pitch = -0.10;
         for (name, t) in [("water_far_t0", 30.00f32), ("water_far_t1", 30.05f32)] {
             let Some(rgba) = render_rgba_at_time(&world, &cam, 960, 540, t) else {
-                eprintln!("no GPU — skipping");
+                eprintln!("no GPU â€” skipping");
                 return;
             };
             let path = format!("target/lookdev/{name}.png");
@@ -6098,7 +6277,7 @@ mod gpu_render_tests {
         // first so there is enough light to see the bands form and sweep.
         for st in [40.0f32, 55.0, 64.0, 70.0, 74.0, 77.0] {
             let Some(rgba) = render_rgba_time_sun(&world, &cam, 960, 540, 30.0, st) else {
-                eprintln!("no GPU — skipping");
+                eprintln!("no GPU â€” skipping");
                 return;
             };
             let sy = (st * 0.025 + 1.20).sin();
@@ -6127,7 +6306,7 @@ mod gpu_render_tests {
         cam.pitch = -1.55;
         for (name, t) in [("cloudshade_t0", 30.0f32), ("cloudshade_t1", 34.0f32)] {
             let Some(rgba) = render_rgba_at_time(&world, &cam, 960, 540, t) else {
-                eprintln!("no GPU — skipping");
+                eprintln!("no GPU â€” skipping");
                 return;
             };
             let path = format!("target/lookdev/{name}.png");
@@ -6163,7 +6342,7 @@ mod gpu_render_tests {
         cam.pitch = -0.5;
         let (w, h) = (960usize, 540usize);
         let Some(a) = render_rgba_full_opts(&world, &cam, w as u32, h as u32, &[], 30.0, 30.0, false, false) else {
-            eprintln!("no GPU adapter — skipping luma-wave probe");
+            eprintln!("no GPU adapter â€” skipping luma-wave probe");
             return;
         };
         let b = render_rgba_full_opts(&world, &cam, w as u32, h as u32, &[], 32.0, 30.0, false, false).unwrap();
@@ -6218,7 +6397,7 @@ mod gpu_render_tests {
         for (name, t, pitch) in views {
             cam.pitch = pitch;
             let Some(rgba) = render_rgba_at_time(&world, &cam, 960, 540, t) else {
-                eprintln!("no GPU — skipping");
+                eprintln!("no GPU â€” skipping");
                 return;
             };
             let (w, h) = (960usize, 540usize);
@@ -6270,7 +6449,7 @@ mod gpu_render_tests {
         cam.pitch = -1.5;
         let (w, h) = (960usize, 540usize);
         let Some(a) = render_rgba_time_sun(&world, &cam, w as u32, h as u32, 30.0, 30.0) else {
-            eprintln!("no GPU adapter — skipping cloud shadow test");
+            eprintln!("no GPU adapter â€” skipping cloud shadow test");
             return;
         };
         // Cloud drift rides the DAY clock (camera.sun_time - so freeze-time
@@ -6380,7 +6559,7 @@ mod gpu_render_tests {
         cam.yaw = std::f32::consts::FRAC_PI_4;
         cam.pitch = -0.30;
         let Some(rgba) = render_rgba(&world, &cam, 960, 540) else {
-            eprintln!("no GPU — skipping");
+            eprintln!("no GPU â€” skipping");
             return;
         };
         std::fs::create_dir_all("target/lookdev").unwrap();
@@ -6454,7 +6633,7 @@ mod gpu_render_tests {
                 ticks += 1;
             }
             let Some(rgba) = render_rgba(&world, &cam, 960, 540) else {
-                eprintln!("no GPU — skipping");
+                eprintln!("no GPU â€” skipping");
                 return;
             };
             let path = format!("target/lookdev/pool_t{target}.png");
@@ -6516,7 +6695,7 @@ mod gpu_render_tests {
         angle.pitch = -0.45;
         for (name, cam) in [("transition_top", top), ("transition_angle", angle)] {
             let Some(rgba) = render_rgba(&world, &cam, 960, 540) else {
-                eprintln!("no GPU — skipping");
+                eprintln!("no GPU â€” skipping");
                 return;
             };
             let path = format!("target/lookdev/{name}.png");
@@ -6610,7 +6789,7 @@ mod gpu_render_tests {
     fn texture_pattern_is_depth_invariant() {
         use crate::voxel::{MAT_ICE, MAT_STONE};
         let Some(stone_side) = normal_shift_diff(MAT_STONE, false) else {
-            eprintln!("no GPU adapter — skipping depth-invariance test");
+            eprintln!("no GPU adapter â€” skipping depth-invariance test");
             return;
         };
         let stone_top = normal_shift_diff(MAT_STONE, true).unwrap();
@@ -6642,7 +6821,7 @@ mod gpu_render_tests {
         std::fs::create_dir_all("target/lookdev").unwrap();
         for (name, cam) in [("stone_probe_2x", corner), ("stone_probe_faceon", faceon)] {
             let Some(rgba) = render_rgba(&world, &cam, 1920, 1080) else {
-                eprintln!("no GPU — skipping");
+                eprintln!("no GPU â€” skipping");
                 return;
             };
             let path = format!("target/lookdev/{name}.png");
@@ -6760,7 +6939,7 @@ mod gpu_render_tests {
         let [(_, side), _, _] = leaf_lab_cams();
         let (w, h) = (640usize, 400usize);
         let Some(frame) = render_rgba(&world, &side, w as u32, h as u32) else {
-            eprintln!("no GPU adapter — skipping leaf lab test");
+            eprintln!("no GPU adapter â€” skipping leaf lab test");
             return;
         };
         // Crown-edge crop: upper-left region of the canopy against sky.
@@ -6855,7 +7034,7 @@ mod gpu_render_tests {
         cam.yaw = 0.62;
         cam.pitch = -0.55;
         let Some(rgba) = render_rgba(&world, &cam, 960, 540) else {
-            eprintln!("no GPU — skipping");
+            eprintln!("no GPU â€” skipping");
             return;
         };
         std::fs::create_dir_all("target/lookdev").unwrap();
@@ -6897,7 +7076,7 @@ mod gpu_render_tests {
         let (world, cam) = build_water_terrace_world();
         let (w, h) = (960usize, 540usize);
         let Some(frame) = render_rgba(&world, &cam, w as u32, h as u32) else {
-            eprintln!("no GPU adapter — skipping water_diagonal_connects");
+            eprintln!("no GPU adapter â€” skipping water_diagonal_connects");
             return;
         };
         let (x0, y0, cw, ch) = (456, 264, 48, 48);
@@ -6951,7 +7130,7 @@ mod gpu_render_tests {
         cam.pitch = -0.45;
         let (w, h) = (640usize, 400usize);
         let Some(frame) = render_rgba(&world, &cam, w as u32, h as u32) else {
-            eprintln!("no GPU adapter — skipping water_terrace_ramp");
+            eprintln!("no GPU adapter â€” skipping water_terrace_ramp");
             return;
         };
         let (x0, y0, cw, ch) = (w / 2 - 100, h / 2 - 40, 200, 120);
@@ -6961,7 +7140,7 @@ mod gpu_render_tests {
     }
 
     /// The water view must contain water-blue pixels and the foliage view
-    /// green foliage pixels — catches "water/foliage renders black, pink, or
+    /// green foliage pixels â€” catches "water/foliage renders black, pink, or
     /// vanishes" regressions that the pure luma-stats tests can't see.
     #[test]
     fn renders_water_blue_and_foliage_green() {
@@ -6973,7 +7152,7 @@ mod gpu_render_tests {
         wcam.pos = glam::Vec3::new(clamp_anchor(water_c.x), 86.0, clamp_anchor(water_c.y) - 40.0);
         wcam.pitch = -0.45;
         let Some(wframe) = render_rgba(&world, &wcam, 320, 200) else {
-            eprintln!("no GPU adapter — skipping water/foliage content test");
+            eprintln!("no GPU adapter â€” skipping water/foliage content test");
             return;
         };
         let blue = ground_fraction(&wframe, 320, 200, |r, g, b| b > r + 0.05 && b > g + 0.02);
@@ -7008,7 +7187,7 @@ mod gpu_render_tests {
 
         let save = |name: &str, cam: &Camera| {
             let Some(rgba) = render_rgba(&world, cam, w, h) else {
-                eprintln!("no GPU — skipping lookdev dump");
+                eprintln!("no GPU â€” skipping lookdev dump");
                 return;
             };
             let path = format!("target/lookdev/{name}.png");
@@ -7163,7 +7342,7 @@ mod gpu_render_tests {
             );
             cam.pitch = -0.25;
             let Some(frame) = render_rgba(&world, &cam, 320, 200) else {
-                eprintln!("no GPU adapter — skipping species content test");
+                eprintln!("no GPU adapter â€” skipping species content test");
                 return;
             };
             // Pine is dark, snow backgrounds are bright: a loose green-dominant
@@ -7700,7 +7879,7 @@ mod gpu_render_tests {
     #[ignore]
     fn raymarch_timing() {
         let Some((device, queue, _gpu)) = headless_device() else {
-            eprintln!("no GPU — skipping");
+            eprintln!("no GPU â€” skipping");
             return;
         };
         let (w, h) = (1920u32, 1080u32);
@@ -7917,7 +8096,7 @@ mod gpu_render_tests {
     #[test]
     fn renders_terrain_and_sky() {
         let Some((min, max, mean)) = render_luma_stats_at(glam::IVec2::ZERO) else {
-            eprintln!("no GPU adapter — skipping headless render test");
+            eprintln!("no GPU adapter â€” skipping headless render test");
             return;
         };
         assert_sane("spawn", min, max, mean);
@@ -7936,7 +8115,7 @@ mod gpu_render_tests {
         // frame must still show terrain + sky. (Biome differs from spawn, so we
         // assert sanity, not a luma match.)
         let Some((min, max, mean)) = render_luma_stats_at(glam::IVec2::new(100_000, 100_000)) else {
-            eprintln!("no GPU adapter — skipping far-origin render test");
+            eprintln!("no GPU adapter â€” skipping far-origin render test");
             return;
         };
         assert_sane("far(100k chunks)", min, max, mean);
@@ -7946,7 +8125,7 @@ mod gpu_render_tests {
     fn gpu_physics_sand_falls() {
         use crate::voxel::{brick_idx, brick_voxel_idx, Brick, MAT_SAND, WORLD_BRICKS_TOTAL};
         let Some((device, queue, _gpu)) = headless_device() else {
-            eprintln!("no GPU adapter — skipping GPU physics test");
+            eprintln!("no GPU adapter â€” skipping GPU physics test");
             return;
         };
         let stride = std::mem::size_of::<Brick>() as u64; // 72
@@ -8022,7 +8201,7 @@ mod gpu_render_tests {
         let data = slice.get_mapped_range().unwrap();
         let out: Brick = *bytemuck::from_bytes(&data);
 
-        // After one pull step the sand fell exactly one cell: top→air, mid→sand,
+        // After one pull step the sand fell exactly one cell: topâ†’air, midâ†’sand,
         // and mass is conserved (still exactly one sand voxel in the brick).
         assert_eq!(out.materials[vi_top as usize], 0, "top should now be air");
         assert_eq!(out.materials[vi_mid as usize], MAT_SAND, "sand should have fallen one cell");
@@ -8141,7 +8320,8 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
             // same order: decide which bricks carry lit shell, then upload the
             // brick table and the compact work list.
             world.sync_light_shell_all();
-            let live_count = upload_voxlight(&queue, &vl, world);
+            world.sync_refl_shell_all();
+            let live_count = upload_voxlight(&queue, &vl, world).light;
             assert!(
                 live_count < VL_PROBE_BLOCK,
                 "crafted scene bound {live_count} blocks and would collide with the probe scratch at {VL_PROBE_BLOCK}"
@@ -8260,6 +8440,13 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
                         light_count: 0,
                         fold: 0.35,
                         ao_strength: 0.85,
+                        // This rig converges the LIGHT field only; the
+                        // reflection pass is a separate dispatch this never
+                        // runs, so its live count stays 0.
+                        refl_live_count: 0,
+                        refl_rays: 1,
+                        refl_fold: 0.125,
+                        _pad: 0,
                     }),
                 );
                 let mut enc = self.device.create_command_encoder(&Default::default());

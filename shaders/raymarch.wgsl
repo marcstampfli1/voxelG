@@ -366,6 +366,14 @@ struct VoxLightParams {
     light_count: u32,
     fold: f32,
     ao_strength: f32,
+    // Reflection cache (see the block after voxlight_sample). It rides the same
+    // params buffer, round counter and update_div as the light field because it
+    // is the same amortization: one more uniform would be one more thing that
+    // can drift out of step with `round`.
+    refl_live_count: u32,
+    refl_rays: u32,
+    refl_fold: f32,
+    _pad: u32,
 };
 
 struct VlPointLight {
@@ -384,6 +392,15 @@ struct VlPointLight {
 @group(0) @binding(24) var<storage, read> vl_live_bricks: array<u32>;
 @group(0) @binding(25) var<uniform> vl_params: VoxLightParams;
 @group(0) @binding(26) var<storage, read> vl_lights: array<VlPointLight>;
+
+// Reflection cache, same three-buffer shape as the light field above (pool +
+// brick->block table + compact live list) but its own pool, because only
+// REFLECTIVE voxels get a record and that set is orders of magnitude smaller
+// than the lit air shell. Sharing one pool would force the wider 4-word stride
+// onto every lit voxel in the world.
+@group(0) @binding(27) var<storage, read_write> refl_pool: array<u32>;
+@group(0) @binding(28) var<storage, read> refl_block_of_brick: array<u32>;
+@group(0) @binding(29) var<storage, read> refl_live_bricks: array<u32>;
 
 // Shared-exponent HDR packing for the local-light term. One word holds a
 // radiance that can exceed 1.0 without an extra buffer.
@@ -500,6 +517,131 @@ fn voxlight_sample(p_world: vec3<f32>, n: vec3<f32>) -> VoxLight {
         o.valid = true;
     }
     return o;
+}
+
+// ---------------------------------------------------------------------------
+// Per-voxel reflection cache (docs/VOXEL_LIGHTING_PLAN.md, "Reflections").
+//
+// Only REFLECTIVE voxels (water surfaces, glass) get a record, so this is a
+// small sparse set rather than another whole-world array. Each record stores
+// SH-L1 DIRECTIONAL radiance rather than one flat colour. That is deliberate:
+// it is the same per-voxel SPATIAL resolution either way, but evaluating the SH
+// along the reflection direction keeps coarse VIEW dependence for free instead
+// of collapsing the surface to a single wash. A view-independent cache can
+// never be a true mirror; the SH is the most a per-voxel scheme can give, and
+// the per-pixel trace stays as the fallback for any voxel it cannot answer for.
+//
+// Record: 4 words per voxel, block stride 64 * 4 = 256.
+//   word0 = m0        mean radiance over the sampled hemisphere   (DC term)
+//   word1 = mx + m0   mean of radiance * ray.x, DC-biased         (x term)
+//   word2 = my + m0   mean of radiance * ray.y, DC-biased         (y term)
+//   word3 = mz + m0   mean of radiance * ray.z, DC-biased         (z term)
+//
+// The DC bias exists because vl_pack_rgb9e5 stores non-negative values only
+// while the directional moments are signed. It is EXACT, not a lossy clamp: the
+// moments are E[L * d_a] with L >= 0 and |d_a| <= 1, so |m_a| <= m0 holds by
+// construction and m_a + m0 always lands in [0, 2*m0].
+//
+// UNWRITTEN vs CONVERGED-TO-BLACK. An all-zero record means NEVER WRITTEN, and
+// that is unambiguous rather than merely harmless: the update pass floors the
+// stored DC at VL_REFL_MIN before packing, and rgb9e5 encodes any value at or
+// above that floor with a mantissa of at least 256 (the shared exponent is
+// derived from the largest channel), so word0 of a written record can never be
+// 0. VL_REFL_MIN is a fortieth of one 8-bit colour LSB, so the floor is
+// invisible by bound while making "black" and "absent" distinguishable.
+// ---------------------------------------------------------------------------
+
+const VL_REFL_RECORD_WORDS: u32 = 4u;
+// 64 voxels per brick * 4 words per record.
+const VL_REFL_BLOCK_WORDS: u32 = 256u;
+// Written-record floor on the DC term. See the note above.
+const VL_REFL_MIN: f32 = 1.0e-4;
+
+/// First pool word of a world voxel's REFLECTION record, or VL_NONE when the
+/// voxel is outside the window or its brick has no reflection block. Mirrors
+/// vl_record_word against the reflection pool's own brick table and stride.
+fn refl_record_word(world_v: vec3<i32>) -> u32 {
+    let rel = world_v - camera.world_origin;
+    if (rel.x < 0 || rel.x >= WORLD_VOXELS_X
+     || rel.y < 0 || rel.y >= WORLD_VOXELS_Y
+     || rel.z < 0 || rel.z >= WORLD_VOXELS_Z) {
+        return VL_NONE;
+    }
+    let v = world_to_slot_voxel(world_v);
+    let bp = v >> vec3<u32>(2u);
+    let bi = world_brick_idx(bp.x, bp.y, bp.z);
+    let block = refl_block_of_brick[u32(bi)];
+    if (block == VL_NONE) { return VL_NONE; }
+    let local = v - bp * BRICK_DIM;
+    let vi = brick_voxel_idx(local.x, local.y, local.z);
+    return block * VL_REFL_BLOCK_WORDS + u32(vi) * VL_REFL_RECORD_WORDS;
+}
+
+/// Cached reflected radiance for a point on a reflective surface.
+///
+/// Reads the record of the REFLECTIVE VOXEL ITSELF, not of an air neighbour:
+/// the reflected radiance is a property of that surface. (The sun/AO field is
+/// the other way round - visibility belongs to the air cell against the face -
+/// which is why the two samplers do not share a lookup.)
+///
+/// `n` is the shading normal and identifies the hemisphere the record was
+/// fitted over; `refl_dir` is the direction to evaluate. `*ok` comes back false
+/// - leaving the caller on its per-pixel path - when there is no block, when
+/// the record has never been written, or when the query direction lies so far
+/// outside the recorded hemisphere that the linear fit reconstructs a strongly
+/// negative radiance, which is proof the record does not describe it.
+fn voxlight_reflection(p_world: vec3<f32>, n: vec3<f32>, refl_dir: vec3<f32>,
+                       ok: ptr<function, bool>) -> vec3<f32> {
+    *ok = false;
+    // Step a hair back along the normal so floor() lands INSIDE the reflective
+    // cell: a glass hit sits exactly on the cube face, and a water plate can
+    // sit flush with its cell's top face, so plain floor(p) can name the air
+    // voxel in front instead.
+    let v = vec3<i32>(floor(p_world - n * 0.02));
+    let w = refl_record_word(v);
+    if (w == VL_NONE) { return vec3<f32>(0.0); }
+    let w0 = refl_pool[w];
+    let w1 = refl_pool[w + 1u];
+    let w2 = refl_pool[w + 2u];
+    let w3 = refl_pool[w + 3u];
+    // All zero == never written. Guaranteed distinct from converged-to-black by
+    // the update pass's DC floor (see the block comment above).
+    if ((w0 | w1 | w2 | w3) == 0u) { return vec3<f32>(0.0); }
+
+    let m0 = vl_unpack_rgb9e5(w0);
+    // Undo the DC bias to recover the signed directional moments.
+    let mx = vl_unpack_rgb9e5(w1) - m0;
+    let my = vl_unpack_rgb9e5(w2) - m0;
+    let mz = vl_unpack_rgb9e5(w3) - m0;
+
+    // Per-channel dot products of the moment VECTOR (mx, my, mz) with the pole
+    // and with the query direction. Written component-wise so all three colour
+    // channels resolve in one set of multiply-adds.
+    let m_n = mx * n.x + my * n.y + mz * n.z;
+    let m_r = mx * refl_dir.x + my * refl_dir.y + mz * refl_dir.z;
+    let c = clamp(dot(refl_dir, n), 0.0, 1.0);
+    // Least-squares SH-L1 reconstruction over the hemisphere about `n`, solved
+    // from that hemisphere's moment matrix (E[1] = 1, E[d.n] = 1/2,
+    // E[(d.n)^2] = 1/3, E[(d.t)^2] = 1/4). Exact for any field that IS linear
+    // and the least-squares projection otherwise, and frame-free: the tangent
+    // terms collapse into m_r, so no tangent basis is built at sample time.
+    //
+    // A linear fit OVERSHOOTS a peaked field at the pole (c = 1) and is
+    // accurate near the rim (c = 0). That falls the right way here: c = 1 is
+    // head-on, where Fresnel weights the reflection at ~2%, and c -> 0 is
+    // grazing, where Fresnel weights it most.
+    let e = 4.0 * m0 - 6.0 * m_n + c * (8.0 * m_n - 6.0 * m0) + 4.0 * m_r;
+
+    // A small negative excursion is the ordinary rim behaviour of a linear fit
+    // to a non-negative field and is simply clamped. An excursion past the DC
+    // cannot happen inside the fitted hemisphere, so it means the caller is
+    // querying a face this record was not gathered for (the far side of a glass
+    // pane): report a miss and let the per-pixel path answer instead of
+    // returning a confident black.
+    let dc = max(max(m0.r, m0.g), m0.b);
+    if (min(min(e.r, e.g), e.b) < -dc) { return vec3<f32>(0.0); }
+    *ok = true;
+    return max(e, vec3<f32>(0.0));
 }
 
 fn sky(dir: vec3<f32>) -> vec3<f32> {
@@ -3762,11 +3904,25 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>, px: vec2<i32>) -
     // trace latency anyway (measured: zero gain). Whole workgroups skipping
     // coherently is what converts skipped work into time.
     let stagger_trace = (((px.x >> 3) ^ (px.y >> 3) ^ i32(camera.gi_round)) & 1) == 0;
+    // Per-voxel reflection cache first: the reflected radiance is a stored
+    // property of the water voxel, so the common case is a four-word fetch
+    // instead of a trace plus a full secondary shade. `ok` is false for any
+    // voxel the cache cannot answer for (no block yet, never converged, or a
+    // query outside the recorded hemisphere), and then the per-pixel path below
+    // runs UNCHANGED - a voxel whose reflection has not converged must not
+    // render black.
+    var vl_refl_ok = false;
+    var vl_refl = vec3<f32>(0.0);
+    if (PROF_TRANSP_NO_REFL < 0.5) {
+        vl_refl = voxlight_reflection(p_hit, n, refl_dir, &vl_refl_ok);
+    }
     var refl_col: vec3<f32>;
     if (PROF_TRANSP_NO_REFL > 0.5) {
         // Cost-split probe: whole reflection component off (trace, shade,
         // history traffic).
         refl_col = sky(refl_dir);
+    } else if (vl_refl_ok) {
+        refl_col = vl_refl;
     } else if (hist_ok && !stagger_trace) {
         let rg = unpack2x16float(hist.x);
         refl_col = vec3<f32>(rg.x, rg.y, unpack2x16float(hist.y).x);
@@ -3791,6 +3947,9 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>, px: vec2<i32>) -
             refl_col = fresh;
         }
     }
+    // History is written on BOTH paths, cached and traced. If the cache path
+    // skipped the store, a pixel that later fell back would read a history
+    // entry from an older frame that still passes the position/angle gates.
     if (PROF_TRANSP_NO_REFL < 0.5) {
         transp_buf[hidx] = vec4<u32>(
             pack2x16float(refl_col.rg),
@@ -4234,12 +4393,22 @@ fn shade_glass(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
 
     let refl_dir = reflect(dir, n);
     let refl_origin = p_hit + n * 0.01;
-    let refl_hit = trace(refl_origin, refl_dir);
+    // Per-voxel reflection cache, same contract as the water surface: a
+    // four-word fetch when the glass voxel's record covers this face, and the
+    // untouched per-pixel trace + shade whenever it does not (no block yet,
+    // never converged, or the record was gathered from the pane's other side).
+    var vl_refl_ok = false;
+    let vl_refl = voxlight_reflection(p_hit, n, refl_dir, &vl_refl_ok);
     var refl_col: vec3<f32>;
-    if (refl_hit.hit) {
-        refl_col = shade(refl_hit, refl_origin, refl_dir, jit, false, false, false, &no_cache, vec3<f32>(0.0));
+    if (vl_refl_ok) {
+        refl_col = vl_refl;
     } else {
-        refl_col = sky(refl_dir);
+        let refl_hit = trace(refl_origin, refl_dir);
+        if (refl_hit.hit) {
+            refl_col = shade(refl_hit, refl_origin, refl_dir, jit, false, false, false, &no_cache, vec3<f32>(0.0));
+        } else {
+            refl_col = sky(refl_dir);
+        }
     }
 
     // Chromatic dispersion: shift the refractive index slightly per channel.

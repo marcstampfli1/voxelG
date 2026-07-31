@@ -347,6 +347,13 @@ pub struct World {
     /// Only the brick -> block binding lives here; the light records themselves
     /// are GPU-side and never read back.
     pub light: crate::voxlight::LightField,
+    /// Sparse per-voxel REFLECTED RADIANCE allocation, same allocator and same
+    /// GPU-side arrangement as `light`. Kept as a second field rather than
+    /// widening the light record: its membership rule is different (reflective
+    /// voxels, not the air shell), so one shared pool would either bind
+    /// reflection storage for the whole lit shell or lose the light shell's
+    /// one-brick conservatism.
+    pub refl: crate::voxlight::LightField,
     /// Reusable physics scratch buffers (a sorted snapshot of active_bricks and
     /// the per-tick "touched" set), kept here so the CA tick allocates nothing —
     /// previously it cloned active_bricks twice per tick (checklist: physics).
@@ -424,7 +431,8 @@ impl World {
             tile_uniform: vec![0u8; WORLD_TILES_TOTAL as usize],
             active_bricks: Vec::with_capacity(4096),
             dirty_bricks: Vec::with_capacity(4096),
-            light: crate::voxlight::LightField::new(),
+            light: crate::voxlight::LightField::new(crate::voxlight::LIGHT_BLOCKS_MAX),
+            refl: crate::voxlight::LightField::new(crate::voxlight::REFL_BLOCKS_MAX),
             phys_scratch: Vec::with_capacity(4096),
             phys_touched: Vec::with_capacity(8192),
             all_dirty: true,
@@ -641,15 +649,17 @@ impl World {
         let base_by = slot_cy * STORAGE_CHUNK_BRICKS;
         let base_bz = slot_cz * STORAGE_CHUNK_BRICKS;
         // Stop physics touching the slot's now-hidden bricks, and hand the
-        // slot's light blocks back to the pool. The block records are left as
-        // they are: nothing maps to them while unbound, and rebinding queues a
-        // reset, so recycling a slot never touches GPU memory.
+        // slot's light and reflection blocks back to their pools. The block
+        // records are left as they are: nothing maps to them while unbound, and
+        // rebinding queues a reset, so recycling a slot never touches GPU
+        // memory.
         for dz in 0..STORAGE_CHUNK_BRICKS {
             for dy in 0..STORAGE_CHUNK_BRICKS {
                 for dx in 0..STORAGE_CHUNK_BRICKS {
                     let bi = brick_idx(base_bx + dx, base_by + dy, base_bz + dz);
                     self.movable_mask[bi as usize] = 0;
                     self.light.release(bi);
+                    self.refl.release(bi);
                 }
             }
         }
@@ -944,6 +954,63 @@ impl World {
             }
         }
         false
+    }
+
+    /// Bring reflection-block bindings in line with the bricks that changed.
+    ///
+    /// Called once per frame from the renderer alongside `sync_light_shell_dirty`
+    /// and for the same reason: the membership test is consumed only at draw
+    /// time, so running it from `mark_brick_dirty` would tax the physics hot
+    /// path.
+    pub fn sync_refl_shell_dirty(&mut self) {
+        // Same take/put-back dance as the light sync: the walk needs &mut self
+        // and the caller still needs the list for the brick upload. Moving a
+        // Vec costs nothing, so this stays allocation-free.
+        let changed = std::mem::take(&mut self.dirty_bricks);
+        for &bi in &changed {
+            // Only the brick ITSELF, unlike the light shell: reflection
+            // membership asks whether this brick holds a reflective voxel, a
+            // question no neighbour's contents can change. Walking the
+            // neighbourhood here would be six redundant scans per edit.
+            self.eval_refl_shell(bi);
+            // The geometry this brick's water/glass reflects moved, so the
+            // accumulated SH is stale.
+            self.refl.invalidate(bi);
+        }
+        self.dirty_bricks = changed;
+    }
+
+    /// Rebind the whole world's reflective set. Used on a full-dirty frame
+    /// (world init, teleport), where every brick is effectively new.
+    pub fn sync_refl_shell_all(&mut self) {
+        for bi in 0..WORLD_BRICKS_TOTAL {
+            self.eval_refl_shell(bi);
+        }
+    }
+
+    fn eval_refl_shell(&mut self, bi: u32) {
+        if self.brick_needs_refl(bi) {
+            self.refl.allocate(bi);
+        } else {
+            self.refl.release(bi);
+        }
+    }
+
+    /// A brick needs reflection storage when it CONTAINS a reflective voxel:
+    /// water or glass. Not conservative by a neighbouring brick the way the
+    /// light shell is, because the record belongs to the reflective voxel
+    /// itself rather than to the air beside it, so there is nothing to
+    /// interpolate across a brick boundary and a one-brick skirt would multiply
+    /// the bound set for records no surface ever reads.
+    fn brick_needs_refl(&self, bi: u32) -> bool {
+        let brick = &self.bricks[bi as usize];
+        // An empty brick stores MAT_AIR everywhere, so the occupancy word
+        // answers the common case (open sky, and every solid-free brick) in one
+        // load instead of 64.
+        if brick.is_empty() {
+            return false;
+        }
+        brick.materials.iter().any(|&m| is_water_mat(m) || m == MAT_GLASS)
     }
 
     /// The face-adjacent storage bricks. x/z wrap toroidally (the storage

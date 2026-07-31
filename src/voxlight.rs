@@ -14,6 +14,12 @@
 // pass and never read back. Keeping the allocator CPU-side and the payload
 // GPU-side is what lets a block be freed or invalidated in O(1) without
 // touching (or moving) 512 bytes of GPU memory.
+//
+// Because it holds no payload, ONE allocator serves both sparse fields: the
+// light field and the per-voxel REFLECTED RADIANCE field, which differ only in
+// pool capacity, record stride and which bricks qualify. Capacity is therefore
+// a constructor argument and the stride lives with the caller's buffer, so the
+// two never share a number by accident.
 
 use crate::world_dims::{BRICK_VOXELS, WORLD_BRICKS_TOTAL};
 
@@ -33,6 +39,23 @@ pub const LIGHT_BLOCKS_MAX: u32 = 131_072;
 
 /// u32 words of GPU storage backing the whole pool (64 MiB).
 pub const LIGHT_POOL_WORDS: u32 = LIGHT_BLOCKS_MAX * LIGHT_RECORDS_PER_BLOCK * LIGHT_RECORD_WORDS;
+
+/// A reflection record is four u32 words: SH-L1 directional radiance, a DC
+/// term plus three directional terms, each packed RGB9E5. Directional rather
+/// than one flat colour so evaluating the SH along the reflection direction
+/// keeps coarse view dependence, which one colour per voxel would collapse
+/// into a uniform wash (docs/VOXEL_LIGHTING_PLAN.md, "Reflections").
+pub const REFL_RECORD_WORDS: u32 = 4;
+
+/// Resident reflection blocks. An eighth of the light ceiling because the set
+/// is far smaller by construction: a block is bound only for a brick that
+/// actually CONTAINS water or glass, not for the whole air shell around solid
+/// geometry, and reflective surfaces are a thin sheet (a lake top, a window)
+/// rather than the entire terrain.
+pub const REFL_BLOCKS_MAX: u32 = 16_384;
+
+/// u32 words of GPU storage backing the reflection pool (16 MiB).
+pub const REFL_POOL_WORDS: u32 = REFL_BLOCKS_MAX * LIGHT_RECORDS_PER_BLOCK * REFL_RECORD_WORDS;
 
 /// `block_of_brick` entry meaning "this brick has no light block".
 pub const LIGHT_BLOCK_NONE: u32 = u32::MAX;
@@ -80,10 +103,17 @@ pub struct LightField {
     /// table and work list only when they actually differ. Without this the
     /// frame would push 4 MB of unchanged table every time.
     table_dirty: bool,
+    /// Blocks in the GPU pool backing this field. Held per instance rather than
+    /// read from a constant so the light and reflection fields cannot allocate
+    /// past each other's buffer.
+    blocks_max: u32,
 }
 
 impl LightField {
-    pub fn new() -> Self {
+    /// `blocks_max` must match the block count of the GPU pool this field
+    /// indexes (`LIGHT_BLOCKS_MAX` / `REFL_BLOCKS_MAX`); it is the only thing
+    /// stopping `allocate` from handing out an out-of-range block index.
+    pub fn new(blocks_max: u32) -> Self {
         Self {
             block_of_brick: vec![LIGHT_BLOCK_NONE; WORLD_BRICKS_TOTAL as usize],
             slots: Vec::new(),
@@ -95,7 +125,15 @@ impl LightField {
             // (epoch 0 = invalid), which is exactly the empty state, so the
             // first frame has nothing to re-upload.
             table_dirty: false,
+            blocks_max,
         }
+    }
+
+    /// Pool ceiling this field was built for. The renderer reports it when the
+    /// pool overflows, so the message names the field's own cap.
+    #[inline]
+    pub fn blocks_max(&self) -> u32 {
+        self.blocks_max
     }
 
     /// Whether the brick table / work list changed since the last call, and clear.
@@ -152,7 +190,7 @@ impl LightField {
                 b
             }
             None => {
-                if self.slots.len() as u32 >= LIGHT_BLOCKS_MAX {
+                if self.slots.len() as u32 >= self.blocks_max {
                     self.overflow = self.overflow.saturating_add(1);
                     return None;
                 }
@@ -214,10 +252,21 @@ impl LightField {
         std::mem::replace(&mut self.overflow, 0)
     }
 
-    /// Word offset of `block`'s records within the pool buffer.
+    /// Word offset of `block`'s records within the LIGHT pool buffer.
     #[inline]
     pub fn block_word_offset(block: u32) -> u32 {
-        block * LIGHT_RECORDS_PER_BLOCK * LIGHT_RECORD_WORDS
+        Self::block_word_offset_with(LIGHT_RECORD_WORDS, block)
+    }
+
+    /// Word offset of `block` in a pool whose records are `record_words` wide.
+    ///
+    /// Explicit stride because the reflection pool's record is twice the light
+    /// record: computing its offsets with `block_word_offset` would land every
+    /// block at half its true address, silently overlapping neighbours instead
+    /// of failing.
+    #[inline]
+    pub fn block_word_offset_with(record_words: u32, block: u32) -> u32 {
+        block * LIGHT_RECORDS_PER_BLOCK * record_words
     }
 
     #[cfg(test)]
@@ -243,11 +292,8 @@ impl LightField {
     }
 }
 
-impl Default for LightField {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// No `Default`: a field built without its pool capacity would either allocate
+// nothing or, worse, allocate past whichever buffer it was later handed to.
 
 #[cfg(test)]
 mod tests {
@@ -261,8 +307,45 @@ mod tests {
     }
 
     #[test]
+    fn refl_pool_sizing_matches_the_documented_budget() {
+        // 16384 blocks * 64 records * 4 words * 4 bytes = 16 MiB.
+        assert_eq!(REFL_POOL_WORDS as u64 * 4, 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn the_capacity_is_per_field_not_a_global_constant() {
+        // The reflection field is an eighth of the light field, so a ceiling
+        // read from LIGHT_BLOCKS_MAX instead of the instance would let it hand
+        // out block indices past the end of its own GPU pool.
+        let mut lf = LightField::new(3);
+        for brick in 0..3u32 {
+            assert!(lf.allocate(brick).is_some(), "block {brick} is within capacity 3");
+        }
+        assert_eq!(lf.allocate(3), None, "capacity 3 must refuse a fourth block");
+        assert_eq!(lf.take_overflow(), 1);
+        assert_eq!(lf.blocks_max(), 3);
+    }
+
+    #[test]
+    fn refl_block_offsets_use_the_reflection_stride() {
+        // The reflection record is twice the light record, so sharing
+        // `block_word_offset` would overlap every block with its neighbour.
+        assert_eq!(LightField::block_word_offset_with(REFL_RECORD_WORDS, 0), 0);
+        assert_eq!(LightField::block_word_offset_with(REFL_RECORD_WORDS, 1), 256);
+        assert_eq!(
+            LightField::block_word_offset_with(LIGHT_RECORD_WORDS, 1),
+            LightField::block_word_offset(1),
+            "the light stride must stay the default"
+        );
+        let last = REFL_BLOCKS_MAX - 1;
+        let end = LightField::block_word_offset_with(REFL_RECORD_WORDS, last)
+            + LIGHT_RECORDS_PER_BLOCK * REFL_RECORD_WORDS;
+        assert_eq!(end, REFL_POOL_WORDS, "the last block must end exactly at the pool end");
+    }
+
+    #[test]
     fn allocate_binds_and_is_idempotent() {
-        let mut lf = LightField::new();
+        let mut lf = LightField::new(LIGHT_BLOCKS_MAX);
         let a = lf.allocate(7).unwrap();
         let b = lf.allocate(7).unwrap();
         assert_eq!(a, b, "re-allocating a bound brick must return the same block");
@@ -273,7 +356,7 @@ mod tests {
 
     #[test]
     fn only_recycled_blocks_request_a_reset() {
-        let mut lf = LightField::new();
+        let mut lf = LightField::new(LIGHT_BLOCKS_MAX);
         lf.allocate(3);
         assert_eq!(
             lf.take_pending_reset().count(),
@@ -291,7 +374,7 @@ mod tests {
 
     #[test]
     fn release_keeps_the_live_list_compact_and_repairs_backpointers() {
-        let mut lf = LightField::new();
+        let mut lf = LightField::new(LIGHT_BLOCKS_MAX);
         for brick in 0..5u32 {
             lf.allocate(brick).unwrap();
         }
@@ -311,7 +394,7 @@ mod tests {
 
     #[test]
     fn release_of_an_unbound_brick_is_a_noop() {
-        let mut lf = LightField::new();
+        let mut lf = LightField::new(LIGHT_BLOCKS_MAX);
         lf.release(42);
         lf.release(42);
         assert_eq!(lf.allocated(), 0);
@@ -320,14 +403,14 @@ mod tests {
 
     #[test]
     fn invalidate_without_a_block_is_a_noop() {
-        let mut lf = LightField::new();
+        let mut lf = LightField::new(LIGHT_BLOCKS_MAX);
         lf.invalidate(11);
         assert_eq!(lf.take_pending_reset().count(), 0);
     }
 
     #[test]
     fn freed_blocks_are_reused_before_growing_the_pool() {
-        let mut lf = LightField::new();
+        let mut lf = LightField::new(LIGHT_BLOCKS_MAX);
         let a = lf.allocate(1).unwrap();
         lf.allocate(2).unwrap();
         lf.release(1);
@@ -339,7 +422,7 @@ mod tests {
 
     #[test]
     fn exhaustion_is_reported_and_degrades_instead_of_panicking() {
-        let mut lf = LightField::new();
+        let mut lf = LightField::new(LIGHT_BLOCKS_MAX);
         // Fill the pool exactly.
         for brick in 0..LIGHT_BLOCKS_MAX {
             assert!(lf.allocate(brick).is_some(), "block {brick} should fit");
@@ -378,7 +461,7 @@ mod tests {
             *state = state.wrapping_mul(1664525).wrapping_add(1013904223);
             *state
         }
-        let mut lf = LightField::new();
+        let mut lf = LightField::new(LIGHT_BLOCKS_MAX);
         let mut rng = 12345u32;
         for _ in 0..4000 {
             let brick = lcg(&mut rng) % 512;
