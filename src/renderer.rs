@@ -328,6 +328,8 @@ pub struct Renderer {
     voxlight_round: u32,
     /// Live block count from the last upload; the update dispatch size.
     voxlight_live_count: u32,
+    /// Dynamic point lights currently uploaded (see `set_point_lights`).
+    voxlight_light_count: u32,
     // Deferred transparent pass (#16): shares compute_bgl/compute_bg.
     transparent_pipeline: wgpu::ComputePipeline,
 
@@ -1151,7 +1153,7 @@ impl Renderer {
             beam_bgl, beam_pipeline, beam_bg,
             compute_bgl, compute_pipeline, compute_bg,
             vl: vl_bufs, voxlight_pipeline, voxlight_pipeline_rt,
-            voxlight_round: 0, voxlight_live_count: 0,
+            voxlight_round: 0, voxlight_live_count: 0, voxlight_light_count: 0,
             rt_shadows, world_accel,
             rt_bgl, rt_bg, compute_pipeline_rt, compose_pipeline_rt, transparent_pipeline_rt,
             gi_probe_buf, gi_probe_pipeline, godray_pipeline, godray_pipeline_rt,
@@ -1181,6 +1183,32 @@ impl Renderer {
             gi_frame: 0,
             gpu_profiler,
         })
+    }
+
+    /// Replace the dynamic point lights gathered into the light field.
+    ///
+    /// Cost lands in the update pass, which walks this list once per lit voxel
+    /// per round, NOT in the per-pixel path: shading reads an already-gathered,
+    /// already-shadow-tested radiance out of the field, so adding lights does
+    /// not make a pixel more expensive. Excess lights past VOXLIGHT_MAX_LIGHTS
+    /// are dropped with a warning rather than silently truncated.
+    pub fn set_point_lights(&mut self, lights: &[VoxLightPoint]) {
+        let n = lights.len().min(VOXLIGHT_MAX_LIGHTS as usize);
+        if lights.len() > n {
+            log::warn!(
+                "voxlight: {} point lights requested, cap is {VOXLIGHT_MAX_LIGHTS}; dropping {}",
+                lights.len(),
+                lights.len() - n,
+            );
+        }
+        if n > 0 {
+            self.queue.write_buffer(&self.vl.lights, 0, bytemuck::cast_slice(&lights[..n]));
+        }
+        // Changing the light set invalidates every accumulated local-light
+        // estimate, but the fold converges within one epoch cycle and a light
+        // that moved is visibly wrong for far less time than a re-gather of the
+        // whole field would cost.
+        self.voxlight_light_count = n as u32;
     }
 
     pub fn resize(&mut self, w: u32, h: u32) {
@@ -1675,6 +1703,7 @@ impl Renderer {
                     bytemuck::bytes_of(&voxlight_params(
                         self.voxlight_live_count,
                         self.voxlight_round,
+                        self.voxlight_light_count,
                     )),
                 );
                 let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -2929,7 +2958,7 @@ fn upload_voxlight(
 /// ONE definition shared by the renderer and the GPU tests: a test that
 /// converged the field with a different ray count or fold than the shipping
 /// path would be measuring something the game never renders.
-pub(crate) fn voxlight_params(live_count: u32, round: u32) -> VoxLightParamsUniform {
+pub(crate) fn voxlight_params(live_count: u32, round: u32, light_count: u32) -> VoxLightParamsUniform {
     VoxLightParamsUniform {
         live_count,
         round,
@@ -2938,7 +2967,7 @@ pub(crate) fn voxlight_params(live_count: u32, round: u32) -> VoxLightParamsUnif
         // Matches the penumbra width the per-pixel cone used, so the soft
         // shadow LOOK is preserved while the mechanism producing it changes.
         sun_cone: 0.07,
-        light_count: 0,
+        light_count,
         fold: 0.35,
         ao_strength: 0.85,
     }

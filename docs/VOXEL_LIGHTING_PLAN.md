@@ -195,16 +195,54 @@ Nothing here is judged by eye alone or declared done off a compile.
 - Look: `dump_lookdev_views` stills read directly, including the water views
   that the reflection decision most affects.
 
-## Staging
+## Staging and current status
 
-Each stage lands complete and verified, not stubbed:
+1. DONE - block pool, GPU buffers, bind group, invalidation hooks.
+2. DONE, WITH A DEVIATION - AO lives in the field, but it is NOT the old
+   formula. The per-pixel version evaluated four corners of one FACE and
+   bilinearly blended them; a per-voxel field cannot be face-indexed, so
+   occlusion is measured for the air cell itself (weighted 6-face + 12-edge
+   occupancy) and the smooth gradient comes from the trilinear fetch instead
+   of the in-face blend. `ao_occluder` is reused verbatim so decoration cells
+   still do not stamp AO squares on the ground. The original plan said "proven
+   equal to today"; that was not achievable and the claim is withdrawn rather
+   than fudged. Verified instead by pinning the value: ground probes read
+   ao 201, which is `1 - 0.85 * (6/24)` to the byte.
+3. DONE - soft `sun_vis` with deterministic sun-disc sampling over 8 epochs.
+4. DONE - solidity-gated trilinear sampling wired into `shade`.
+5. PARTIAL - point lights are gathered by the update pass, uploaded, and
+   surfaced through `Renderer::set_point_lights`. Nothing in the game calls it
+   yet, and there is no test covering a lit point light.
+6. NOT STARTED - per-voxel reflections.
+7. NOT STARTED - secondary rays read the field.
+8. IN PROGRESS - baseline captured in `docs/rt/BASELINE-per-voxel-lighting.md`.
 
-1. Block pool, GPU buffer, bind group, invalidation hooks. No shading change.
-2. AO into the field, proven equal to the current formula.
-3. Soft `sun_vis` with the deterministic disc sampling.
-4. Solidity-gated trilinear sampling wired into `shade`, per-pixel shadow
-   and AO paths and the reprojection cache deleted.
-5. Point lights.
-6. Per-voxel reflections.
-7. Secondary rays read the field.
-8. Measurement, stills, `docs/PERF.md` entries.
+### Known follow-ups found while building
+
+- TEMPORAL STABILITY IS UNMEASURED. Each round folds a 4-ray estimate at
+  `fold = 0.35`, an effective window of roughly three rounds or twelve rays, so
+  the stored value may shimmer between rounds even though the SPATIAL gradient
+  measures clean. The `flicker_probe_rt_views` rig exists precisely for this
+  and has not been run against the field yet. If it shimmers, the fix is the
+  probe grid's shape: accumulate a complete epoch cycle in a staging slot and
+  fold only finished estimates (`gi_probes.wgsl:255`), rather than lowering the
+  fold and adding lag.
+- AO IS RECOMPUTED EVERY ROUND for no reason. It is purely geometric, so
+  eighteen occupancy lookups per voxel per round are repeated work; it only
+  needs recomputing when the record is reset or its brick is edited.
+- POOL SIZING IS UNVALIDATED AGAINST A REAL STREAMED WORLD. The 131072-block
+  ceiling was derived from the shape of the terrain shell, and the crafted test
+  worlds bind only ~2300 blocks. `take_overflow` will log if it is short, but
+  nobody has yet flown a real world far enough to find out.
+
+### What is NOT yet true
+
+The old per-pixel machinery is still present and still runs as the fallback
+for any voxel the field cannot answer for (no block, or a block that has not
+converged). The plan called for DELETING the per-pixel shadow cone, the
+per-pixel `compute_ao` call and the whole screen-space reprojection cache.
+None of that is removed yet, so the promised simplification - one world-space
+mechanism instead of a screen-space cache plus a per-pixel trace plus a
+staleness heuristic - has not landed. Two paths still exist and can drift.
+Removing them is only safe once the field is proven to cover the cases they
+handle, which is what the measurement stage is for.
