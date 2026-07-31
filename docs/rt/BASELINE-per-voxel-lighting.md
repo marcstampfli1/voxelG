@@ -41,6 +41,41 @@ cost sits in the transparent pass (3.25 ms), where reflection hits are
 re-shaded from scratch and deliberately bypass the reprojection cache
 (raymarch.wgsl:3545). That pass is what stages 6 and 7 target.
 
+## Measurement rounds so far (RT-prim+PROBE-GI, the shipped config)
+
+| round                          | terrain  | foliage  | water-close |
+|--------------------------------|----------|----------|-------------|
+| A. baseline (a113962)          | 14.38 ms | 15.83 ms | 8.16 ms     |
+| B. field in, no early-out      | 15.63 ms | 17.00 ms | 8.86 ms     |
+| C. field in, with early-out    | 13.62 ms | 15.17 ms | 7.93 ms     |
+
+Round B is the honest cost of a MISSING early-out: `voxlight_sample` ran its
+full eight-tap gated loop and paid an `is_voxel_solid` descent plus a brick
+table lookup per tap before failing. Terrain shade went 9.24 -> 10.01 ms.
+Round C checks the centre voxel first and answers a miss in one lookup.
+
+READ ROUND C CAREFULLY. It is NOT evidence that the light field is faster.
+The timing harness builds its own bind groups with an unpopulated
+`VoxLightBuffers`, so in every one of these rounds the field is empty,
+`voxlight_sample` returns invalid, and shading falls back to the previous
+per-pixel path. All three rounds measure the SAME renderer, plus or minus the
+cost of asking the field a question it cannot answer.
+
+Round-to-round variance is also large: the software column alone reads
+13.85 / 15.11 / 13.16 ms for terrain across A/B/C, about 13% spread on a path
+whose behaviour did not change. Round C landing under round A is inside that
+spread and must not be reported as a win.
+
+What round C does establish: the field is performance-NEUTRAL when it is not
+populated, which is the precondition for it being a win when it is.
+
+## Still to measure
+
+The A/B that matters has not been run. It needs the timing harness to bind a
+POPULATED field (as `voxlight_field_populates_and_is_sampled` already does)
+so the shadow ray and AO evaluation are actually replaced rather than
+supplemented. Until then there is no number for the feature itself.
+
 ## Reproducing
 
     cargo test --lib rt_vs_software_timing -- --nocapture --ignored
