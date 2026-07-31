@@ -60,6 +60,50 @@ pub(crate) const COMPUTE_STORAGE_BUFFERS: u32 = 20;
 /// VOXLIGHT_UPDATE_DIV frames. Mirrors the probe grid's cadence.
 pub(crate) const VOXLIGHT_UPDATE_DIV: u32 = 8;
 
+/// Elevation strata in one reflection gather, and equally the number of
+/// stratification phases the gather rotates through. Mirrors `VL_REFL_EPOCHS`
+/// in `shaders/voxlight_refl_update.wgsl`.
+pub(crate) const VOXLIGHT_REFL_RAYS: u32 = 8;
+
+/// Reflection-field update amortization, and DELIBERATELY NOT the light
+/// field's.
+///
+/// The reflection pass gathers a whole hemisphere, whose radiance spans an
+/// order of magnitude between the sky overhead and the terrain at the rim, so a
+/// partial gather is not an approximation of the full one - it is a different
+/// number, and folding a sequence of them makes the record walk instead of
+/// converge. It was measured doing exactly that (22.7-46.8% peak-to-peak on a
+/// static scene, against 0.0% for the shape below; see the block comment on
+/// `cs_voxel_refl_update` and `voxlight_refl_record_is_stable_across_rounds`).
+/// So this pass visits each block RARELY and gathers COMPLETELY:
+///
+///     VOXLIGHT_REFL_UPDATE_DIV = VOXLIGHT_UPDATE_DIV * VOXLIGHT_REFL_RAYS
+///
+/// keeps rays-per-frame identical to the old one-ray-per-visit shape - eight
+/// times rarer, eight times as many rays each time - and identical convergence
+/// LATENCY too, because the old shape needed about eight visits of folding at
+/// 0.125 before it meant anything. What changes is that the visit's estimate is
+/// now whole, so a static scene settles instead of oscillating.
+///
+/// Identical rays per frame is NOT identical cost, and that was measured too:
+/// the reflection pass went 0.23 -> 0.51 ms/frame. The ray count really is flat
+/// (16,448 -> 16,896 slots on the demo world) but the dispatch collapses from
+/// 257 workgroups to 33, so serial traces replace latency hiding. Still a win
+/// where it matters - water-close saves 2.84 ms of shading against a 1.64 ms
+/// total update - and if it ever bites, the lever is the DISPATCH SHAPE, never
+/// the completeness of the gather: that is the whole flicker fix. See round E
+/// in `docs/rt/BASELINE-per-voxel-lighting.md`.
+pub(crate) const VOXLIGHT_REFL_UPDATE_DIV: u32 = VOXLIGHT_UPDATE_DIV * VOXLIGHT_REFL_RAYS;
+
+/// Update rounds a headless harness must run before BOTH fields are at steady
+/// state, i.e. what a still or a timing sample has to see or it is judging the
+/// amortization schedule rather than the lighting.
+///
+/// Sized by the SLOWER field. The reflection pass now visits a block once every
+/// `VOXLIGHT_REFL_UPDATE_DIV` rounds, so three visits is three times that; the
+/// light field gets 24 visits in the same window, well past its own fold.
+pub(crate) const VOXLIGHT_CONVERGE_ROUNDS: u32 = VOXLIGHT_REFL_UPDATE_DIV * 3;
+
 /// Software dispatchers injected into the non-RT variant so the render body's
 /// `shadow_occluded(...)` and `indirect_light(...)` calls resolve to the
 /// pre-RT behaviour: occlusion forwards to the DDA `trace_any`, and there is no
@@ -557,10 +601,17 @@ impl Renderer {
         } else {
             wgpu::Features::empty()
         };
+        // Persisting the driver's compiled shaders needs PIPELINE_CACHE ON THE
+        // DEVICE, so it has to be requested here. Empty when the adapter cannot
+        // offer it (wgpu implements pipeline caches on Vulkan only), which
+        // leaves the device byte-identical to before.
+        let cache_features = crate::shader_cache::wanted_features(&adapter);
         let (device, queue, rt_shadows) = if want_rt {
             match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("voxel device (RT)"),
-                required_features: wgpu::Features::EXPERIMENTAL_RAY_QUERY | profile_features,
+                required_features: wgpu::Features::EXPERIMENTAL_RAY_QUERY
+                    | profile_features
+                    | cache_features,
                 // adapter.limits() supplies the acceleration-structure limits
                 // (which default to 0) and is a superset of base_limits.
                 required_limits: adapter.limits(),
@@ -576,7 +627,7 @@ impl Renderer {
                     log::warn!("VOXELG_RT set but RT device request failed ({e}); using software renderer");
                     let (d, q) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                         label: Some("voxel device"),
-                        required_features: wgpu::Features::empty(),
+                        required_features: cache_features,
                         required_limits: base_limits.clone(),
                         memory_hints: wgpu::MemoryHints::Performance,
                         experimental_features: wgpu::ExperimentalFeatures::disabled(),
@@ -589,7 +640,7 @@ impl Renderer {
         } else {
             let (d, q) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("voxel device"),
-                required_features: profile_features,
+                required_features: profile_features | cache_features,
                 required_limits: base_limits.clone(),
                 memory_hints: wgpu::MemoryHints::Performance,
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
@@ -598,6 +649,13 @@ impl Renderer {
             .map_err(|e| format!("request_device failed: {e}"))?;
             (d, q, false)
         };
+
+        // Persistent driver pipeline cache. Opened before ANY pipeline is built
+        // so every compile below can be seeded from (and contribute to) it; the
+        // blob is written back once at the end of `new`. See src/shader_cache.rs
+        // for why this is the difference between a minutes-long silent first
+        // launch and a warm one.
+        let shader_cache = crate::shader_cache::ShaderCache::open(&device, &adapter);
 
         // Per-pass GPU timing (only when VOXELG_GPU_PROFILE granted the features).
         let gpu_profiler = device
@@ -795,35 +853,41 @@ impl Renderer {
             label: Some("raymarch shader"),
             source: wgpu::ShaderSource::Wgsl(raymarch_src.into()),
         });
-        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("raymarch pipeline"),
-            layout: Some(&compute_pl),
-            module: &compute_shader,
-            entry_point: Some("cs_main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        // Every entry point below comes out of the same ~4700-line module, and
+        // each one is a separate driver compile: they go through the shared
+        // pipeline cache and log their own time so a cold run reads as progress
+        // rather than a hang.
+        // Accumulated rather than measured end-to-end: unrelated setup (grass,
+        // leaves, bind groups) is interleaved between these calls, so a plain
+        // elapsed-time span would over-report the compile cost.
+        let sw_pipe_secs = std::cell::Cell::new(0.0f64);
+        let sw_pipe = |label: &'static str, entry: &'static str| {
+            let t = std::time::Instant::now();
+            let p = crate::shader_cache::create_compute_timed(
+                &device,
+                &shader_cache,
+                "init",
+                wgpu::ComputePipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(&compute_pl),
+                    module: &compute_shader,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    cache: None, // set by create_compute_timed
+                },
+            );
+            sw_pipe_secs.set(sw_pipe_secs.get() + t.elapsed().as_secs_f64());
+            p
+        };
+        let compute_pipeline = sw_pipe("raymarch pipeline", "cs_main");
         // The light-field update shares the render module and layout: it reads
         // the same world data and calls the same `shadow_occluded`.
-        let voxlight_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("voxlight update pipeline"),
-            layout: Some(&compute_pl),
-            module: &compute_shader,
-            entry_point: Some("cs_voxel_light_update"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let voxlight_pipeline = sw_pipe("voxlight update pipeline", "cs_voxel_light_update");
         // Same module and layout again: the reflection pass traces the world
         // and shades a hit exactly as the light pass does, so a second shader
         // would only be a second copy of the same world-access code.
-        let voxlight_refl_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("voxlight reflection update pipeline"),
-            layout: Some(&compute_pl),
-            module: &compute_shader,
-            entry_point: Some("cs_voxel_refl_update"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let voxlight_refl_pipeline =
+            sw_pipe("voxlight reflection update pipeline", "cs_voxel_refl_update");
 
         // Main bind group: colour -> geom_tex, depth -> depth_tex; slots
         // 20/21 point at unrelated textures (history/beam) for usage-scope
@@ -853,32 +917,15 @@ impl Renderer {
         let (_grass_depth_tex, grass_depth_view) = create_grass_depth(&device, width, height);
         let grass_bg = make_grass_bg(&device, &grass_bgl, &camera_buf, &grass_cells_buf, &depth_view, &light_out_view, &geom_view, &sampler);
 
-        let godray_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("godray pipeline"),
-            layout: Some(&compute_pl),
-            module: &compute_shader,
-            entry_point: Some("cs_godrays"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-        let compose_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("compose pipeline"),
-            layout: Some(&compute_pl),
-            module: &compute_shader,
-            entry_point: Some("cs_compose"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let godray_pipeline = sw_pipe("godray pipeline", "cs_godrays");
+        let compose_pipeline = sw_pipe("compose pipeline", "cs_compose");
 
         // -- deferred transparent pipeline (cs_transparent, same module + bgl) --
-        let transparent_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("transparent pipeline"),
-            layout: Some(&compute_pl),
-            module: &compute_shader,
-            entry_point: Some("cs_transparent"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let transparent_pipeline = sw_pipe("transparent pipeline", "cs_transparent");
+        log::info!(
+            "init: 6 shared-layout raymarch pipelines in {:.2}s total (cs_clouds follows)",
+            sw_pipe_secs.get()
+        );
 
         // -- hardware-RT occlusion variants (opt-in via VOXELG_RT) --
         // The three occlusion-using entry points (cs_main / cs_compose /
@@ -935,23 +982,31 @@ impl Renderer {
             // world-space probe GI (GI_PROBE_MODE, on by default). GI_ENABLE stays
             // at its default 1.0. Verified faster than software WITH bounced light.
             let rt_consts: &[(&'static str, f64)] = &[("RT_PRIMARY", 1.0)];
+            // Seven separate driver compiles of the same big module. They share
+            // the persistent pipeline cache, and each logs its own time: with a
+            // single line at the end a cold run is minutes of silence, which is
+            // exactly what the "hangs on first launch" report was.
             let mk = |entry: &'static str, label: &'static str| {
-                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some(label),
-                    layout: Some(&rt_pl),
-                    module: &rt_shader,
-                    entry_point: Some(entry),
-                    compilation_options: wgpu::PipelineCompilationOptions {
-                        constants: rt_consts,
-                        ..Default::default()
+                crate::shader_cache::create_compute_timed(
+                    &device,
+                    &shader_cache,
+                    "RT init",
+                    wgpu::ComputePipelineDescriptor {
+                        label: Some(label),
+                        layout: Some(&rt_pl),
+                        module: &rt_shader,
+                        entry_point: Some(entry),
+                        compilation_options: wgpu::PipelineCompilationOptions {
+                            constants: rt_consts,
+                            ..Default::default()
+                        },
+                        cache: None, // set by create_compute_timed
                     },
-                    cache: None,
-                })
+                )
             };
             let t_pipe = std::time::Instant::now();
             let p_godray = mk("cs_godrays", "godray pipeline (RT)");
             let p_main = mk("cs_main", "raymarch pipeline (RT)");
-            log::info!("RT init: cs_main pipeline (driver compile) in {:.2}s", t_pipe.elapsed().as_secs_f64());
             let p_compose = mk("cs_compose", "compose pipeline (RT)");
             let p_transp = mk("cs_transparent", "transparent pipeline (RT)");
             let p_probe = mk("cs_gi_probe_update", "gi probe update (RT)");
@@ -960,7 +1015,7 @@ impl Renderer {
             voxlight_pipeline_rt = Some(mk("cs_voxel_light_update", "voxlight update (RT)"));
             voxlight_refl_pipeline_rt =
                 Some(mk("cs_voxel_refl_update", "voxlight reflection update (RT)"));
-            log::info!("RT init: all 4 RT pipelines in {:.2}s total", t_pipe.elapsed().as_secs_f64());
+            log::info!("RT init: all 7 RT pipelines in {:.2}s total", t_pipe.elapsed().as_secs_f64());
             // Worker: owns nothing persistent; each job carries the spare set in
             // and back out. wgpu Device/Queue are internally refcounted.
             let (req_tx, req_rx) = std::sync::mpsc::channel::<AccelJob>();
@@ -1011,14 +1066,21 @@ impl Renderer {
             bind_group_layouts: &[Some(&cloud_bgl)],
             immediate_size: 0,
         });
-        let cloud_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("cloud pipeline"),
-            layout: Some(&cloud_pl),
-            module: &compute_shader,
-            entry_point: Some("cs_clouds"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        // Seventh entry point out of the raymarch module (its own layout, hence
+        // not built through `sw_pipe`), so it is cached and timed like the rest.
+        let cloud_pipeline = crate::shader_cache::create_compute_timed(
+            &device,
+            &shader_cache,
+            "init",
+            wgpu::ComputePipelineDescriptor {
+                label: Some("cloud pipeline"),
+                layout: Some(&cloud_pl),
+                module: &compute_shader,
+                entry_point: Some("cs_clouds"),
+                compilation_options: Default::default(),
+                cache: None, // set by create_compute_timed
+            },
+        );
         let cloud_bg = make_cloud_bg(&device, &cloud_bgl, &camera_buf, &cloud_storage_view);
 
         // -- GPU-compute physics pipeline (#25): pull-only sand CA --
@@ -1039,14 +1101,22 @@ impl Renderer {
             label: Some("physics shader"),
             source: wgpu::ShaderSource::Wgsl(physics_src.into()),
         });
-        let physics_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("physics pipeline"),
-            layout: Some(&physics_pl),
-            module: &physics_shader,
-            entry_point: Some("cs_physics"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        // Not from the raymarch module and far cheaper, but the cache costs
+        // nothing extra here and the timing line makes any future blow-up in
+        // this shader visible instead of mysterious.
+        let physics_pipeline = crate::shader_cache::create_compute_timed(
+            &device,
+            &shader_cache,
+            "init",
+            wgpu::ComputePipelineDescriptor {
+                label: Some("physics pipeline"),
+                layout: Some(&physics_pl),
+                module: &physics_shader,
+                entry_point: Some("cs_physics"),
+                compilation_options: Default::default(),
+                cache: None, // set by create_compute_timed
+            },
+        );
         let physics_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("physics bg"),
             layout: &physics_bgl,
@@ -1077,14 +1147,19 @@ impl Renderer {
             label: Some("beam shader"),
             source: wgpu::ShaderSource::Wgsl(beam_src.into()),
         });
-        let beam_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("beam pipeline"),
-            layout: Some(&beam_pl),
-            module: &beam_shader,
-            entry_point: Some("cs_beam"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let beam_pipeline = crate::shader_cache::create_compute_timed(
+            &device,
+            &shader_cache,
+            "init",
+            wgpu::ComputePipelineDescriptor {
+                label: Some("beam pipeline"),
+                layout: Some(&beam_pl),
+                module: &beam_shader,
+                entry_point: Some("cs_beam"),
+                compilation_options: Default::default(),
+                cache: None, // set by create_compute_timed
+            },
+        );
         let beam_bg = make_beam_bg(&device, &beam_bgl, &camera_buf, &chunk_mask_buf, &beam_view);
 
         // -- blit pipeline --
@@ -1141,7 +1216,9 @@ impl Renderer {
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
-            cache: None,
+            // Render pipelines take the same cache; no timing helper for one
+            // because a fullscreen-triangle blit compiles in microseconds.
+            cache: shader_cache.handle(),
         });
 
         // The blit now samples the TAA-resolved image, not the raw raymarch.
@@ -1159,14 +1236,19 @@ impl Renderer {
             label: Some("taa shader"),
             source: wgpu::ShaderSource::Wgsl(taa_src.into()),
         });
-        let taa_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("taa pipeline"),
-            layout: Some(&taa_pl),
-            module: &taa_shader,
-            entry_point: Some("cs_taa"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let taa_pipeline = crate::shader_cache::create_compute_timed(
+            &device,
+            &shader_cache,
+            "init",
+            wgpu::ComputePipelineDescriptor {
+                label: Some("taa pipeline"),
+                layout: Some(&taa_pl),
+                module: &taa_shader,
+                entry_point: Some("cs_taa"),
+                compilation_options: Default::default(),
+                cache: None, // set by create_compute_timed
+            },
+        );
         let taa_bg = make_taa_bg(&device, &taa_bgl, &camera_buf, &ldr_view, &history_view, &resolve_view, &light_out_view);
 
         let post_bgl = create_post_bgl(&device);
@@ -1175,6 +1257,11 @@ impl Renderer {
         let post_bg_blur_h = make_post_bg(&device, &post_bgl, &camera_buf, &output_view, &bloom_a_view, &bloom_b_view, &ldr_view, &sampler);
         let post_bg_blur_v = make_post_bg(&device, &post_bgl, &camera_buf, &output_view, &bloom_b_view, &bloom_a_view, &ldr_view, &sampler);
         let post_bg_final = make_post_bg(&device, &post_bgl, &camera_buf, &output_view, &bloom_a_view, &bloom_b_view, &ldr_view, &sampler);
+
+        // Last pipeline is built: hand the driver's accumulated compile results
+        // back to disk so the next launch skips the work. Best effort - a failure
+        // here only costs the next launch its speed, never this one its start.
+        shader_cache.persist();
 
         Ok(Self {
             device, queue, surface, config,
@@ -1791,8 +1878,10 @@ impl Renderer {
                     cp.set_bind_group(0, &self.compute_bg, &[]);
                 }
                 // One workgroup per block, one invocation per voxel, sliced by
-                // the same round counter as the light pass.
-                let blocks = self.voxlight_refl_live_count.div_ceil(VOXLIGHT_UPDATE_DIV);
+                // the same round counter as the light pass but by the
+                // REFLECTION divisor: this pass visits rarely and gathers
+                // completely (see VOXLIGHT_REFL_UPDATE_DIV).
+                let blocks = self.voxlight_refl_live_count.div_ceil(VOXLIGHT_REFL_UPDATE_DIV);
                 cp.dispatch_workgroups(blocks, 1, 1);
             }
             self.voxlight_round = self.voxlight_round.wrapping_add(1);
@@ -2696,7 +2785,9 @@ fn bgl_sampler(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
-fn create_compute_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+// pub(crate) so the pipeline-cache timing test can build the REAL two-group RT
+// pipeline layout instead of a derived stand-in.
+pub(crate) fn create_compute_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("compute bgl"),
         entries: &[
@@ -2778,7 +2869,9 @@ pub(crate) struct VoxLightParamsUniform {
     pub refl_live_count: u32,
     pub refl_rays: u32,
     pub refl_fold: f32,
-    pub _pad: u32,
+    /// The reflection pass's own amortization divisor. See
+    /// `VOXLIGHT_REFL_UPDATE_DIV` for why it is not `update_div`.
+    pub refl_update_div: u32,
 }
 
 /// A dynamic point light, matching `VlPointLight` in the shader.
@@ -2912,7 +3005,7 @@ fn create_lighting_texture(
 // cs_clouds writes the half-res clouds; its own (tiny) layout: camera + the
 // cloud storage texture. Separate from compute_bgl so the cloud texture is
 // never bound as storage-write and sampled in the same bind group.
-fn create_cloud_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+pub(crate) fn create_cloud_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("cloud bgl"),
         entries: &[
@@ -3146,16 +3239,17 @@ pub(crate) fn voxlight_params(
         fold: 0.35,
         ao_strength: 0.85,
         refl_live_count,
-        // ONE reflection ray per reflective voxel per round: a reflection ray
-        // is a full secondary trace plus a shade, far dearer than a sun-disc
-        // occlusion ray, and the SH fold below is what turns the sequence of
-        // single samples into a converged estimate.
-        refl_rays: 1,
-        // Slower than the light field's 0.35 because each round contributes a
-        // quarter of the rays: a wider window is what keeps a one-ray estimate
-        // from shimmering round to round.
-        refl_fold: 0.125,
-        _pad: 0,
+        // A COMPLETE stratified hemisphere per visit - one ray per elevation
+        // stratum - because a partial hemisphere estimate is not an
+        // approximation of the whole one. Paid for by visiting eight times
+        // rarer (`VOXLIGHT_REFL_UPDATE_DIV`), so rays per frame are unchanged.
+        refl_rays: VOXLIGHT_REFL_RAYS,
+        // The SAME fold as the light field, and for the same reason: each visit
+        // hands the fold a finished estimate, so the fold only has to damp the
+        // stratification difference between epochs and follow the sun. The old
+        // 0.125 existed to hide a one-ray estimate and did not manage it.
+        refl_fold: 0.35,
+        refl_update_div: VOXLIGHT_REFL_UPDATE_DIV,
     }
 }
 
@@ -3770,12 +3864,11 @@ mod gpu_render_tests {
             };
             let vl_update = vl_pipe("cs_voxel_light_update");
             let vl_refl_update = vl_pipe("cs_voxel_refl_update");
-            // A full direction-epoch cycle of both passes (8 work-list slices x
-            // 8 epochs): the steady state a still camera reaches after 64
-            // frames, which is what a STILL should show. Anything less captures
-            // the field mid-convergence and the image would be judging the
-            // amortization schedule rather than the lighting.
-            let rounds = VOXLIGHT_UPDATE_DIV * 8;
+            // The steady state a still camera reaches, which is what a STILL
+            // should show. Anything less captures the field mid-convergence and
+            // the image would be judging the amortization schedule rather than
+            // the lighting.
+            let rounds = VOXLIGHT_CONVERGE_ROUNDS;
             report_voxlight_binding(world, vl_counts);
             let t0 = std::time::Instant::now();
             VoxLightUpdate {
@@ -4322,16 +4415,34 @@ mod gpu_render_tests {
         /// Freeze the shading-noise phase (JIT_PHASE_FREEZE override): the
         /// discriminator for held-random-sample churn (shadow cone, GI jitter).
         jit_freeze: bool,
+        /// Bind and RUN the per-voxel light and reflection fields, exactly as
+        /// `Renderer::render` does: both update passes, one round per frame, on
+        /// the frame counter.
+        ///
+        /// Off by default because every number this rig has ever recorded was
+        /// taken against an empty `VoxLightBuffers` - the samplers report
+        /// invalid and shading falls back to the per-pixel path - so flipping it
+        /// on globally would silently make those figures incomparable. On, this
+        /// measures the SHIPPED frame; off, the fallback the field replaces. The
+        /// pair is the A/B, and it is the only way this rig can see the field at
+        /// all.
+        voxlight: bool,
     }
 
     impl Default for RigOpts {
         fn default() -> Self {
-            Self { gi_on: true, sun_base: 30.0, animate: true, jit_freeze: false }
+            Self {
+                gi_on: true,
+                sun_base: 30.0,
+                animate: true,
+                jit_freeze: false,
+                voxlight: false,
+            }
         }
     }
 
     fn flicker_probe_rt(world: &World, cam: &Camera, label: &str, opts: RigOpts) -> f64 {
-        let RigOpts { gi_on, sun_base, animate, jit_freeze } = opts;
+        let RigOpts { gi_on, sun_base, animate, jit_freeze, voxlight } = opts;
         let Some((device, queue, _gpu)) = rt_headless_device() else {
             eprintln!("flicker_probe_rt: no RT adapter, skipping");
             return 0.0;
@@ -4365,7 +4476,13 @@ mod gpu_render_tests {
         let words = ((tiles_w * tiles_h) as usize + 31) / 32;
         let tile_dirty_buf = storage(device, "td", bytemuck::cast_slice(&vec![u32::MAX; words]));
         let players_buf = storage(device, "pl", &vec![0u8; 16 + MAX_REMOTE_PLAYERS * 16]);
-        let (_out_tex, output_view) = create_output_texture(device, w, h);
+        // HDR, like every other harness and like `Renderer::new`. Binding 5 of
+        // the compute layout is an Rgba16Float storage texture; this rig was
+        // the last place still handing it an Rgba8Unorm view, so bind-group
+        // creation failed outright and it had not run since the layout went
+        // HDR - which is a large part of why the field's temporal stability
+        // went unmeasured for as long as it did.
+        let (_out_tex, output_view) = create_hdr_texture(device, w, h);
         let (_btex, beam_view) = create_beam_texture(device, w, h);
         let (_ctex, cloud_sampled_view, cloud_storage_view) = create_cloud_texture(device, w, h);
         let cloud_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -4378,10 +4495,19 @@ mod gpu_render_tests {
         let transp_buf = create_transp_buf(device, w, h);
         let sprites_buf = storage(device, "spr", bytemuck::cast_slice(&crate::sprites::encoded()));
         let (_dtex, depth_view) = create_depth_texture(device, w, h);
-        let (_gtex, geom_view) = create_output_texture(device, w, h);
+        let (_gtex, geom_view) = create_hdr_texture(device, w, h);
         let (_ddtex, dummy_depth_view) = create_depth_texture(device, 1, 1);
         let bgl = create_compute_bgl(device);
         let vl_bufs = VoxLightBuffers::new(device);
+        // Left all-zero unless `voxlight` is set, which is what makes the
+        // samplers report a miss and shading take the per-pixel path.
+        let vl_counts = if voxlight {
+            let c = upload_voxlight_fresh(queue, &vl_bufs, world);
+            report_voxlight_binding(world, c);
+            c
+        } else {
+            VoxLightCounts { light: 0, refl: 0 }
+        };
         let mk_main = |lin: &wgpu::TextureView, lout: &wgpu::TextureView| {
             make_compute_bg(
                 device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
@@ -4441,6 +4567,8 @@ mod gpu_render_tests {
         let p_comp = mk_pipe("cs_compose");
         let p_probe = mk_pipe("cs_gi_probe_update");
         let p_godray = mk_pipe("cs_godrays");
+        let p_vl = mk_pipe("cs_voxel_light_update");
+        let p_vl_refl = mk_pipe("cs_voxel_refl_update");
 
         // Half-res cloud pre-pass (its own tiny layout, same shader module).
         let cloud_bgl = create_cloud_bgl(device);
@@ -4537,6 +4665,33 @@ mod gpu_render_tests {
                 cp.set_bind_group(1, &rt_bg[parity], &[]);
                 let threads = crate::voxel::PROBE_TOTAL / GI_PROBE_UPDATE_DIV;
                 cp.dispatch_workgroups(threads.div_ceil(64), 1, 1);
+            }
+            // Per-voxel light + reflection update, in the SAME place in the
+            // frame `Renderer::render` puts them (after the GI probe pass,
+            // before the raymarch) and on the same per-frame round counter, so
+            // what this rig counts as flicker is the shipped cadence and not an
+            // approximation of it.
+            if vl_counts.light > 0 || vl_counts.refl > 0 {
+                queue.write_buffer(
+                    &vl_bufs.params,
+                    0,
+                    bytemuck::bytes_of(&voxlight_params(
+                        vl_counts.light, f as u32, 0, vl_counts.refl,
+                    )),
+                );
+                for (pipe, count, div) in [
+                    (&p_vl, vl_counts.light, VOXLIGHT_UPDATE_DIV),
+                    (&p_vl_refl, vl_counts.refl, VOXLIGHT_REFL_UPDATE_DIV),
+                ] {
+                    if count == 0 {
+                        continue;
+                    }
+                    let mut cp = enc.begin_compute_pass(&Default::default());
+                    cp.set_pipeline(pipe);
+                    cp.set_bind_group(0, &bg_main[parity], &[]);
+                    cp.set_bind_group(1, &rt_bg[parity], &[]);
+                    cp.dispatch_workgroups(count.div_ceil(div), 1, 1);
+                }
             }
             for (pipe, bg) in [(&p_main, &bg_main[parity]), (&p_transp, &bg_main[parity])] {
                 let mut cp = enc.begin_compute_pass(&Default::default());
@@ -4865,6 +5020,19 @@ mod gpu_render_tests {
         wt.pos = glam::Vec3::new(px as f32 + 0.5, psurf as f32 + 6.0, pz as f32 - 10.0);
         wt.pitch = -0.75;
         flicker_probe_rt(&world, &wt, "water_top", day);
+        // GRAZING over the water, and the only view in this rig that judges the
+        // REFLECTION cache. Reflections are Fresnel-weighted, so a steep view
+        // shows the cache at ~2% of the pixel and a grazing one shows it at
+        // most of the pixel. Run as an A/B - once on the per-pixel fallback,
+        // once with the per-voxel fields live - because "the field flickers" is
+        // a claim about the DIFFERENCE, and every number this rig had ever
+        // produced was taken against an empty field.
+        let mut wg = Camera::new();
+        wg.pos = glam::Vec3::new(px as f32 + 0.5, psurf as f32 + 3.0, pz as f32 - 20.0);
+        wg.pitch = -0.10;
+        flicker_probe_rt(&world, &wg, "water_graze_nofield", day);
+        sync_voxlight_shells(&mut world);
+        flicker_probe_rt(&world, &wg, "water_graze_field", RigOpts { voxlight: true, ..day });
         // The primary symptom view: a lone tree's cast shadow on open grass,
         // camera aimed at the penumbra boundary. Sun at t=30 is at
         // s ~ (-0.36, 0.89, 0.29): the shadow of a crown ~9 up lands ~(+3.6,
@@ -7231,26 +7399,56 @@ mod gpu_render_tests {
         let (w, h) = (960u32, 540u32); // bytes_per_row stays 256-aligned
         let mut world = World::new();
         world.fill_demo_terrain();
+        let (water_c, leaf_c, leaf_ground) = find_scene_anchors(&world);
+        std::fs::create_dir_all("target/lookdev").unwrap();
+
+        let write_png = |name: &str, rgba: &[u8]| {
+            let path = format!("target/lookdev/{name}.png");
+            let file = std::fs::File::create(&path).unwrap();
+            let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w, h);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            enc.write_header().unwrap().write_image_data(rgba).unwrap();
+            eprintln!("wrote {path}");
+        };
+
+        // GRAZING close-up over the water, the same camera the timing harness
+        // calls "water-close". Reflections are Fresnel-weighted, so a steep
+        // view shows the per-voxel reflection cache at ~2% of the pixel and a
+        // grazing one shows it at most of the pixel. This is therefore the view
+        // that actually judges the reflection decision
+        // (docs/VOXEL_LIGHTING_PLAN.md, "Reflections").
+        let mut water_graze = Camera::new();
+        water_graze.pos = glam::Vec3::new(
+            clamp_anchor(water_c.x),
+            71.0,
+            clamp_anchor(water_c.y) - 8.0,
+        );
+        water_graze.pitch = -0.22;
+
+        // Captured BEFORE the shells are bound, so it is the per-pixel mirror
+        // the cache replaces. The reflection decision traded a true mirror for
+        // a view-independent cache and the plan says the stills are how that
+        // trade gets judged; without the two frames side by side there is
+        // nothing to judge it against, and every other still in this set is
+        // taken with the field live. Deliberately the ONLY view captured both
+        // ways: it is the only one where the cache is most of the pixel.
+        if let Some(rgba) = render_rgba(&world, &water_graze, w, h) {
+            write_png("water_graze_nofield", &rgba);
+        }
+
         // The whole point of these stills is to judge the lighting, so every
-        // world captured here binds the per-voxel fields and the render helper
+        // world captured below binds the per-voxel fields and the render helper
         // converges them. Without this the frames show the per-pixel fallback
         // and would look identical if the feature were deleted.
         sync_voxlight_shells(&mut world);
-        let (water_c, leaf_c, leaf_ground) = find_scene_anchors(&world);
-        std::fs::create_dir_all("target/lookdev").unwrap();
 
         let save = |name: &str, cam: &Camera| {
             let Some(rgba) = render_rgba(&world, cam, w, h) else {
                 eprintln!("no GPU â€” skipping lookdev dump");
                 return;
             };
-            let path = format!("target/lookdev/{name}.png");
-            let file = std::fs::File::create(&path).unwrap();
-            let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w, h);
-            enc.set_color(png::ColorType::Rgba);
-            enc.set_depth(png::BitDepth::Eight);
-            enc.write_header().unwrap().write_image_data(&rgba).unwrap();
-            eprintln!("wrote {path}");
+            write_png(name, &rgba);
         };
 
         let mut tree_close = Camera::new();
@@ -7280,21 +7478,7 @@ mod gpu_render_tests {
         water_view.pitch = -0.35;
         save("water_view", &water_view);
 
-        // GRAZING close-up over the water, the same camera the timing harness
-        // calls "water-close". Reflections are Fresnel-weighted, so a steep
-        // view like `water_view` above shows the per-voxel reflection cache at
-        // ~2% of the pixel and a grazing one shows it at most of the pixel.
-        // This is therefore the view that actually judges the reflection
-        // decision (docs/VOXEL_LIGHTING_PLAN.md, "Reflections"), and without it
-        // the still set only ever looked at the case where the cache barely
-        // contributes.
-        let mut water_graze = Camera::new();
-        water_graze.pos = glam::Vec3::new(
-            clamp_anchor(water_c.x),
-            71.0,
-            clamp_anchor(water_c.y) - 8.0,
-        );
-        water_graze.pitch = -0.22;
+        // The field-live half of the A/B captured above.
         save("water_graze", &water_graze);
 
         // Straight down at the densest canopy: judges the horizontal cap
@@ -7565,11 +7749,10 @@ mod gpu_render_tests {
             device: &device, queue: &queue, vl: &vl_bufs, bg: &bg, rt_bg: Some(&rt_bg),
             light: &vl_update, refl: &vl_refl_update, counts: vl_counts,
         };
-        // A full direction-epoch cycle of BOTH passes (8 work-list slices x 8
-        // epochs), i.e. the steady state a still camera reaches after 64 frames.
-        // Fewer rounds would still make every record valid, but would time a
-        // field mid-convergence rather than the one the game settles at.
-        let vl_rounds = VOXLIGHT_UPDATE_DIV * 8;
+        // The steady state a still camera reaches. Fewer rounds would still make
+        // every record valid, but would time a field mid-convergence rather
+        // than the one the game settles at.
+        let vl_rounds = VOXLIGHT_CONVERGE_ROUNDS;
         let vl_params_at = |round| voxlight_params(vl_counts.light, round, 0, vl_counts.refl);
         let t_conv = std::time::Instant::now();
         vl_up.converge(vl_rounds, vl_params_at);
@@ -8460,9 +8643,22 @@ mod gpu_render_tests {
 
     /// Words per probe slot: point (3), normal (3), reflection direction (3),
     /// the packed light answer, the reflection ok flag, the reflected radiance
-    /// (3), then two spares to keep the slot a power of two.
-    /// Slot 0 of the scratch region holds the request count instead.
-    const VL_PROBE_SLOT_WORDS: u32 = 16;
+    /// (3), the GROUND TRUTH the cache is approximating - the per-pixel mirror
+    /// trace (3) and the raw sky (3) - then spares to keep the slot a power of
+    /// two. Slot 0 of the scratch region holds the request count instead.
+    ///
+    /// The ground-truth pair is the point: a probe that returns only the
+    /// cache's own value can say whether it is non-zero and whether it is
+    /// continuous, but not whether it is RIGHT. `mirror` is exactly what
+    /// `shade_water_top`'s fallback computes at the same point and direction,
+    /// so cache-vs-mirror is the reconstruction error the player sees.
+    const VL_PROBE_SLOT_WORDS: u32 = 32;
+
+    /// Probe slots that fit in the reserved scratch region, so a caller cannot
+    /// silently run off the end of it into live blocks.
+    const VL_PROBE_MAX: usize =
+        (64 * LIGHT_RECORDS_PER_BLOCK * LIGHT_RECORD_WORDS) as usize / VL_PROBE_SLOT_WORDS as usize
+            - 1;
 
     /// Sun time whose direction has NO x component. `sun_dir_at(t)` is
     /// `normalize(cos(a), sin(a), 0.30)` with `a = t * 0.025 + 1.20`, so
@@ -8515,6 +8711,50 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
     vl_pool[w + 11u] = bitcast<u32>(refl.r);
     vl_pool[w + 12u] = bitcast<u32>(refl.g);
     vl_pool[w + 13u] = bitcast<u32>(refl.b);
+
+    // GROUND TRUTH, computed by the same shader at the same point so the
+    // comparison cannot drift: what `shade_water_top`'s per-pixel fallback
+    // would put on this pixel. The origin lift copies that path exactly,
+    // including its incidence-dependent term - a mirror reflection is
+    // `reflect(dir, n)`, so `dot(-dir, n)` IS `dot(rd, n)` and the graze factor
+    // is recoverable without the probe being told the view ray.
+    let graze = 1.0 - clamp(dot(rd, n), 0.0, 1.0);
+    let ro = p + n * (0.01 + 0.34 * graze * graze);
+    var no_cache = vec2<f32>(0.0);
+    let jit = fract(p.x * 17.0 + p.z * 23.0);
+    let mh = trace_secondary(ro, rd, SECONDARY_MAX_T);
+    var mirror: vec3<f32>;
+    if (mh.hit) {{
+        mirror = shade(mh, ro, rd, jit, false, false, false, &no_cache, vec3<f32>(0.0));
+    }} else {{
+        mirror = sky(rd);
+    }}
+    vl_pool[w + 14u] = bitcast<u32>(mirror.r);
+    vl_pool[w + 15u] = bitcast<u32>(mirror.g);
+    vl_pool[w + 16u] = bitcast<u32>(mirror.b);
+    // The sky alone, unoccluded: separates "the fit is wrong" from "the sky
+    // really is dimmer in this direction", which is the open question in
+    // docs/VOXEL_LIGHTING_PLAN.md's grazing-water follow-up.
+    let sk = sky(rd);
+    vl_pool[w + 17u] = bitcast<u32>(sk.r);
+    vl_pool[w + 18u] = bitcast<u32>(sk.g);
+    vl_pool[w + 19u] = bitcast<u32>(sk.b);
+    // The RAW STORED MOMENTS of the record under `p`, decoded but not fitted:
+    // word 20 = DC luma, 21..23 = the luma of the three directional moments.
+    // These are the ESTIMATOR's own output, so a reconstruction that reads
+    // wrong can be told apart from moments that were already wrong before the
+    // fit saw them. Read from the centre record rather than through the blend,
+    // which is exact for a probe placed at a cell centre (weight 1 there).
+    let rw = refl_record_word(vec3<i32>(floor(p - n * 0.02)));
+    if (rw != VL_NONE) {{
+        let q0 = vl_unpack_rgb9e5(refl_pool[rw]);
+        let lw = vec3<f32>(0.2126, 0.7152, 0.0722);
+        vl_pool[w + 20u] = bitcast<u32>(dot(q0, lw));
+        for (var k = 1u; k < 4u; k = k + 1u) {{
+            vl_pool[w + 20u + k] =
+                bitcast<u32>(dot(vl_unpack_rgb9e5(refl_pool[rw + k]) - q0, lw));
+        }}
+    }}
 }}
 "#,
             base = LightField::block_word_offset(VL_PROBE_BLOCK),
@@ -8533,13 +8773,31 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
         refl_ok: bool,
         /// The reflected radiance it returned, linear RGB.
         refl: [f32; 3],
+        /// GROUND TRUTH: the per-pixel mirror trace at the same point and
+        /// direction, i.e. what shading falls back to when `refl_ok` is false.
+        mirror: [f32; 3],
+        /// The unoccluded sky along `refl_dir`, for separating a bad fit from a
+        /// genuinely dim direction.
+        sky: [f32; 3],
+        /// Luma of the raw stored moments under the probe point:
+        /// `[m0, m_x, m_y, m_z]`, i.e. the estimator's output before the fit.
+        moments: [f32; 4],
+    }
+
+    /// Rec.709 luma. One place to spell the weights so every reflection
+    /// assertion below reads the same quantity.
+    fn luma(c: [f32; 3]) -> f32 {
+        0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
     }
 
     impl VlSample {
-        /// Rec.709 luma of the reflected radiance. One place to spell the
-        /// weights so every reflection assertion below reads the same quantity.
+        /// Rec.709 luma of the reflected radiance.
         fn refl_luma(&self) -> f32 {
-            0.2126 * self.refl[0] + 0.7152 * self.refl[1] + 0.0722 * self.refl[2]
+            luma(self.refl)
+        }
+        /// Rec.709 luma of the per-pixel mirror this cache is approximating.
+        fn mirror_luma(&self) -> f32 {
+            luma(self.mirror)
         }
     }
 
@@ -8588,9 +8846,15 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
             for round in 0..rounds {
                 self.queue.write_buffer(&self.vl.params, 0, bytemuck::bytes_of(&params(round)));
                 let mut enc = self.device.create_command_encoder(&Default::default());
-                for (pipe, count) in
-                    [(self.light, self.counts.light), (self.refl, self.counts.refl)]
-                {
+                // Each pass carries its OWN divisor: the light field refreshes
+                // often and gathers partially, the reflection field rarely and
+                // completely (see VOXLIGHT_REFL_UPDATE_DIV). A harness that
+                // dispatched both at one divisor would either starve the
+                // reflection work list or over-run it.
+                for (pipe, count, div) in [
+                    (self.light, self.counts.light, VOXLIGHT_UPDATE_DIV),
+                    (self.refl, self.counts.refl, VOXLIGHT_REFL_UPDATE_DIV),
+                ] {
                     if count == 0 {
                         continue;
                     }
@@ -8602,7 +8866,7 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
                     }
                     // One workgroup per block in this round's slice, one
                     // invocation per voxel.
-                    cp.dispatch_workgroups(count.div_ceil(VOXLIGHT_UPDATE_DIV), 1, 1);
+                    cp.dispatch_workgroups(count.div_ceil(div), 1, 1);
                 }
                 self.queue.submit(std::iter::once(enc.finish()));
             }
@@ -8830,6 +9094,17 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
         /// with them, and silently reading them from `voxlight_params` would let
         /// a regression in the LOOK slip through a test that still passed.
         fn converge(&self, rounds: u32) {
+            self.converge_from(0, rounds);
+        }
+
+        /// `rounds` update rounds starting at round `start`.
+        ///
+        /// The round counter drives BOTH the work-list slice and the direction
+        /// epoch, so a caller that wants to watch the field evolve one round at
+        /// a time has to keep counting from where it left off; restarting at 0
+        /// would re-walk the same slice and epoch and hide exactly the
+        /// round-to-round motion it is looking for.
+        fn converge_from(&self, start: u32, rounds: u32) {
             VoxLightUpdate {
                 device: &self.device,
                 queue: &self.queue,
@@ -8842,7 +9117,7 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
             }
             .converge(rounds, |round| VoxLightParamsUniform {
                 live_count: self.counts.light,
-                round,
+                round: start + round,
                 update_div: VOXLIGHT_UPDATE_DIV,
                 sun_rays: 4,
                 sun_cone: 0.07,
@@ -8850,9 +9125,9 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 fold: 0.35,
                 ao_strength: 0.85,
                 refl_live_count: self.counts.refl,
-                refl_rays: 1,
-                refl_fold: 0.125,
-                _pad: 0,
+                refl_rays: VOXLIGHT_REFL_RAYS,
+                refl_fold: 0.35,
+                refl_update_div: VOXLIGHT_REFL_UPDATE_DIV,
             });
         }
 
@@ -8903,6 +9178,12 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
 
         /// Evaluate both samplers at each request through `cs_vl_probe`.
         fn probe(&self, reqs: &[VlProbe]) -> Vec<VlSample> {
+            assert!(
+                reqs.len() <= VL_PROBE_MAX,
+                "{} probe requests overrun the {VL_PROBE_MAX}-slot scratch region and would \
+                 corrupt live blocks",
+                reqs.len(),
+            );
             let base = LightField::block_word_offset(VL_PROBE_BLOCK) as u64;
             let slot = VL_PROBE_SLOT_WORDS as usize;
             let mut words = vec![0u32; slot * (reqs.len() + 1)];
@@ -8939,6 +9220,22 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
                             f32::from_bits(out[w + 11]),
                             f32::from_bits(out[w + 12]),
                             f32::from_bits(out[w + 13]),
+                        ],
+                        mirror: [
+                            f32::from_bits(out[w + 14]),
+                            f32::from_bits(out[w + 15]),
+                            f32::from_bits(out[w + 16]),
+                        ],
+                        sky: [
+                            f32::from_bits(out[w + 17]),
+                            f32::from_bits(out[w + 18]),
+                            f32::from_bits(out[w + 19]),
+                        ],
+                        moments: [
+                            f32::from_bits(out[w + 20]),
+                            f32::from_bits(out[w + 21]),
+                            f32::from_bits(out[w + 22]),
+                            f32::from_bits(out[w + 23]),
                         ],
                     }
                 })
@@ -9410,9 +9707,13 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
             "a world with an open water sheet bound NO reflection blocks; \
              sync_refl_shell_all or brick_needs_refl is broken"
         );
-        // One round per work-list slice: over `div` rounds every live block is
-        // visited exactly once, so every water voxel has had one ray folded in.
-        rig.converge(VOXLIGHT_UPDATE_DIV);
+        // One round per work-list slice: over the REFLECTION divisor's worth of
+        // rounds every live block is visited exactly once, and one visit is a
+        // whole hemisphere gather, so every water voxel now carries a complete
+        // record. (This is the reflection pass's own divisor, not the light
+        // field's - it visits eight times rarer and gathers eight times as
+        // much; see VOXLIGHT_REFL_UPDATE_DIV.)
+        rig.converge(VOXLIGHT_REFL_UPDATE_DIV);
         let pool = rig.read_live_refl_pool();
 
         let mut total = 0usize;
@@ -9550,10 +9851,11 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
             eprintln!("voxlight_refl_reads_back_plausible_radiance: no GPU adapter, skipping");
             return;
         };
-        // 128 rounds = 16 visits per block = two full passes over the eight
-        // direction epochs, so the 0.125 fold has settled and the stored moments
-        // describe the whole hemisphere rather than the last ray.
-        rig.converge(128);
+        // Three visits per block, each a COMPLETE stratified hemisphere gather,
+        // so the fold has settled and the stored moments describe the whole
+        // hemisphere rather than the last ray. (One visit would already be a
+        // whole estimate; three is margin, and cheap on a crafted scene.)
+        rig.converge(VOXLIGHT_REFL_UPDATE_DIV * 3);
 
         // Mirror of a camera looking down at the sheet at ~19 degrees, and the
         // head-on case, which is the other end of the linear fit's accuracy.
@@ -9642,10 +9944,10 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
             eprintln!("voxlight_refl_is_continuous_across_voxel_boundaries: no GPU adapter, skipping");
             return;
         };
-        // Same budget as the read-back test: two full passes over the eight
-        // direction epochs, so the moments describe the whole hemisphere and
-        // the per-cell difference below is the wall, not the last ray.
-        rig.converge(128);
+        // Same budget as the read-back test: three complete hemisphere gathers
+        // folded, so the moments describe the whole hemisphere and the per-cell
+        // difference below is the wall, not the last ray.
+        rig.converge(VOXLIGHT_REFL_UPDATE_DIV * 3);
 
         let x = (VL_WATER_X0 + 16) as f32 + 0.5;
         let top = VL_WATER_Y as f32 + 1.0;
@@ -9755,4 +10057,315 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
             );
         }
     }
+
+    /// A stored reflection record must STOP MOVING on a static scene.
+    ///
+    /// This is the "flickery" half of the original report, measured. The
+    /// reflection pass used to visit a block every `VOXLIGHT_UPDATE_DIV` rounds
+    /// and fold ONE ray of a rotating eight-direction set at 0.125. A hemisphere
+    /// over water spans an order of magnitude in radiance between the sky
+    /// overhead and the terrain at the rim, so those eight rays are not eight
+    /// noisy looks at one number - they are eight different numbers, and an
+    /// exponential average over them is never the hemisphere mean at any
+    /// instant. It random-walks behind the direction cycle for ever.
+    ///
+    /// Measured on this world with that shape: 22.7-46.8% peak-to-peak on a
+    /// STATIC scene, a STATIC sun and a FIXED query direction, and a stored
+    /// `E[L*d.z]` of -0.17 where the true moment is unambiguously POSITIVE. The
+    /// current shape - visit rarely (`VOXLIGHT_REFL_UPDATE_DIV`), gather a
+    /// COMPLETE stratified hemisphere over a direction set that does not depend
+    /// on the round - reads 0.0% and +0.035.
+    ///
+    /// Three independent things are asserted because the swing and the sign are
+    /// different failures. A record can be perfectly steady and still hold a
+    /// moment that points the wrong way (a biased estimator), and it can hold
+    /// the right moment while flipping `ok` and swapping shading paths under the
+    /// camera. All three were symptoms of the same estimator, and any one of
+    /// them coming back is the bug coming back.
+    ///
+    /// The probes step along X, NOT Z. The work list is the allocated bricks in
+    /// brick-index order and `brick_idx` is x-fastest, so bricks adjacent in X
+    /// land on ADJACENT work-list slices and are visited on DIFFERENT rounds,
+    /// while a column of bricks at one x sits on a single slice and moves in
+    /// lockstep. Sampling along Z would watch eight points that all update on
+    /// the same frame and would report perfect agreement whatever the field did.
+    #[test]
+    fn voxlight_refl_record_is_stable_across_rounds() {
+        let mut world = voxlight_water_wall_world();
+        let Some(rig) = VoxLightRig::new(&mut world, VL_SUN_TIME) else {
+            eprintln!("voxlight_refl_record_is_stable_across_rounds: no GPU adapter, skipping");
+            return;
+        };
+        let warm = VOXLIGHT_REFL_UPDATE_DIV * 3;
+        rig.converge(warm);
+
+        // Grazing and pointing INTO the wall at -z: the direction where the
+        // records carry the most directional signal, and the one Fresnel
+        // weights heaviest on real water.
+        let refl_dir = glam::Vec3::new(0.0, 0.35, -1.0).normalize();
+        let top = VL_WATER_Y as f32 + 1.0;
+        let watch: Vec<VlProbe> = (0..8)
+            .map(|i| VlProbe {
+                p: glam::Vec3::new(
+                    (VL_WATER_X0 + 2 + i * 4) as f32 + 0.5,
+                    top,
+                    (VL_WATER_Z0 + 12) as f32 + 0.5,
+                ),
+                n: glam::Vec3::Y,
+                refl_dir,
+            })
+            .collect();
+
+        // Two full visit cycles, so no block can look stable merely by not
+        // having been visited inside the observation window.
+        let obs = VOXLIGHT_REFL_UPDATE_DIV * 2;
+        let mut series: Vec<Vec<f32>> = vec![Vec::new(); watch.len()];
+        let mut mz: Vec<Vec<f32>> = vec![Vec::new(); watch.len()];
+        let mut ok_flips = vec![0u32; watch.len()];
+        let mut prev_ok: Vec<Option<bool>> = vec![None; watch.len()];
+        for r in 0..obs {
+            rig.converge_from(warm + r, 1);
+            for (i, s) in rig.probe(&watch).iter().enumerate() {
+                series[i].push(s.refl_luma());
+                mz[i].push(s.moments[3]);
+                if prev_ok[i] == Some(!s.refl_ok) {
+                    ok_flips[i] += 1;
+                }
+                prev_ok[i] = Some(s.refl_ok);
+            }
+        }
+
+        for (i, s) in series.iter().enumerate() {
+            let mean = s.iter().sum::<f32>() / s.len() as f32;
+            let lo = s.iter().cloned().fold(f32::INFINITY, f32::min);
+            let hi = s.iter().cloned().fold(0.0f32, f32::max);
+            let p2p = 100.0 * (hi - lo) / mean.max(1e-6);
+            let zlo = mz[i].iter().cloned().fold(f32::INFINITY, f32::min);
+            let zhi = mz[i].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            eprintln!(
+                "refl stability x={:>5.1}: mean {mean:.4} range {lo:.4}..{hi:.4} \
+                 p2p {p2p:>5.1}%, ok-flips {}, m_z {zlo:+.4}..{zhi:+.4}",
+                watch[i].p.x, ok_flips[i],
+            );
+
+            // Not vacuous: a field that converged to black, or a sampler that
+            // missed entirely, would make the percentage below meaningless.
+            assert!(
+                mean > 0.05,
+                "watch point x={} reads a mean luma of {mean:.4} over {obs} rounds; \
+                 there is no reflection here to be stable ABOUT",
+                watch[i].p.x,
+            );
+            // The bar is 5%: four and a half times clear of the broken shape's
+            // 22.7% floor and far above the current 0.0%, with room for
+            // driver-level differences in the trace. A 5% swing on a bright
+            // reflection, every frame, on a static scene, is plainly visible.
+            assert!(
+                p2p < 5.0,
+                "the stored reflection at x={} swings {p2p:.1}% peak-to-peak ({lo:.4}..{hi:.4}) \
+                 over {obs} rounds of a STATIC scene with a static sun and a fixed query \
+                 direction; that swing is the flicker - the update pass is folding partial \
+                 hemisphere estimates instead of complete ones",
+                watch[i].p.x,
+            );
+            // The wall sits at -z and is darker than the open sky above, so the
+            // true E[L*d.z] over this hemisphere is positive at every one of
+            // these points and by a wide margin. rgb9e5 carries ~0.2% relative
+            // precision, so 0.005 is an order of magnitude above the encoding
+            // floor: a moment that is negative, or indistinguishable from zero,
+            // is proof the record is not a hemisphere estimate at all.
+            assert!(
+                zlo > 0.005,
+                "the stored E[L*d.z] at x={} reaches {zlo:+.4} over {obs} rounds, but the only \
+                 dark thing in this hemisphere is the wall at -z, so the true moment is \
+                 positive; the estimator is reporting the last few rays' directions rather \
+                 than the hemisphere",
+                watch[i].p.x,
+            );
+            // A voxel that answers on one frame and misses on the next swaps
+            // the surface between the cache and the per-pixel mirror - two
+            // different reflection sources alternating under a static camera.
+            assert_eq!(
+                ok_flips[i], 0,
+                "the reflection sampler changed its mind {} times in {obs} rounds at x={}; \
+                 shading alternates between the cache and the per-pixel trace",
+                ok_flips[i], watch[i].p.x,
+            );
+        }
+    }
+
+    /// MEASUREMENT harness for the reflection cache: how far the cached value
+    /// sits from the mirror it replaces, how far it moves as the animated wave
+    /// facet swings the query direction, and how far it moves between update
+    /// rounds. Prints; asserts nothing beyond the probe answering at all.
+    ///
+    /// Ignored because it is a diagnostic, not a gate - the gates it produced
+    /// live in the tests above and below it.
+    #[test]
+    #[ignore]
+    fn voxlight_refl_diagnose() {
+        let mut world = voxlight_water_wall_world();
+        let Some(rig) = VoxLightRig::new(&mut world, VL_SUN_TIME) else {
+            eprintln!("voxlight_refl_diagnose: no GPU adapter, skipping");
+            return;
+        };
+        let warm = VOXLIGHT_REFL_UPDATE_DIV * 3;
+        rig.converge(warm);
+        let top = VL_WATER_Y as f32 + 1.0;
+        let x = (VL_WATER_X0 + 16) as f32 + 0.5;
+        let at = |z: f32, n: glam::Vec3, rd: glam::Vec3| VlProbe {
+            p: glam::Vec3::new(x, top, z),
+            n,
+            refl_dir: rd,
+        };
+
+        // ---- A. cache vs the per-pixel mirror it replaces -------------------
+        // Elevation sweep of the mirror direction, pole fixed at +Y (what the
+        // update pass gathered about). Toward -z the wall is in frame.
+        eprintln!("\n=== A: cache vs mirror, elevation sweep (pole +Y) ===");
+        eprintln!("  elev  z      cache    mirror   sky      cache/mirror  ok");
+        let mut a_err: Vec<f32> = Vec::new();
+        for elev_deg in [5.0f32, 10.0, 19.0, 30.0, 45.0, 70.0, 90.0] {
+            let e = elev_deg.to_radians();
+            for &(z, tag) in &[
+                ((VL_WATER_Z0 + 2) as f32 + 0.5, "near wall"),
+                ((VL_WATER_Z0 + 16) as f32 + 0.5, "mid"),
+            ] {
+                for &sz in &[-1.0f32, 1.0] {
+                    let rd = glam::Vec3::new(0.0, e.sin(), sz * e.cos()).normalize();
+                    let s = rig.probe(&[at(z, glam::Vec3::Y, rd)])[0];
+                    let (c, m) = (s.refl_luma(), s.mirror_luma());
+                    a_err.push(if m > 1e-4 { c / m } else { 1.0 });
+                    eprintln!(
+                        "  {elev_deg:>4.0}  {z:>5.1} {c:>8.4} {m:>8.4} {:>8.4} {:>12.3}  {} ({tag}, z{:+.0})",
+                        luma(s.sky), c / m.max(1e-6), s.refl_ok, sz,
+                    );
+                }
+            }
+        }
+        let worst_lo = a_err.iter().cloned().fold(f32::INFINITY, f32::min);
+        let worst_hi = a_err.iter().cloned().fold(0.0f32, f32::max);
+        eprintln!("  cache/mirror ratio over the sweep: min {worst_lo:.3} max {worst_hi:.3}");
+
+        // ---- B. the animated wave facet -------------------------------------
+        // The facet normal is not +Y: it is the gradient of the Gerstner field
+        // (bounded at ~3.2 deg of tilt, sum of A_i*k_i = 0.0556 over
+        // `wave_param`) and, at a terrace or a pinned corner, of the surface
+        // connection itself, which reaches 45 deg. `reflect` DOUBLES a normal
+        // perturbation, so the query direction swings twice as far. Both the
+        // cache and the mirror are evaluated over that swing: what matters is
+        // not that either moves, but whether the cache tracks the mirror.
+        eprintln!("\n=== B: query direction swept by the wave facet ===");
+        let z = (VL_WATER_Z0 + 12) as f32 + 0.5;
+        for &(tilt_deg, what) in &[(3.2f32, "gerstner"), (15.0, "terrace"), (45.0, "pinned corner")] {
+            // A camera looking down at 19 degrees, the grazing case the plan's
+            // follow-up measures.
+            let dir = glam::Vec3::new(0.0, -19.0f32.to_radians().sin(), -19.0f32.to_radians().cos())
+                .normalize();
+            let t = tilt_deg.to_radians();
+            let mut probes = Vec::new();
+            for k in 0..16 {
+                let phi = k as f32 * std::f32::consts::TAU / 16.0;
+                let n = glam::Vec3::new(t.sin() * phi.cos(), t.cos(), t.sin() * phi.sin())
+                    .normalize();
+                probes.push(at(z, n, (dir - 2.0 * dir.dot(n) * n).normalize()));
+            }
+            let got = rig.probe(&probes);
+            let cs: Vec<f32> = got.iter().map(|s| s.refl_luma()).collect();
+            let ms: Vec<f32> = got.iter().map(|s| s.mirror_luma()).collect();
+            let span = |v: &[f32]| {
+                let lo = v.iter().cloned().fold(f32::INFINITY, f32::min);
+                let hi = v.iter().cloned().fold(0.0f32, f32::max);
+                (lo, hi, hi - lo)
+            };
+            let (clo, chi, cspan) = span(&cs);
+            let (mlo, mhi, mspan) = span(&ms);
+            let misses = got.iter().filter(|s| !s.refl_ok).count();
+            eprintln!(
+                "  tilt {tilt_deg:>4.1} deg ({what:<14}): cache {clo:.4}..{chi:.4} (span {cspan:.4}) \
+                 mirror {mlo:.4}..{mhi:.4} (span {mspan:.4})  ok-misses {misses}/16"
+            );
+        }
+
+        // ---- C. round-to-round motion of the stored record ------------------
+        // The record is read back THROUGH the sampler once per update round, so
+        // this is the value shading would see on each of N successive frames
+        // with a static camera and a static sun. Any spread here is flicker the
+        // scene itself cannot explain.
+        //
+        // The window spans two full visits of EVERY block, so no block can look
+        // stable merely by not having been visited inside it.
+        let obs = VOXLIGHT_REFL_UPDATE_DIV * 2;
+        eprintln!("\n=== C: stored record across {obs} successive rounds ===");
+        let rd_graze = glam::Vec3::new(0.0, 0.35, -1.0).normalize();
+        // Stepped along X, not Z. The work list is the allocated bricks in
+        // brick-index order and `brick_idx` is x-fastest, so bricks adjacent in
+        // X land on ADJACENT work-list slices and are visited on different
+        // rounds, while a column of bricks at the same x sits on one slice and
+        // moves in lockstep. Sampling along Z would measure eight points that
+        // update on the same frame and report perfect agreement whatever the
+        // field does.
+        let watch: Vec<VlProbe> = (0..8)
+            .map(|i| VlProbe {
+                p: glam::Vec3::new(
+                    (VL_WATER_X0 + 2 + i * 4) as f32 + 0.5,
+                    top,
+                    (VL_WATER_Z0 + 12) as f32 + 0.5,
+                ),
+                n: glam::Vec3::Y,
+                refl_dir: rd_graze,
+            })
+            .collect();
+        let mut series: Vec<Vec<f32>> = vec![Vec::new(); watch.len()];
+        // The z moment alongside it. The wall sits at -z, so the TRUE E[L*d.z]
+        // over this hemisphere is positive at every one of these points, and by
+        // a wide margin: a stored moment that changes SIGN between rounds is
+        // proof the record is not a hemisphere estimate at all.
+        let mut mz: Vec<Vec<f32>> = vec![Vec::new(); watch.len()];
+        let mut ok_flips = vec![0u32; watch.len()];
+        let mut prev_ok: Vec<Option<bool>> = vec![None; watch.len()];
+        for r in 0..obs {
+            rig.converge_from(warm + r, 1);
+            let got = rig.probe(&watch);
+            for (i, s) in got.iter().enumerate() {
+                series[i].push(s.refl_luma());
+                mz[i].push(s.moments[3]);
+                if prev_ok[i] == Some(!s.refl_ok) {
+                    ok_flips[i] += 1;
+                }
+                prev_ok[i] = Some(s.refl_ok);
+            }
+        }
+        for (i, s) in series.iter().enumerate() {
+            let mean = s.iter().sum::<f32>() / s.len() as f32;
+            let lo = s.iter().cloned().fold(f32::INFINITY, f32::min);
+            let hi = s.iter().cloned().fold(0.0f32, f32::max);
+            let zlo = mz[i].iter().cloned().fold(f32::INFINITY, f32::min);
+            let zhi = mz[i].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let signs = mz[i].windows(2).filter(|w| (w[0] < 0.0) != (w[1] < 0.0)).count();
+            // Peak-to-peak against the mean is the quantity that reads as
+            // flicker: a 5% swing on a bright reflection is plainly visible.
+            eprintln!(
+                "  x={:>5.1}: mean {mean:.4} range {lo:.4}..{hi:.4} p2p {:>5.1}% of mean, \
+                 ok-flips {}, m_z {zlo:+.4}..{zhi:+.4} ({signs} sign changes)",
+                watch[i].p.x, 100.0 * (hi - lo) / mean.max(1e-6), ok_flips[i],
+            );
+        }
+        // Neighbouring bricks sit on DIFFERENT work-list slices, so they are
+        // visited on different rounds and their records are at different points
+        // of the same walk. Frame-to-frame deltas that ANTICORRELATE are what
+        // turns a temporal wobble into a crawling 4x4-voxel patchwork.
+        let delta = |s: &Vec<f32>| -> Vec<f32> { s.windows(2).map(|w| w[1] - w[0]).collect() };
+        for i in 1..series.len() {
+            let (a, b) = (delta(&series[i - 1]), delta(&series[i]));
+            let dot: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
+            let na = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let nb = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+            eprintln!(
+                "  delta correlation x={:.1} vs x={:.1}: {:+.3}",
+                watch[i - 1].p.x, watch[i].p.x, dot / (na * nb).max(1e-9),
+            );
+        }
+    }
+
 }

@@ -16,6 +16,7 @@ pub mod accel;
 pub mod physics;
 pub mod net;
 pub mod temporal;
+pub mod shader_cache;
 pub mod renderer;
 pub mod app;
 pub mod server;

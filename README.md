@@ -105,6 +105,8 @@ src/lib.rs             crate root / module wiring
 src/app.rs             event loop, input, click-to-raycast pipeline
 src/server.rs          dedicated server loop
 src/renderer.rs        wgpu setup; beam -> raymarch -> blit passes, palette, buffers
+src/shader_cache.rs    persistent wgpu::PipelineCache so the driver's shader compile
+                       survives restarts (see "First-launch shader compile" below)
 src/voxel.rs           brick/tile/chunk storage, noise terrain, biomes, streaming,
                        uniform-brick/tile compaction, edit log
 src/world_dims.rs      world dimension constants (also emits shaders/world_consts.wgsl)
@@ -132,6 +134,24 @@ engine is byte-identical to the software renderer, which remains the default. On
 brick goes into a BLAS (the RT core skips empty space in hardware); a small in-brick DDA
 (`shaders/rt_voxel_query.wgsl`) resolves the exact voxel, sharing one occluder rule (`shadow_voxel_occludes`)
 with the software path so the two render identically. Progress and design notes live in `docs/rt/WORKLOG.md`.
+
+### First-launch shader compile
+
+`shaders/raymarch.wgsl` assembles to a very large module and the renderer builds seven compute pipelines
+out of it (fourteen with `VOXELG_RT=1`). Turning that into machine code is the graphics driver's job and
+it can take minutes the first time, before any window appears. `src/shader_cache.rs` keeps a
+`wgpu::PipelineCache` on disk so that cost is paid once per machine instead of once per driver-cache
+eviction, and every pipeline logs its own compile time at `info` so a slow start reads as progress
+instead of a hang.
+
+The blob lives in `%LOCALAPPDATA%\voxelG\shader-cache\` on Windows and `$XDG_CACHE_HOME/voxelG/shader-cache/`
+(or `~/.cache/voxelG/shader-cache/`) elsewhere, one file per adapter+driver. It is safe to delete at any
+time; the next launch just recompiles. wgpu validates the blob against the current device and driver, so a
+stale, corrupt or foreign one is rejected and logged rather than used. The cache needs the `PIPELINE_CACHE`
+feature, which wgpu implements on Vulkan only; on DX12/Metal the engine logs that and carries on without it.
+
+- `VOXELG_SHADER_CACHE_DIR=<path>` puts the blob somewhere else.
+- `VOXELG_NO_SHADER_CACHE=1` turns it off entirely.
 
 ## Building and running
 
