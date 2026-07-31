@@ -1672,19 +1672,10 @@ impl Renderer {
                 self.queue.write_buffer(
                     &self.vl.params,
                     0,
-                    bytemuck::bytes_of(&VoxLightParamsUniform {
-                        live_count: self.voxlight_live_count,
-                        round: self.voxlight_round,
-                        update_div: VOXLIGHT_UPDATE_DIV,
-                        sun_rays: 4,
-                        // Matches the penumbra width the per-pixel cone used,
-                        // so the soft-shadow LOOK is preserved while the
-                        // mechanism producing it changes.
-                        sun_cone: 0.07,
-                        light_count: 0,
-                        fold: 0.35,
-                        ao_strength: 0.85,
-                    }),
+                    bytemuck::bytes_of(&voxlight_params(
+                        self.voxlight_live_count,
+                        self.voxlight_round,
+                    )),
                 );
                 let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("voxlight update"),
@@ -2690,7 +2681,10 @@ impl VoxLightBuffers {
         let pool = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("voxlight pool"),
             size: crate::voxlight::LIGHT_POOL_WORDS as u64 * 4,
-            usage: U::STORAGE | U::COPY_DST,
+            // COPY_SRC so the records can be read back: the light field is
+            // write-only from the frame's point of view, so a GPU test is the
+            // ONLY way to see what the update pass actually stored.
+            usage: U::STORAGE | U::COPY_DST | U::COPY_SRC,
             mapped_at_creation: false,
         });
         // Must start as all-LIGHT_BLOCK_NONE, not zero: zero is a VALID block
@@ -2907,7 +2901,47 @@ fn upload_voxlight(
             queue.write_buffer(&vl.live_bricks, 0, bytemuck::cast_slice(live));
         }
     }
+    // Zero every RECYCLED block before anything can sample it. Its records
+    // still hold the PREVIOUS tenant's light at a non-zero epoch, which the
+    // sampler trusts, so deferring this until the block's slice comes round
+    // would show one brick's lighting on another for up to
+    // VOXLIGHT_UPDATE_DIV frames after a streaming shift. Only recycled blocks
+    // reach here (a never-bound block is already zero in a fresh pool), so the
+    // cost tracks actual slot churn rather than world size.
+    // Collected rather than drained in place so the mutable borrow ends before
+    // the live count is read below. An empty Vec does not allocate, so the
+    // common no-churn frame still costs nothing.
+    let resets: Vec<u32> = world.light.take_pending_reset().collect();
+    if !resets.is_empty() {
+        let words = crate::voxlight::LIGHT_RECORDS_PER_BLOCK * crate::voxlight::LIGHT_RECORD_WORDS;
+        let zeros = vec![0u32; words as usize];
+        let bytes: &[u8] = bytemuck::cast_slice(&zeros);
+        for block in resets {
+            let off = crate::voxlight::LightField::block_word_offset(block) as u64 * 4;
+            queue.write_buffer(&vl.pool, off, bytes);
+        }
+    }
     world.light.allocated() as u32
+}
+
+/// The light-field update parameters for one frame.
+///
+/// ONE definition shared by the renderer and the GPU tests: a test that
+/// converged the field with a different ray count or fold than the shipping
+/// path would be measuring something the game never renders.
+pub(crate) fn voxlight_params(live_count: u32, round: u32) -> VoxLightParamsUniform {
+    VoxLightParamsUniform {
+        live_count,
+        round,
+        update_div: VOXLIGHT_UPDATE_DIV,
+        sun_rays: 4,
+        // Matches the penumbra width the per-pixel cone used, so the soft
+        // shadow LOOK is preserved while the mechanism producing it changes.
+        sun_cone: 0.07,
+        light_count: 0,
+        fold: 0.35,
+        ao_strength: 0.85,
+    }
 }
 
 /// Group-1 layout for the RT occlusion path (world TLAS + the primitive->brick
@@ -7967,5 +8001,657 @@ mod gpu_render_tests {
         assert_eq!(sand_count, 1, "sand mass must be conserved");
         assert_eq!(out.occupancy, 1u64 << vi_mid, "occupancy must track the moved voxel");
         eprintln!("GPU physics: sand fell {vi_top} -> {vi_mid}, mass conserved");
+    }
+
+    // =====================================================================
+    // Per-voxel light field (docs/VOXEL_LIGHTING_PLAN.md)
+    //
+    // Every OTHER GPU test in this module builds `VoxLightBuffers::new` and
+    // never fills it: `vl_block_of_brick` stays all-LIGHT_BLOCK_NONE, so
+    // `voxlight_sample` reports `valid = false` and shading falls straight back
+    // to the old per-pixel shadow ray. Those frames therefore say nothing at
+    // all about the light field - they would look identical if the whole
+    // feature were deleted. The rig below is the one place the real chain runs:
+    // bind the lit shell, upload the brick table and work list, dispatch
+    // `cs_voxel_light_update` for as many rounds as a converged frame sequence
+    // would, then read the records back out of the pool and (through a probe
+    // entry point) back out of `voxlight_sample` itself.
+    // =====================================================================
+
+    use crate::voxlight::{LightField, LIGHT_RECORDS_PER_BLOCK, LIGHT_RECORD_WORDS};
+
+    /// Pool block reserved as scratch for the sampler probe. The render
+    /// bind-group layout is full (26 bindings), so rather than widen it for a
+    /// test the probe passes its requests and answers through the far END of
+    /// the pool. A crafted scene binds a few thousand of the 131072 blocks and
+    /// `VoxLightRig::new` asserts the live set never reaches this far, so the
+    /// probe can never overwrite the field it is measuring.
+    const VL_PROBE_BLOCK: u32 = crate::voxlight::LIGHT_BLOCKS_MAX - 64;
+
+    /// Words per probe slot: point (3), normal (3), packed answer, spare.
+    /// Slot 0 of the scratch region holds the request count instead.
+    const VL_PROBE_SLOT_WORDS: u32 = 8;
+
+    /// Sun time whose direction has NO x component. `sun_dir_at(t)` is
+    /// `normalize(cos(a), sin(a), 0.30)` with `a = t * 0.025 + 1.20`, so
+    /// `a = pi/2` puts the sun straight overhead in x and tilted only in z.
+    /// Shadows then displace purely along -z, which is what lets a shadow
+    /// boundary be crossed by walking a single row of voxels along one axis.
+    const VL_SUN_TIME: f32 = (std::f32::consts::FRAC_PI_2 - 1.20) / 0.025;
+
+    /// Test-only compute entry that calls the REAL `voxlight_sample`, so the
+    /// SHADING side of the feature is measured and not just the pool the update
+    /// pass wrote. Appended to `raymarch_source()` here rather than added to
+    /// shaders/, so the shipped shader carries no test scaffolding.
+    ///
+    /// A pool readback alone cannot see the sampler: it re-derives the record
+    /// offset on the CPU. This probe instead makes the shader do it, which is
+    /// what checks that `vl_record_word` (sampler side) and
+    /// `vl_brick_world_base` (update side) invert the same linearisation, plus
+    /// the solidity gate, the epoch validity gate and the weight
+    /// renormalisation.
+    fn voxlight_probe_wgsl() -> String {
+        format!(
+            r#"
+const VLP_BASE: u32 = {base}u;
+const VLP_SLOT: u32 = {slot}u;
+
+@compute @workgroup_size(64, 1, 1)
+fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    let i = gid.x;
+    if (i >= vl_pool[VLP_BASE]) {{ return; }}
+    let w = VLP_BASE + VLP_SLOT + i * VLP_SLOT;
+    let p = vec3<f32>(bitcast<f32>(vl_pool[w]), bitcast<f32>(vl_pool[w + 1u]), bitcast<f32>(vl_pool[w + 2u]));
+    let n = vec3<f32>(bitcast<f32>(vl_pool[w + 3u]), bitcast<f32>(vl_pool[w + 4u]), bitcast<f32>(vl_pool[w + 5u]));
+    let s = voxlight_sample(p, n);
+    vl_pool[w + 6u] = u32(round(clamp(s.sun, 0.0, 1.0) * 255.0))
+        | (u32(round(clamp(s.ao, 0.0, 1.0) * 255.0)) << 8u)
+        | (select(0u, 1u, s.valid) << 16u);
+}}
+"#,
+            base = LightField::block_word_offset(VL_PROBE_BLOCK),
+            slot = VL_PROBE_SLOT_WORDS,
+        )
+    }
+
+    /// One answer from `cs_vl_probe`: the values shading would actually use.
+    #[derive(Copy, Clone, Debug)]
+    struct VlSample {
+        sun: u32,
+        ao: u32,
+        valid: bool,
+    }
+
+    /// Headless rig for the per-voxel light field: the group-0 render bindings
+    /// (the update pass shares the render layout), a POPULATED `VoxLightBuffers`
+    /// and the update + probe pipelines.
+    struct VoxLightRig {
+        vl: VoxLightBuffers,
+        bg: wgpu::BindGroup,
+        update: wgpu::ComputePipeline,
+        probe: wgpu::ComputePipeline,
+        /// Blocks bound for this world, i.e. the update pass's dispatch size.
+        live_count: u32,
+        /// Screen-space bindings the update pass never reads. Held only so the
+        /// bind group's resources outlive it.
+        _keep: Vec<Box<dyn std::any::Any>>,
+        queue: wgpu::Queue,
+        device: wgpu::Device,
+        /// Dropped LAST, after the device, exactly like `headless_device`'s
+        /// callers: the driver crashes on concurrent submission across devices.
+        _gpu: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl VoxLightRig {
+        /// Bind `world`'s lit shell, push it to the GPU and build the pipelines.
+        /// Returns None when there is no adapter, like every other GPU test.
+        fn new(world: &mut World, sun_time: f32) -> Option<Self> {
+            let (device, queue, gpu) = headless_device()?;
+            let vl = VoxLightBuffers::new(&device);
+            // The two calls the renderer makes on a full-dirty frame, in the
+            // same order: decide which bricks carry lit shell, then upload the
+            // brick table and the compact work list.
+            world.sync_light_shell_all();
+            let live_count = upload_voxlight(&queue, &vl, world);
+            assert!(
+                live_count < VL_PROBE_BLOCK,
+                "crafted scene bound {live_count} blocks and would collide with the probe scratch at {VL_PROBE_BLOCK}"
+            );
+
+            // The update pass reads only `camera.world_origin` and
+            // `camera.sun_time` from the camera and touches none of the
+            // screen-space bindings, so they are sized 8x8 - they exist purely
+            // because the shared render layout declares them.
+            let (w, h) = (8u32, 8u32);
+            let wo = world.world_origin_voxel();
+            let cam = Camera::new();
+            let cu = CameraUniform::from_camera(&cam, w, h, sun_time, sun_time, wo, [0.0, 0.0], 0.0);
+            let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("voxlight camera"),
+                contents: bytemuck::bytes_of(&cu),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+            let bricks_buf = storage(&device, "bricks", bytemuck::cast_slice(&world.bricks));
+            let tile_mask_buf = storage(&device, "tile_mask", bytemuck::cast_slice(&world.tile_mask));
+            let chunk_mask_buf = storage(&device, "chunk_mask", bytemuck::cast_slice(&world.chunk_mask));
+            let l4_mask_buf = storage(&device, "l4_mask", bytemuck::cast_slice(&world.l4_mask));
+            let bu = storage(&device, "bu", bytemuck::cast_slice(&pack_u8_to_u32(&world.brick_uniform)));
+            let tu = storage(&device, "tu", bytemuck::cast_slice(&pack_u8_to_u32(&world.tile_uniform)));
+            let palette = default_palette();
+            let palette_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("palette"),
+                contents: bytemuck::cast_slice(&palette),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+            let words = ((((w + 7) / 8) * ((h + 7) / 8)) as usize + 31) / 32;
+            let tile_dirty_buf = storage(&device, "tile_dirty", bytemuck::cast_slice(&vec![u32::MAX; words]));
+            let players_buf = storage(&device, "players", &vec![0u8; 16 + MAX_REMOTE_PLAYERS * 16]);
+            let (out_tex, output_view) = create_hdr_texture(&device, w, h);
+            let (geom_tex, geom_view) = create_hdr_texture(&device, w, h);
+            let (beam_tex, beam_view) = create_beam_texture(&device, w, h);
+            let (cloud_tex, cloud_sampled_view, _cloud_storage_view) = create_cloud_texture(&device, w, h);
+            let cloud_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("voxlight cloud samp"),
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                ..Default::default()
+            });
+            let (lin_tex, light_in_view) = create_lighting_texture(&device, w, h);
+            let (lout_tex, light_out_view) = create_lighting_texture(&device, w, h);
+            let transp_buf = create_transp_buf(&device, w, h);
+            let sprites_buf = storage(&device, "sprites", bytemuck::cast_slice(&crate::sprites::encoded()));
+            let (depth_tex, depth_view) = create_depth_texture(&device, w, h);
+            let (ddepth_tex, dummy_depth_view) = create_depth_texture(&device, 1, 1);
+            let bgl = create_compute_bgl(&device);
+            let bg = make_compute_bg(
+                &device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
+                &palette_buf, &output_view, &beam_view, &tile_dirty_buf, &players_buf,
+                &bu, &tu, &l4_mask_buf, &cloud_sampled_view, &cloud_sampler,
+                &light_in_view, &light_out_view, &transp_buf, &sprites_buf,
+                &dummy_depth_view, &geom_view, &depth_view, &vl,
+            );
+
+            // The SOFTWARE variant: `shadow_occluded` forwards to the DDA, so
+            // this runs on any adapter (the RT variant needs ray query, which
+            // would make the whole feature untested on a non-RT machine).
+            let src = format!("{}\n{}", raymarch_source(), voxlight_probe_wgsl());
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("voxlight update + probe"),
+                source: wgpu::ShaderSource::Wgsl(src.into()),
+            });
+            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("voxlight pl"),
+                bind_group_layouts: &[Some(&bgl)],
+                immediate_size: 0,
+            });
+            let mk = |entry: &'static str| {
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(entry),
+                    layout: Some(&pl),
+                    module: &module,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    cache: None,
+                })
+            };
+            let update = mk("cs_voxel_light_update");
+            let probe = mk("cs_vl_probe");
+
+            let keep: Vec<Box<dyn std::any::Any>> = vec![
+                Box::new(out_tex), Box::new(geom_tex), Box::new(beam_tex), Box::new(cloud_tex),
+                Box::new(lin_tex), Box::new(lout_tex), Box::new(depth_tex), Box::new(ddepth_tex),
+                Box::new(camera_buf), Box::new(bricks_buf), Box::new(tile_mask_buf),
+                Box::new(chunk_mask_buf), Box::new(l4_mask_buf), Box::new(bu), Box::new(tu),
+                Box::new(palette_buf), Box::new(tile_dirty_buf), Box::new(players_buf),
+                Box::new(transp_buf), Box::new(sprites_buf),
+            ];
+            Some(Self { vl, bg, update, probe, live_count, _keep: keep, queue, device, _gpu: gpu })
+        }
+
+        /// Run `rounds` update rounds, one submit each, exactly as the renderer
+        /// runs one per frame: same amortization divisor and the same `round`
+        /// increment, so successive rounds walk both the work-list slice
+        /// (`round % div`) and the sun-direction epoch (`round / div`).
+        ///
+        /// The ray/cone/fold constants are duplicated from `Renderer::render`
+        /// deliberately: if the shipped values change, these must be re-tuned
+        /// with them, and a silently shared helper would let a regression in
+        /// the LOOK slip through a test that still passed.
+        fn converge(&self, rounds: u32) {
+            for round in 0..rounds {
+                self.queue.write_buffer(
+                    &self.vl.params,
+                    0,
+                    bytemuck::bytes_of(&VoxLightParamsUniform {
+                        live_count: self.live_count,
+                        round,
+                        update_div: VOXLIGHT_UPDATE_DIV,
+                        sun_rays: 4,
+                        sun_cone: 0.07,
+                        light_count: 0,
+                        fold: 0.35,
+                        ao_strength: 0.85,
+                    }),
+                );
+                let mut enc = self.device.create_command_encoder(&Default::default());
+                {
+                    let mut cp = enc.begin_compute_pass(&Default::default());
+                    cp.set_pipeline(&self.update);
+                    cp.set_bind_group(0, &self.bg, &[]);
+                    cp.dispatch_workgroups(self.live_count.div_ceil(VOXLIGHT_UPDATE_DIV), 1, 1);
+                }
+                self.queue.submit(std::iter::once(enc.finish()));
+            }
+        }
+
+        fn read_pool_words(&self, first_word: u64, words: u64) -> Vec<u32> {
+            let bytes = words * 4;
+            let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("voxlight pool readback"),
+                size: bytes,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut enc = self.device.create_command_encoder(&Default::default());
+            enc.copy_buffer_to_buffer(&self.vl.pool, first_word * 4, &staging, 0, bytes);
+            self.queue.submit(std::iter::once(enc.finish()));
+            let slice = staging.slice(..);
+            slice.map_async(wgpu::MapMode::Read, |_| {});
+            self.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            let data = slice.get_mapped_range().unwrap();
+            bytemuck::cast_slice::<u8, u32>(&data).to_vec()
+        }
+
+        /// The records of every BOUND block. Only the live region is copied:
+        /// the pool is 64 MiB and a crafted scene uses well under 1% of it.
+        fn read_live_pool(&self) -> Vec<u32> {
+            let words =
+                self.live_count as u64 * LIGHT_RECORDS_PER_BLOCK as u64 * LIGHT_RECORD_WORDS as u64;
+            self.read_pool_words(0, words)
+        }
+
+        /// Evaluate `voxlight_sample` at each (world point, surface normal).
+        fn sample(&self, reqs: &[(glam::Vec3, glam::Vec3)]) -> Vec<VlSample> {
+            let base = LightField::block_word_offset(VL_PROBE_BLOCK) as u64;
+            let slot = VL_PROBE_SLOT_WORDS as usize;
+            let mut words = vec![0u32; slot * (reqs.len() + 1)];
+            words[0] = reqs.len() as u32;
+            for (i, (p, n)) in reqs.iter().enumerate() {
+                let w = slot + i * slot;
+                let (pa, na) = (p.to_array(), n.to_array());
+                for k in 0..3 {
+                    words[w + k] = pa[k].to_bits();
+                    words[w + 3 + k] = na[k].to_bits();
+                }
+            }
+            self.queue.write_buffer(&self.vl.pool, base * 4, bytemuck::cast_slice(&words));
+            let mut enc = self.device.create_command_encoder(&Default::default());
+            {
+                let mut cp = enc.begin_compute_pass(&Default::default());
+                cp.set_pipeline(&self.probe);
+                cp.set_bind_group(0, &self.bg, &[]);
+                cp.dispatch_workgroups((reqs.len() as u32).div_ceil(64), 1, 1);
+            }
+            self.queue.submit(std::iter::once(enc.finish()));
+            let out = self.read_pool_words(base, words.len() as u64);
+            (0..reqs.len())
+                .map(|i| {
+                    let a = out[slot + i * slot + 6];
+                    VlSample { sun: a & 0xFF, ao: (a >> 8) & 0xFF, valid: (a >> 16) & 1 != 0 }
+                })
+                .collect()
+        }
+    }
+
+    /// Word offset of a WORLD voxel's record in the pool, or None when its
+    /// brick carries no light block.
+    ///
+    /// CPU mirror of the shader's `vl_record_word`. Valid only while the
+    /// streaming window origin is zero, which every crafted scene below keeps,
+    /// so storage coords and world coords coincide and no toroidal fold is
+    /// involved.
+    fn vl_record_word(world: &World, v: glam::IVec3) -> Option<u32> {
+        use crate::voxel::{brick_idx, brick_voxel_idx, BRICK_DIM};
+        let (x, y, z) = (v.x as u32, v.y as u32, v.z as u32);
+        let block = world.light.block_of(brick_idx(x / BRICK_DIM, y / BRICK_DIM, z / BRICK_DIM))?;
+        let vi = brick_voxel_idx(x % BRICK_DIM, y % BRICK_DIM, z % BRICK_DIM);
+        Some(LightField::block_word_offset(block) + vi * LIGHT_RECORD_WORDS)
+    }
+
+    /// Stored sun visibility of a world voxel, 0..255. Panics rather than
+    /// returning a default if the voxel has no block: a test that silently
+    /// measured "no record" as "dark" would pass while the field was empty.
+    fn vl_sun_vis(pool: &[u32], world: &World, v: glam::IVec3) -> u32 {
+        let w = vl_record_word(world, v).unwrap_or_else(|| panic!("voxel {v} has no light block"));
+        pool[w as usize] & 0xFF
+    }
+
+    // Crafted-scene geometry. Ground and overhang share the x span so the
+    // overhang's x edges are nowhere near the sampled row.
+    const VL_X0: u32 = 200;
+    const VL_X1: u32 = 264;
+    const VL_GROUND_Y: u32 = 60;
+    const VL_GROUND_Z0: u32 = 180;
+    const VL_GROUND_Z1: u32 = 300;
+    const VL_OVERHANG_Y: u32 = 140;
+    const VL_OVERHANG_Z0: u32 = 240;
+
+    /// Flat ground with a high overhang above it, arranged so the sun's shadow
+    /// boundary falls in the open where a single row of ground-surface air
+    /// voxels crosses it.
+    ///
+    /// The overhang is deliberately FAR above the ground (80 voxels). The
+    /// penumbra a `sun_cone` of 0.07 rad casts is roughly `cone * distance`
+    /// wide, so an occluder a couple of voxels up would cast a SUB-VOXEL
+    /// penumbra that no per-voxel field could resolve however continuous its
+    /// estimate - the test would be measuring the voxel grid, not the shadow
+    /// model. At 80 voxels the penumbra is ~11 voxels wide, which is the regime
+    /// the field exists for: a cliff lip, a canopy over a clearing.
+    fn voxlight_shadow_world() -> World {
+        use crate::voxel::MAT_STONE;
+        let mut w = World::new();
+        for z in VL_GROUND_Z0..VL_GROUND_Z1 {
+            for x in VL_X0..VL_X1 {
+                w.set_voxel(x, VL_GROUND_Y, z, MAT_STONE);
+            }
+        }
+        for z in VL_OVERHANG_Z0..VL_GROUND_Z1 {
+            for x in VL_X0..VL_X1 {
+                w.set_voxel(x, VL_OVERHANG_Y, z, MAT_STONE);
+            }
+        }
+        w
+    }
+
+    // The sealed box: outer extent inclusive, shell exactly one voxel thick.
+    const VL_BOX_LO: (u32, u32, u32) = (200, 60, 200);
+    const VL_BOX_HI: (u32, u32, u32) = (215, 75, 215);
+
+    /// A sealed one-voxel-thick box floating in open air. Everything outside it
+    /// sees the whole sky, everything inside sees none of it, and the only
+    /// thing separating the two is a single solid voxel.
+    fn voxlight_sealed_box_world() -> World {
+        use crate::voxel::MAT_STONE;
+        let mut w = World::new();
+        for y in VL_BOX_LO.1..=VL_BOX_HI.1 {
+            for z in VL_BOX_LO.2..=VL_BOX_HI.2 {
+                for x in VL_BOX_LO.0..=VL_BOX_HI.0 {
+                    let shell = x == VL_BOX_LO.0 || x == VL_BOX_HI.0
+                        || y == VL_BOX_LO.1 || y == VL_BOX_HI.1
+                        || z == VL_BOX_LO.2 || z == VL_BOX_HI.2;
+                    if shell {
+                        w.set_voxel(x, y, z, MAT_STONE);
+                    }
+                }
+            }
+        }
+        w
+    }
+
+    /// Gate test: is the field even running?
+    ///
+    /// Everything else here is downstream of this, so it asserts the two
+    /// cheapest facts that a broken feature cannot fake - blocks were bound at
+    /// all, and after one full sweep of the work list the update pass has
+    /// STAMPED records (a non-zero epoch byte is written by nothing else). The
+    /// pool starts zeroed, so an update pass that never ran, never dispatched,
+    /// or wrote to the wrong offset leaves every epoch at 0.
+    ///
+    /// Then it takes the sampler's word for it too: `voxlight_sample` must
+    /// report `valid` on the ground surface. Without that half, the field could
+    /// be perfectly converged and shading would still ignore it - which is
+    /// exactly the state every other GPU test in this module leaves it in.
+    #[test]
+    fn voxlight_field_populates_and_is_sampled() {
+        let mut world = voxlight_shadow_world();
+        let Some(rig) = VoxLightRig::new(&mut world, VL_SUN_TIME) else {
+            eprintln!("voxlight_field_populates_and_is_sampled: no GPU adapter, skipping");
+            return;
+        };
+        assert!(
+            rig.live_count > 0,
+            "the lit shell bound no blocks at all; sync_light_shell_all / the shell test is broken"
+        );
+        // One round per work-list slice: `idx = wg * div + round % div` covers
+        // every live block exactly once over `div` rounds.
+        rig.converge(VOXLIGHT_UPDATE_DIV);
+        let pool = rig.read_live_pool();
+
+        let records = rig.live_count as usize * LIGHT_RECORDS_PER_BLOCK as usize;
+        let stamped = (0..records)
+            .filter(|r| (pool[r * LIGHT_RECORD_WORDS as usize] >> 16) & 0xFF != 0)
+            .count();
+        let frac = stamped as f64 / records as f64;
+        eprintln!(
+            "voxlight populate: live_blocks={} records={records} stamped={stamped} ({frac:.3})",
+            rig.live_count
+        );
+        // Solid voxels are deliberately left at epoch 0 (light lives in air),
+        // and the bound bricks are mostly air here, so the expected coverage is
+        // high. The bar is set well below the measured 0.97 so a scene tweak
+        // cannot break it, but far above the 0.0 a dead update pass produces.
+        assert!(
+            frac > 0.5,
+            "only {frac:.3} of live records carry a non-zero epoch; the update pass is not writing the pool"
+        );
+
+        // ...and the sampler must actually find them. Ground surface points on
+        // the OPEN part of the plane: the overhang's penumbra starts around
+        // z=211, so this row stops well short of it and stays fully lit.
+        let reqs: Vec<_> = (VL_GROUND_Z0 + 4..VL_GROUND_Z0 + 28)
+            .step_by(4)
+            .map(|z| {
+                (
+                    glam::Vec3::new(232.5, VL_GROUND_Y as f32 + 1.0, z as f32 + 0.5),
+                    glam::Vec3::Y,
+                )
+            })
+            .collect();
+        let got = rig.sample(&reqs);
+        let valid = got.iter().filter(|s| s.valid).count();
+        eprintln!("voxlight sample on ground: {valid}/{} valid, {got:?}", got.len());
+        assert_eq!(
+            valid,
+            got.len(),
+            "voxlight_sample returned valid=false on lit-shell ground; shading would fall back to the old per-pixel path"
+        );
+        // Open ground under a clear sky: the sampled sun must be near full, so
+        // a sampler that reads the right words but the wrong BYTES is caught.
+        assert!(
+            got.iter().all(|s| s.sun > 200),
+            "open ground sampled as shadowed: {got:?}"
+        );
+        // AO comes out of the SAME word, one byte up. An air voxel sitting on a
+        // flat plane has one solid face neighbour and four solid edge
+        // neighbours, so `vl_voxel_ao` is 1 - 0.85 * (2 + 4) / 24 = 0.7875, i.e.
+        // ~201/255. Checking it pins the byte layout: a shifted decode would
+        // still give a plausible-looking sun and a nonsense AO.
+        assert!(
+            got.iter().all(|s| (190..=212).contains(&s.ao)),
+            "AO on flat open ground is outside the 0.7875 the weighted 6-face/12-edge \
+             occupancy predicts; the record's byte layout is wrong: {got:?}"
+        );
+    }
+
+    /// The headline claim: sun visibility is a CONTINUOUS quantity now, not the
+    /// binary shadow-ray result it replaced.
+    ///
+    /// Walks a row of ground-surface air voxels across the overhang's shadow
+    /// edge and reads the stored `sun_vis` byte for each. A binary field steps
+    /// 255 -> 0 between two adjacent voxels with nothing in between; a
+    /// cone-sampled, epoch-folded field has to land intermediate values in the
+    /// penumbra. Requiring several of them (not one) rules out a single
+    /// half-lit voxel produced by pure luck of where the edge fell.
+    #[test]
+    fn voxlight_sun_visibility_is_continuous_not_binary() {
+        let mut world = voxlight_shadow_world();
+        let Some(rig) = VoxLightRig::new(&mut world, VL_SUN_TIME) else {
+            eprintln!("voxlight_sun_visibility_is_continuous_not_binary: no GPU adapter, skipping");
+            return;
+        };
+        // 128 rounds = 16 visits per voxel = two full passes over the eight
+        // direction epochs, so the exponential fold has settled and every ring
+        // of the sun disc has been folded in twice.
+        rig.converge(128);
+        let pool = rig.read_live_pool();
+
+        // One voxel above the ground surface, mid-span in x so the overhang's
+        // x edges are 32 voxels away and only its z edge is in play.
+        let y = VL_GROUND_Y as i32 + 1;
+        let row: Vec<(i32, u32)> = (202..=232)
+            .map(|z| (z, vl_sun_vis(&pool, &world, glam::IVec3::new(232, y, z))))
+            .collect();
+        let pretty: Vec<String> = row.iter().map(|(z, v)| format!("z{z}={v}")).collect();
+        eprintln!("voxlight sun_vis across the shadow edge: {}", pretty.join(" "));
+
+        let vals: Vec<u32> = row.iter().map(|&(_, v)| v).collect();
+        // The row must actually span the edge, else "continuous" is untested.
+        assert!(
+            vals.iter().any(|&v| v > 247) && vals.iter().any(|&v| v < 8),
+            "the sampled row never crosses the shadow edge (lit {:?}, shadowed {:?}): {}",
+            vals.iter().max(),
+            vals.iter().min(),
+            pretty.join(" ")
+        );
+        let mids = vals.iter().filter(|&&v| (8..=247).contains(&v)).count();
+        eprintln!("voxlight penumbra: {mids} intermediate voxels of {}", vals.len());
+        assert!(
+            mids >= 3,
+            "sun visibility steps straight from lit to shadowed ({mids} intermediate voxels); \
+             the field is binary, not continuous: {}",
+            pretty.join(" ")
+        );
+        // Monotone as well as gradual: the shadow of a straight edge must not
+        // wobble, or the "gradient" is just noise that happens to be mid-grey.
+        // One sign flip is tolerated for byte rounding at the flat ends.
+        let flips = vals
+            .windows(2)
+            .filter(|w| w[1] > w[0] + 1)
+            .count();
+        assert!(
+            flips <= 1,
+            "sun visibility is not monotone across a straight shadow edge ({flips} rises); \
+             the estimate is noisy rather than converged: {}",
+            pretty.join(" ")
+        );
+    }
+
+    /// A sealed room must stay dark while the outside stays bright, with one
+    /// solid voxel between them.
+    ///
+    /// The two solidity rules are what buy this: the update pass writes light
+    /// for AIR only, and `voxlight_sample` drops solid taps and renormalises
+    /// the surviving weights. Measured, they turn out to be REDUNDANT for a
+    /// leak - disabling either one alone changes nothing, because a solid
+    /// record left at epoch 0 fails the sampler's validity check anyway, and
+    /// because `trace_any` tests the ray's own origin voxel, so even a solid
+    /// voxel that DID gather would gather zero. Each is still asserted here on
+    /// its own (the wall's records must stay all-zero), because the day one of
+    /// them is loosened the other becomes load-bearing.
+    ///
+    /// What this catches on its own is the failure mode that really does put
+    /// sun inside a sealed room: the two index derivations drifting apart.
+    /// `vl_brick_world_base` (update side) and `vl_record_word` (sampler side)
+    /// must invert the same brick linearisation, and if they disagree by so
+    /// much as one brick, enclosed voxels read records gathered outdoors.
+    /// Transposing the brick decode fills this room with sun_vis 255.
+    #[test]
+    fn voxlight_does_not_leak_through_a_one_voxel_wall() {
+        let mut world = voxlight_sealed_box_world();
+        let Some(rig) = VoxLightRig::new(&mut world, VL_SUN_TIME) else {
+            eprintln!("voxlight_does_not_leak_through_a_one_voxel_wall: no GPU adapter, skipping");
+            return;
+        };
+        // 64 rounds = 8 visits per voxel = one full epoch cycle. Both sides
+        // here saturate (all rays blocked / no rays blocked), so this is more
+        // than enough for the fold to reach its fixed point.
+        rig.converge(64);
+        let pool = rig.read_live_pool();
+
+        let y = 67i32; // mid-height, far from floor and roof
+        let z = 207i32;
+        // Enclosed: the interior air row at that height, wall to wall.
+        let inside: Vec<(i32, u32)> = (VL_BOX_LO.0 as i32 + 1..VL_BOX_HI.0 as i32)
+            .map(|x| (x, vl_sun_vis(&pool, &world, glam::IVec3::new(x, y, z))))
+            .collect();
+        // Open: the air just outside the same wall at the same height, plus the
+        // air directly above the roof. x=196 is the outermost column that still
+        // has a block (its brick touches the wall's brick).
+        let outside: Vec<(i32, u32)> = (196..=199)
+            .map(|x| (x, vl_sun_vis(&pool, &world, glam::IVec3::new(x, y, z))))
+            .collect();
+        let above: Vec<(i32, u32)> = (202..=213)
+            .map(|zz| (zz, vl_sun_vis(&pool, &world, glam::IVec3::new(207, VL_BOX_HI.1 as i32 + 1, zz))))
+            .collect();
+        eprintln!("voxlight sealed box: inside={inside:?}");
+        eprintln!("voxlight sealed box: outside(same height)={outside:?}");
+        eprintln!("voxlight sealed box: above roof={above:?}");
+
+        let in_max = inside.iter().map(|&(_, v)| v).max().unwrap();
+        let sky_min = above.iter().map(|&(_, v)| v).min().unwrap();
+        // Nothing gets in. Every ray from an enclosed voxel hits the shell, so
+        // the converged estimate is exactly zero; the tolerance is only for
+        // byte rounding.
+        assert!(
+            in_max <= 2,
+            "sunlight reached a sealed voxel (max sun_vis {in_max} inside): {inside:?}"
+        );
+        // ...and the scene is not simply dark everywhere, which would make the
+        // assertion above vacuous.
+        assert!(
+            sky_min >= 250,
+            "open sky above the roof is not lit (min sun_vis {sky_min}); the comparison proves nothing: {above:?}"
+        );
+        // The column immediately outside the wall is grazed by the outer rays
+        // of the sun cone (that is a real penumbra, not a leak), so it is only
+        // required to be clearly LIT, not saturated.
+        let out_min = outside.iter().map(|&(_, v)| v).min().unwrap();
+        assert!(
+            out_min >= 200,
+            "the open side of the wall is not lit (min sun_vis {out_min}): {outside:?}"
+        );
+
+        // The wall itself must hold NO light. Light lives in air: a solid voxel
+        // keeps epoch 0 so the sampler's validity check drops it even before
+        // the solidity gate does. A stamped wall record is a record the
+        // trilinear fetch could interpolate through.
+        let mut wall_bad = Vec::new();
+        for yy in VL_BOX_LO.1 as i32 + 1..VL_BOX_HI.1 as i32 {
+            let w = vl_record_word(&world, glam::IVec3::new(VL_BOX_LO.0 as i32, yy, z))
+                .expect("the wall's brick must be bound");
+            let (w0, w1) = (pool[w as usize], pool[w as usize + 1]);
+            if w0 != 0 || w1 != 0 {
+                wall_bad.push((yy, w0, w1));
+            }
+        }
+        assert!(
+            wall_bad.is_empty(),
+            "solid wall voxels carry light records (y, word0, word1): {wall_bad:?}"
+        );
+
+        // Finally through the sampler, which is what shading actually calls.
+        // The inside floor point sits 0.3 voxels from the wall, so 30% of the
+        // trilinear weight lands ON the wall voxel and is only excluded by the
+        // solidity gate; the outside floor point is its mirror image.
+        let fy = VL_BOX_LO.1 as f32 + 1.0;
+        let probes = [
+            (glam::Vec3::new(201.2, fy, z as f32 + 0.5), glam::Vec3::Y),   // inside, hugging the wall
+            (glam::Vec3::new(207.5, fy, z as f32 + 0.5), glam::Vec3::Y),   // inside, mid-room
+            (glam::Vec3::new(207.5, VL_BOX_HI.1 as f32 + 1.0, z as f32 + 0.5), glam::Vec3::Y), // on the roof
+        ];
+        let got = rig.sample(&probes);
+        eprintln!("voxlight sealed box: sampled {got:?}");
+        assert!(
+            got.iter().all(|s| s.valid),
+            "voxlight_sample found no record on the box surfaces: {got:?}"
+        );
+        assert!(
+            got[0].sun <= 2 && got[1].sun <= 2,
+            "voxlight_sample let sun into the sealed room: {got:?}"
+        );
+        assert!(
+            got[2].sun >= 250,
+            "voxlight_sample reports the open roof as shadowed: {got:?}"
+        );
     }
 }
