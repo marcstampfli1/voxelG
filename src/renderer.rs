@@ -55,6 +55,32 @@ pub(crate) const COMPUTE_STORAGE_BUFFERS: u32 = 17;
 /// VOXLIGHT_UPDATE_DIV frames. Mirrors the probe grid's cadence.
 pub(crate) const VOXLIGHT_UPDATE_DIV: u32 = 8;
 
+/// Sun-disc direction epochs the update pass cycles through, mirroring
+/// `VL_SUN_EPOCHS` in shaders/voxlight_update.wgsl. One definition on each side
+/// of the language boundary is one too many, but the shader constant cannot be
+/// imported, so this is the Rust name for it and the tests that reason about the
+/// cycle use this rather than spelling 8 again.
+pub(crate) const VOXLIGHT_SUN_EPOCHS: u32 = 8;
+
+/// Extra amortization applied to lit shell FURTHER than
+/// `World::LIGHT_NEAR_RADIUS` from the camera, on top of `VOXLIGHT_UPDATE_DIV`.
+///
+/// The update pass used to walk the entire resident shell every 8 frames with no
+/// idea where the camera was, and on the shipped benchmark that made it the
+/// LARGEST single GPU pass in the frame - 0.95 to 2.09 ms, 18-32% of the GPU
+/// time, ahead of the raymarch itself on four of the six segments. It is also the
+/// one pass in the frame whose cost has nothing to do with what is on screen: a
+/// streamed world binds ~60,000 blocks and a camera can see a small fraction of
+/// them.
+///
+/// 8 makes a distant block's refresh period 64 frames instead of 8. That is a
+/// REFRESH RATE, not a storage or shading change - the record stays allocated,
+/// stays valid and is read exactly as before, so nothing renders differently
+/// once converged. What it costs is tracking latency for a moving sun and for
+/// freshly streamed geometry, both of which are bounded and both of which are
+/// worst exactly where fog has already taken over. See `LightField::near_count`.
+pub(crate) const VOXLIGHT_FAR_DIV: u32 = 8;
+
 /// Update rounds a headless harness must run before the light field is at
 /// steady state, i.e. what a still or a timing sample has to see, or it is
 /// judging the amortization schedule rather than the lighting.
@@ -134,16 +160,25 @@ fn pack_u8_to_u32(src: &[u8]) -> Vec<u32> {
     out
 }
 
-/// Coalesce a SORTED, DEDUPED slice of element indices into contiguous runs and
-/// invoke `f(start, end_inclusive)` once per run. Turns thousands of tiny DMAs
-/// into a handful of multi-KB writes.
-fn upload_spans(sorted: &[u32], mut f: impl FnMut(u32, u32)) {
+/// Coalesce a SORTED, DEDUPED slice of element indices into runs and invoke
+/// `f(start, end_inclusive)` once per run. Turns thousands of tiny DMAs into a
+/// handful of multi-KB writes.
+///
+/// `gap` is how many MISSING indices may be swept into a run rather than split
+/// it. A `write_buffer` costs a staging-belt allocation, a memcpy and a recorded
+/// copy whichever way the bytes go, so past some element count it is cheaper to
+/// re-send untouched elements than to issue a second write. The caller states
+/// that tolerance because only the caller knows the element size AND whether
+/// re-sending an untouched element is even legal: it is for a table (the value
+/// is simply written again), and it is NOT for a pool of blocks where the gap
+/// belongs to a different, live tenant.
+fn upload_spans(sorted: &[u32], gap: u32, mut f: impl FnMut(u32, u32)) {
     let mut i = 0usize;
     while i < sorted.len() {
         let start = sorted[i];
         let mut end = start;
         let mut j = i + 1;
-        while j < sorted.len() && sorted[j] == end + 1 {
+        while j < sorted.len() && sorted[j] <= end.saturating_add(gap).saturating_add(1) {
             end = sorted[j];
             j += 1;
         }
@@ -161,7 +196,9 @@ fn upload_packed_word_spans(
     queue: &wgpu::Queue,
     buf: &wgpu::Buffer,
 ) {
-    upload_spans(words, |w_start, w_end| {
+    // gap 0: a packed-byte table re-packs each run from `bytes`, so widening a
+    // run costs a re-pack as well as a re-send, and these lists are already dense.
+    upload_spans(words, 0, |w_start, w_end| {
         let b0 = (w_start as usize) * 4;
         let b1 = (((w_end as usize) + 1) * 4).min(bytes.len());
         let packed = pack_u8_to_u32(&bytes[b0..b1]);
@@ -198,7 +235,7 @@ fn upload_chunks_for_tiles(
     }
     scratch.sort_unstable();
     scratch.dedup();
-    upload_spans(scratch, |s, e| {
+    upload_spans(scratch, 0, |s, e| {
         let slice = &chunk_mask[s as usize..=e as usize];
         queue.write_buffer(buf, s as u64 * 8, bytemuck::cast_slice(slice));
     });
@@ -342,8 +379,14 @@ pub struct Renderer {
     voxlight_pipeline: wgpu::ComputePipeline,
     voxlight_pipeline_rt: Option<wgpu::ComputePipeline>,
     voxlight_round: u32,
-    /// Live block count from the last upload; the update dispatch size.
+    /// What the light field's per-frame upload actually moves. Reported under
+    /// VOXELG_GPU_PROFILE beside the CPU frame breakdown.
+    vl_stats: VoxLightUploadStats,
+    /// Live block count from the last upload; with `voxlight_near_count` it
+    /// gives the update dispatch size.
     voxlight_live_count: u32,
+    /// Length of the near prefix of that work list (`LightField::near_count`).
+    voxlight_near_count: u32,
     /// Dynamic point lights currently uploaded (see `set_point_lights`).
     voxlight_light_count: u32,
     // Deferred transparent pass (#16): shares compute_bgl/compute_bg.
@@ -1218,7 +1261,8 @@ impl Renderer {
             beam_bgl, beam_pipeline, beam_bg,
             compute_bgl, compute_pipeline, compute_bg,
             vl: vl_bufs, voxlight_pipeline, voxlight_pipeline_rt,
-            voxlight_round: 0, voxlight_live_count: 0,
+            voxlight_round: 0, voxlight_live_count: 0, voxlight_near_count: 0,
+            vl_stats: VoxLightUploadStats::default(),
             voxlight_light_count: 0,
             rt_shadows, world_accel,
             rt_bgl, rt_bg, compute_pipeline_rt, compose_pipeline_rt, transparent_pipeline_rt,
@@ -1392,6 +1436,16 @@ impl Renderer {
         std::mem::take(&mut self.taa_reset)
     }
 
+    /// The light field's upload traffic since the last call, and reset.
+    ///
+    /// Exposed rather than logged from inside `upload_voxlight` so the caller
+    /// that already owns a reporting cadence (the CPU frame profile in
+    /// `app.rs`) says it once, alongside the milliseconds it has to be read
+    /// against. A byte total with no frame count under it means nothing.
+    pub(crate) fn take_vl_stats(&mut self) -> VoxLightUploadStats {
+        std::mem::take(&mut self.vl_stats)
+    }
+
     pub fn upload_world(&mut self, world: &mut World) {
         // Keep the RT acceleration structure in sync with the world, but ONLY
         // when the BLAS-relevant state actually changed: the set of non-empty
@@ -1487,7 +1541,9 @@ impl Renderer {
             self.queue.write_buffer(&self.tile_uniform_buf, 0, bytemuck::cast_slice(&tu));
             // Every brick is new, so bind the light shell from scratch.
             world.sync_light_shell_all();
-            self.voxlight_live_count = upload_voxlight(&self.queue, &self.vl, world);
+            self.voxlight_live_count =
+                upload_voxlight(&self.queue, &self.vl, world, &mut self.vl_stats);
+            self.voxlight_near_count = world.light.near_count();
             world.all_dirty = false;
             world.dirty_bricks.clear();
             return;
@@ -1497,13 +1553,36 @@ impl Renderer {
         // Before the early-out below: streaming releases blocks through
         // clear_slot_masks WITHOUT dirtying a brick, so the table can need an
         // upload on a frame where no brick changed.
+        // Timed separately from the brick DMA below: the shell walk is CPU-only
+        // (7 membership tests per dirty brick, each a scattered read into a
+        // 1M-entry array) while the upload is DMA, and a single "world+upload"
+        // number cannot tell a regression in one from the other.
+        let t_shell = std::time::Instant::now();
+        // Point the field's refresh priority at the camera. `prev_cam` is LAST
+        // frame's pose, because `update_camera` runs after this in the frame -
+        // deliberate and harmless: the policy is deadbanded at 16 voxels, so one
+        // frame of lag cannot change its answer by more than one frame of camera
+        // motion. Before the first `update_camera` there is no pose and the whole
+        // shell stays near, which is exactly the pre-existing behaviour.
+        if let Some(cam) = &self.prev_cam {
+            world.set_light_focus(cam.pos);
+        }
         world.sync_light_shell_dirty();
-        self.voxlight_live_count = upload_voxlight(&self.queue, &self.vl, world);
+        let t_up = std::time::Instant::now();
+        self.vl_stats.shell_ns += (t_up - t_shell).as_nanos() as u64;
+        self.voxlight_live_count =
+            upload_voxlight(&self.queue, &self.vl, world, &mut self.vl_stats);
+        self.voxlight_near_count = world.light.near_count();
+        self.vl_stats.live = self.voxlight_live_count;
+        self.vl_stats.near = self.voxlight_near_count;
+        self.vl_stats.upload_ns += t_up.elapsed().as_nanos() as u64;
         if world.dirty_bricks.is_empty() { return; }
 
         // 1. Brick voxel data â€” coalesced contiguous spans (one DMA per run).
         let stride = std::mem::size_of::<Brick>() as u64;
-        upload_spans(&world.dirty_bricks, |s, e| {
+        // gap 0: a brick is 72 bytes, so sweeping up untouched ones costs 18x what
+        // it costs in a u32 table, and the dirty list is already contiguous blobs.
+        upload_spans(&world.dirty_bricks, 0, |s, e| {
             let slice = &world.bricks[s as usize..=e as usize];
             self.queue.write_buffer(&self.bricks_buf, s as u64 * stride, bytemuck::cast_slice(slice));
         });
@@ -1526,7 +1605,7 @@ impl Renderer {
         }
         self.dirty_tiles_scratch.sort_unstable();
         self.dirty_tiles_scratch.dedup();
-        upload_spans(&self.dirty_tiles_scratch, |s, e| {
+        upload_spans(&self.dirty_tiles_scratch, 0, |s, e| {
             let slice = &world.tile_mask[s as usize..=e as usize];
             self.queue.write_buffer(&self.tile_mask_buf, s as u64 * 8, bytemuck::cast_slice(slice));
         });
@@ -1558,7 +1637,7 @@ impl Renderer {
         }
         world.mask_dirty_tiles.sort_unstable();
         world.mask_dirty_tiles.dedup();
-        upload_spans(&world.mask_dirty_tiles, |s, e| {
+        upload_spans(&world.mask_dirty_tiles, 0, |s, e| {
             let slice = &world.tile_mask[s as usize..=e as usize];
             self.queue.write_buffer(&self.tile_mask_buf, s as u64 * 8, bytemuck::cast_slice(slice));
         });
@@ -1758,6 +1837,7 @@ impl Renderer {
                     cp.dispatch_workgroups((threads + 63) / 64, 1, 1);
                 }
             }
+            if let Some(pr) = &self.gpu_profiler { pr.stamp(&mut encoder, 3); }
             // ---- per-voxel light field update ----
             // Runs BEFORE the raymarch so this frame shades against a field
             // that already includes this frame's slice. wgpu inserts the
@@ -1770,6 +1850,7 @@ impl Renderer {
                         self.voxlight_live_count,
                         self.voxlight_round,
                         self.voxlight_light_count,
+                        self.voxlight_near_count,
                     )),
                 );
                 let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1784,12 +1865,15 @@ impl Renderer {
                     cp.set_pipeline(&self.voxlight_pipeline);
                     cp.set_bind_group(0, &self.compute_bg, &[]);
                 }
-                // One workgroup per block, one invocation per voxel.
-                let blocks = self.voxlight_live_count.div_ceil(VOXLIGHT_UPDATE_DIV);
+                // One workgroup per block in this round's slice, one
+                // invocation per voxel.
+                let blocks = voxlight_dispatch_blocks(
+                    self.voxlight_live_count, self.voxlight_near_count,
+                );
                 cp.dispatch_workgroups(blocks, 1, 1);
             }
             self.voxlight_round = self.voxlight_round.wrapping_add(1);
-            if let Some(pr) = &self.gpu_profiler { pr.stamp(&mut encoder, 3); }
+            if let Some(pr) = &self.gpu_profiler { pr.stamp(&mut encoder, 4); }
             // ---- main raymarch (skips clean tiles in-shader) ----
             {
                 let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1808,7 +1892,7 @@ impl Renderer {
                 let gy = (self.size.1 + 7) / 8;
                 cp.dispatch_workgroups(gx, gy, 1);
             }
-            if let Some(pr) = &self.gpu_profiler { pr.stamp(&mut encoder, 4); }
+            if let Some(pr) = &self.gpu_profiler { pr.stamp(&mut encoder, 5); }
             // ---- deferred transparent pass (#16): shade water/glass pixels ----
             {
                 let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1827,7 +1911,7 @@ impl Renderer {
                 let gy = (self.size.1 + 7) / 8;
                 cp.dispatch_workgroups(gx, gy, 1);
             }
-            if let Some(pr) = &self.gpu_profiler { pr.stamp(&mut encoder, 5); }
+            if let Some(pr) = &self.gpu_profiler { pr.stamp(&mut encoder, 6); }
             // ---- half-res god-ray occlusion march (scratch in transp_buf tail,
             // consumed by cs_compose's depth-weighted upsample) ----
             {
@@ -1867,7 +1951,7 @@ impl Renderer {
                 let gy = (self.size.1 + 7) / 8;
                 cp.dispatch_workgroups(gx, gy, 1);
             }
-            if let Some(pr) = &self.gpu_profiler { pr.stamp(&mut encoder, 6); }
+            if let Some(pr) = &self.gpu_profiler { pr.stamp(&mut encoder, 7); }
             // (temporal GI needs no copy: the gi textures ping-pong via the two
             // rt bind groups selected by frame parity.)
             // (stamp 6 covers compose + the gi_out->gi_in copy)
@@ -1943,7 +2027,7 @@ impl Renderer {
                 let gy = (self.size.1 + 7) / 8;
                 cp.dispatch_workgroups(gx, gy, 1);
             }
-            if let Some(pr) = &self.gpu_profiler { pr.stamp(&mut encoder, 7); }
+            if let Some(pr) = &self.gpu_profiler { pr.stamp(&mut encoder, 8); }
             // Feed this frame's resolved image back as next frame's history.
             encoder.copy_texture_to_texture(
                 wgpu::TexelCopyTextureInfo {
@@ -2004,7 +2088,7 @@ impl Renderer {
             }
         }
 
-        if let Some(pr) = &self.gpu_profiler { pr.stamp(&mut encoder, 8); }
+        if let Some(pr) = &self.gpu_profiler { pr.stamp(&mut encoder, 9); }
         {
             let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("blit"),
@@ -2033,7 +2117,7 @@ impl Renderer {
         // instrument only dirty frames so the numbers are the real render cost).
         if any_dirty {
             if let Some(pr) = &self.gpu_profiler {
-                pr.stamp(&mut encoder, 9);
+                pr.stamp(&mut encoder, 10);
                 pr.resolve(&mut encoder);
             }
         }
@@ -2756,6 +2840,11 @@ pub(crate) struct VoxLightParamsUniform {
     pub light_count: u32,
     pub fold: f32,
     pub ao_strength: f32,
+    /// Length of the near prefix of the work list. See `LightField::near_count`.
+    pub near_count: u32,
+    /// Extra division applied to the far remainder, on top of `update_div`.
+    pub far_div: u32,
+    pub _pad: [u32; 2],
 }
 
 /// A dynamic point light, matching `VlPointLight` in the shader.
@@ -2975,6 +3064,68 @@ fn make_compute_bg(
     })
 }
 
+/// What `upload_voxlight` actually moved, accumulated since construction.
+///
+/// The light field's per-frame CPU price was structurally invisible before this
+/// existed. The brick -> block table is 4 MiB and gets re-pushed WHOLE whenever
+/// any binding changed; the recycled-block clears are one 512-byte DMA each; and
+/// the only harness that ever timed anything (`rt_vs_software_timing`) builds a
+/// static crafted world with no physics tick and no streaming, so neither could
+/// fire in a measurement. Counting bytes here is what makes the live cost
+/// sayable instead of arguable.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct VoxLightUploadStats {
+    /// `upload_voxlight` calls, i.e. frames.
+    pub frames: u64,
+    /// Frames on which `take_table_dirty` fired.
+    pub table_uploads: u64,
+    /// Bytes of brick table + work list pushed.
+    pub table_bytes: u64,
+    /// Blocks zeroed because their slot was recycled or their brick was edited.
+    pub reset_blocks: u64,
+    /// Bytes of pool zeroing.
+    pub reset_bytes: u64,
+    /// Individual `queue.write_buffer` calls issued. Each one is a staging-belt
+    /// allocation plus a recorded copy, so the COUNT matters independently of
+    /// the byte total when the writes are small.
+    pub writes: u64,
+    /// Nanoseconds spent in `World::sync_light_shell_dirty` (main thread).
+    pub shell_ns: u64,
+    /// Nanoseconds spent in `upload_voxlight` itself (main thread).
+    pub upload_ns: u64,
+    /// Most recent live block count and near-prefix length. Not accumulated:
+    /// they are a state, and the ratio is what says whether the camera-aware
+    /// cadence is actually finding a small near set in this world.
+    pub live: u32,
+    pub near: u32,
+}
+
+impl VoxLightUploadStats {
+    /// One line, in the units the decision is made in: how often the 4 MiB
+    /// table actually moves, what that is per second, and what the CPU pays.
+    pub(crate) fn report(&self, secs: f64) -> String {
+        let f = self.frames.max(1) as f64;
+        format!(
+            "voxlight upload: {} / {} frames dirty ({:.0}%), {:.2} MB/s table + {:.2} MB/s resets, \
+             {:.1} writes/frame ({} reset blocks), cpu shell {:.2} ms + upload {:.2} ms per frame",
+            self.table_uploads, self.frames,
+            100.0 * self.table_uploads as f64 / f,
+            self.table_bytes as f64 / 1e6 / secs.max(1e-9),
+            self.reset_bytes as f64 / 1e6 / secs.max(1e-9),
+            self.writes as f64 / f,
+            self.reset_blocks,
+            self.shell_ns as f64 / 1e6 / f,
+            self.upload_ns as f64 / 1e6 / f,
+        ) + &format!(
+            "; shell {} blocks, {} near ({:.0}%), dispatch {} wgs of {}",
+            self.live, self.near,
+            100.0 * self.near as f64 / self.live.max(1) as f64,
+            voxlight_dispatch_blocks(self.live, self.near),
+            voxlight_dispatch_blocks(self.live, self.live),
+        )
+    }
+}
+
 /// Push the light field's brick table and work list to the GPU, and report the
 /// live block count (the update pass's dispatch size).
 ///
@@ -2985,6 +3136,7 @@ fn upload_voxlight(
     queue: &wgpu::Queue,
     vl: &VoxLightBuffers,
     world: &mut crate::voxel::World,
+    stats: &mut VoxLightUploadStats,
 ) -> u32 {
     let field = &mut world.light;
     let (pool, table, work_list) = (&vl.pool, &vl.block_of_brick, &vl.live_bricks);
@@ -3007,11 +3159,32 @@ fn upload_voxlight(
             field.blocks_max(),
         );
     }
-    if field.take_table_dirty() {
-        queue.write_buffer(table, 0, bytemuck::cast_slice(field.block_table()));
+    stats.frames += 1;
+    // The brick table: only the RUNS that changed. Gap-merged, so a frame that
+    // touched a scattered handful of bricks does not turn into a scattered
+    // handful of DMAs (see LIGHT_TABLE_UPLOAD_GAP).
+    {
+        let (touched, tbl) = field.table_delta();
+        if !touched.is_empty() {
+            stats.table_uploads += 1;
+            upload_spans(touched, crate::voxlight::LIGHT_TABLE_UPLOAD_GAP, |s, e| {
+                let slice = &tbl[s as usize..=e as usize];
+                queue.write_buffer(table, s as u64 * 4, bytemuck::cast_slice(slice));
+                stats.table_bytes += slice.len() as u64 * 4;
+                stats.writes += 1;
+            });
+        }
+    }
+    field.clear_table_touched();
+    // The work list is 240 KiB against the table's 4 MiB and changes on a
+    // different trigger (the near/far repartition reorders it without moving a
+    // single table entry), so it has its own flag and goes whole.
+    if field.take_list_dirty() {
         let live = field.live_bricks();
         if !live.is_empty() {
             queue.write_buffer(work_list, 0, bytemuck::cast_slice(live));
+            stats.table_bytes += live.len() as u64 * 4;
+            stats.writes += 1;
         }
     }
     // Zero every RECYCLED block before anything can sample it. Its records
@@ -3021,20 +3194,37 @@ fn upload_voxlight(
     // VOXLIGHT_UPDATE_DIV frames after a streaming shift. Only recycled blocks
     // reach here (a never-bound block is already zero in a fresh pool), so the
     // cost tracks actual slot churn rather than world size.
-    // Collected rather than drained in place so the mutable borrow ends before
-    // the live count is read below. An empty Vec does not allocate, so the
-    // common no-churn frame still costs nothing.
-    let resets: Vec<u32> = field.take_pending_reset().collect();
-    if !resets.is_empty() {
-        let words =
+    // COALESCED into runs of consecutive blocks, one write each. Installing a
+    // streamed chunk marks all 512 of a slot's bricks dirty and every one of them
+    // invalidates its block, so the naive one-DMA-per-block version issued
+    // thousands of 512-byte writes on a single frame - measured at 295
+    // write_buffer calls per frame on the shipped benchmark. Blocks were handed
+    // out in brick order, so sorting puts most of them back into runs.
+    //
+    // NO GAP MERGING here, unlike the table: a block between two resets is
+    // someone else's LIVE block, and sweeping it up would erase converged light.
+    if !field.pending_reset().is_empty() {
+        let block_words =
             crate::voxlight::LIGHT_RECORDS_PER_BLOCK * crate::voxlight::LIGHT_RECORD_WORDS;
-        let zeros = vec![0u32; words as usize];
-        let bytes: &[u8] = bytemuck::cast_slice(&zeros);
-        for block in resets {
-            let off = crate::voxlight::LightField::block_word_offset(block) as u64 * 4;
+        let resets = field.pending_reset();
+        let longest = {
+            let mut m = 1u32;
+            upload_spans(resets, 0, |s, e| m = m.max(e - s + 1));
+            m
+        };
+        // One zero buffer, sized to the longest run and reused by every write.
+        let zeros = vec![0u32; (longest * block_words) as usize];
+        upload_spans(resets, 0, |s, e| {
+            let n = (e - s + 1) * block_words;
+            let off = crate::voxlight::LightField::block_word_offset(s) as u64 * 4;
+            let bytes: &[u8] = bytemuck::cast_slice(&zeros[..n as usize]);
             queue.write_buffer(pool, off, bytes);
-        }
+            stats.reset_blocks += (e - s + 1) as u64;
+            stats.reset_bytes += bytes.len() as u64;
+            stats.writes += 1;
+        });
     }
+    field.clear_pending_reset();
     field.allocated() as u32
 }
 
@@ -3043,14 +3233,38 @@ fn upload_voxlight(
 /// ONE definition shared by the renderer and the GPU tests: a test that
 /// converged the field with a different ray count or fold than the shipping
 /// path would be measuring something the game never renders.
+/// Workgroups `cs_voxel_light_update` needs for a near/far partitioned work
+/// list.
+///
+/// ONE definition, called by the renderer and by every harness, because the
+/// SHADER derives the same boundary from the same two numbers: a dispatch that
+/// disagreed with it would silently starve the tail of the far group and nobody
+/// would see anything except slightly stale light somewhere far away.
+pub(crate) fn voxlight_dispatch_blocks(live: u32, near: u32) -> u32 {
+    let near = near.min(live);
+    let far = live - near;
+    near.div_ceil(VOXLIGHT_UPDATE_DIV) + far.div_ceil(VOXLIGHT_UPDATE_DIV * VOXLIGHT_FAR_DIV)
+}
+
 pub(crate) fn voxlight_params(
-    live_count: u32, round: u32, light_count: u32,
+    live_count: u32, round: u32, light_count: u32, near_count: u32,
 ) -> VoxLightParamsUniform {
     VoxLightParamsUniform {
         live_count,
         round,
+        near_count,
+        far_div: VOXLIGHT_FAR_DIV,
+        _pad: [0; 2],
         update_div: VOXLIGHT_UPDATE_DIV,
-        sun_rays: 4,
+        // Rays per VISIT, and a visit is now the whole estimate rather than a
+        // quarter of it (`vl_sun_visibility`), so this is also the number of
+        // penumbra levels minus one. 4 was the per-visit count when four visits
+        // made a cycle; keeping 4 would have made the estimate stable at five
+        // levels, which is a visible coarsening of a soft shadow on terrain. 8
+        // gives nine levels, which the eight-tap trilinear fetch then dithers,
+        // and costs twice the rays of the old per-visit count against a pass the
+        // camera-aware cadence had already cut by 3-5x.
+        sun_rays: 8,
         // Matches the penumbra width the per-pixel cone used, so the soft
         // shadow LOOK is preserved while the mechanism producing it changes.
         sun_cone: 0.07,
@@ -3172,14 +3386,20 @@ pub(crate) struct GpuProfiler {
     /// Most recent sampled per-pass milliseconds (GPU_PROFILE_LABELS order),
     /// their total, and a sample counter - lets the bench mode aggregate
     /// per-segment GPU attributions instead of scraping the log.
-    pub(crate) last: [f64; 9],
+    pub(crate) last: [f64; GPU_PROFILE_LABELS.len()],
     pub(crate) last_total: f64,
     pub(crate) reports: u64,
 }
 
 /// Pass boundaries bracketed in render(); N_TS timestamps -> N_TS-1 deltas.
-pub(crate) const GPU_PROFILE_LABELS: [&str; 9] =
-    ["clouds", "beam", "probe", "main", "transp", "compose", "taa", "post", "blit"];
+///
+/// `vlight` is the per-voxel light-field update. It used to share the `probe`
+/// bracket with the GI probe update, which made the single largest world-space
+/// GPU cost in the frame unattributable in the only profiler that watches the
+/// REAL renderer - the two are separate features with separate amortization and
+/// they have to be separately readable.
+pub(crate) const GPU_PROFILE_LABELS: [&str; 10] =
+    ["clouds", "beam", "probe", "vlight", "main", "transp", "compose", "taa", "post", "blit"];
 const GPU_PROFILE_TS: u32 = GPU_PROFILE_LABELS.len() as u32 + 1;
 
 impl GpuProfiler {
@@ -3205,7 +3425,7 @@ impl GpuProfiler {
         Self {
             query_set, resolve_buf, read_buf,
             period_ns: queue.get_timestamp_period(), frame: 0,
-            last: [0.0; 9], last_total: 0.0, reports: 0,
+            last: [0.0; GPU_PROFILE_LABELS.len()], last_total: 0.0, reports: 0,
         }
     }
 
@@ -3679,9 +3899,9 @@ mod gpu_render_tests {
             let t0 = std::time::Instant::now();
             VoxLightUpdate {
                 device: &device, queue: &queue, vl: &vl_bufs, bg: &bg, rt_bg: None,
-                light: &vl_update, count: vl_count,
+                light: &vl_update, count: vl_count, near: vl_count,
             }
-            .converge(rounds, |round| voxlight_params(vl_count, round, 0));
+            .converge(rounds, |round| voxlight_params(vl_count, round, 0, vl_count));
             device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
             eprintln!("  converged over {rounds} rounds in {:.1} s", t0.elapsed().as_secs_f64());
         }
@@ -4478,7 +4698,7 @@ mod gpu_render_tests {
                 queue.write_buffer(
                     &vl_bufs.params,
                     0,
-                    bytemuck::bytes_of(&voxlight_params(vl_count, f as u32, 0)),
+                    bytemuck::bytes_of(&voxlight_params(vl_count, f as u32, 0, vl_count)),
                 );
                 let mut cp = enc.begin_compute_pass(&Default::default());
                 cp.set_pipeline(&p_vl);
@@ -4826,6 +5046,29 @@ mod gpu_render_tests {
         flicker_probe_rt(&world, &wg, "water_graze_nofield", day);
         sync_voxlight_shells(&mut world);
         flicker_probe_rt(&world, &wg, "water_graze_field", RigOpts { voxlight: true, ..day });
+        // The steep view WITH THE FIELD, which is the A/B the water-shadow
+        // report needs and which this rig has never run. `water_top` above is
+        // the per-pixel fallback: every water number ever taken here was, so
+        // "the faceted surface and the light field are fighting" was untestable.
+        // Steep rather than grazing because at this angle Fresnel is near zero
+        // and almost the whole pixel is the lit/shadowed term the field feeds.
+        flicker_probe_rt(&world, &wt, "water_top_field", RigOpts { voxlight: true, ..day });
+        // SHADOWED OPEN WATER, both ways. This is the view the water-shadow
+        // report needs and the one no natural camera in the demo world provides:
+        // `water_top` above frames a pond in full sun, so `shade_water_top`'s
+        // lit/shadowed smoothstep is saturated at 1 and reads the SAME whether
+        // the light field answers or the per-pixel ray does - which is why those
+        // two lines agree to eleven pixels and settle nothing.
+        //
+        // Same crafted scene `dump_lookdev_views` uses for the still: a wall
+        // standing in a flat sheet, its shadow edge a line of constant x across
+        // the water.
+        {
+            let (mut sw, scam) = build_water_shadow_world(true);
+            flicker_probe_rt(&sw, &scam, "water_shadow_nofield", day);
+            sync_voxlight_shells(&mut sw);
+            flicker_probe_rt(&sw, &scam, "water_shadow_field", RigOpts { voxlight: true, ..day });
+        }
         // The primary symptom view: a lone tree's cast shadow on open grass,
         // camera aimed at the penumbra boundary. Sun at t=30 is at
         // s ~ (-0.36, 0.89, 0.29): the shadow of a crown ~9 up lands ~(+3.6,
@@ -7864,17 +8107,18 @@ mod gpu_render_tests {
         // composition, same printed columns - so these numbers sit in the same
         // table as round A.
         sync_voxlight_shells(&mut world);
-        let vl_count = upload_voxlight(&queue, &vl_bufs, &mut world);
+        let vl_count =
+            upload_voxlight(&queue, &vl_bufs, &mut world, &mut VoxLightUploadStats::default());
         report_voxlight_binding(&world, vl_count);
         let vl_up = VoxLightUpdate {
             device: &device, queue: &queue, vl: &vl_bufs, bg: &bg, rt_bg: Some(&rt_bg),
-            light: &vl_update, count: vl_count,
+            light: &vl_update, count: vl_count, near: vl_count,
         };
         // The steady state a still camera reaches. Fewer rounds would still make
         // every record valid, but would time a field mid-convergence rather
         // than the one the game settles at.
         let vl_rounds = VOXLIGHT_CONVERGE_ROUNDS;
-        let vl_params_at = |round| voxlight_params(vl_count, round, 0);
+        let vl_params_at = |round| voxlight_params(vl_count, round, 0, vl_count);
         let t_conv = std::time::Instant::now();
         vl_up.converge(vl_rounds, vl_params_at);
         device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
@@ -7913,7 +8157,7 @@ mod gpu_render_tests {
         let time_update = |count: u32| -> f64 {
             let up = VoxLightUpdate {
                 device: &device, queue: &queue, vl: &vl_bufs, bg: &bg, rt_bg: Some(&rt_bg),
-                light: &vl_update, count,
+                light: &vl_update, count, near: count,
             };
             // A LONG warm-up, not the 5 rounds the frame timers use. These
             // dispatches are ~0.5 ms each, so five of them is 2.5 ms of load -
@@ -7929,9 +8173,42 @@ mod gpu_render_tests {
             t.elapsed().as_secs_f64() * 1000.0 / 60.0
         };
         eprintln!(
-            "voxlight update cost per frame: light pass {:.2} ms (NOT included in any column below)",
+            "voxlight update cost per frame: light pass {:.2} ms, WHOLE SHELL NEAR              (NOT included in any column below)",
             time_update(vl_count),
         );
+        // The same pass under the SHIPPED camera-aware cadence, which this
+        // harness would otherwise never show.
+        //
+        // Everything above binds the shell with `sync_light_shell_all` and no
+        // camera, so the near/far partition is degenerate - the whole shell is
+        // near - and the number above is the cost of refreshing a 60,000-block
+        // world every eight frames regardless of where anyone is standing. That
+        // is what the renderer used to do and it is not what it does now, so
+        // quoting only the first line would overstate the live cost by several
+        // times. The frame columns below are unaffected either way: they time
+        // the raymarch, and the update pass does not run inside them.
+        {
+            let focus = ab_camera(&world).pos;
+            world.set_light_focus(focus);
+            let near = world.light.near_count();
+            upload_voxlight_fresh(&queue, &vl_bufs, &world);
+            let params_near = |round| voxlight_params(vl_count, round, 0, near);
+            let up = VoxLightUpdate {
+                device: &device, queue: &queue, vl: &vl_bufs, bg: &bg, rt_bg: Some(&rt_bg),
+                light: &vl_update, count: vl_count, near,
+            };
+            up.converge(200, params_near);
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            let t = std::time::Instant::now();
+            up.converge(60, params_near);
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            eprintln!(
+                "  camera-aware ({near} of {vl_count} blocks near, {} of {} workgroups): {:.2} ms",
+                voxlight_dispatch_blocks(vl_count, near),
+                voxlight_dispatch_blocks(vl_count, vl_count),
+                t.elapsed().as_secs_f64() * 1000.0 / 60.0,
+            );
+        }
 
         // Foliage-heavy and terrain-overview cameras (occlusion cost differs a
         // lot: dense canopy AO/shadow rays vs open terrain).
@@ -8839,6 +9116,9 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
         rt_bg: Option<&'a wgpu::BindGroup>,
         light: &'a wgpu::ComputePipeline,
         count: u32,
+        /// Near prefix length. Harnesses with no camera focus pass `count`,
+        /// which is the whole-shell cadence the field shipped with.
+        near: u32,
     }
 
     impl VoxLightUpdate<'_> {
@@ -8862,7 +9142,7 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
                     }
                     // One workgroup per block in this round's slice, one
                     // invocation per voxel.
-                    cp.dispatch_workgroups(self.count.div_ceil(VOXLIGHT_UPDATE_DIV), 1, 1);
+                    cp.dispatch_workgroups(voxlight_dispatch_blocks(self.count, self.near), 1, 1);
                 }
                 self.queue.submit(std::iter::once(enc.finish()));
             }
@@ -8933,42 +9213,267 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
         }
     }
 
-    /// Headless rig for the per-voxel light field: the group-0 render bindings
-    /// (the update pass shares the render layout), a POPULATED
-    /// `VoxLightBuffers` and the update + probe pipelines.
-    struct VoxLightRig {
-        vl: VoxLightBuffers,
+    /// Mean / p50 / p99 / max of a millisecond sample, for the live-session
+    /// report. A mean alone hides exactly the shape that matters here: a cost
+    /// that fires on one frame in ten and stalls it is a stutter, not a 10%
+    /// slowdown, and only the tail says which one it is.
+    fn ms_stats(v: &mut Vec<f64>) -> (f64, f64, f64, f64) {
+        if v.is_empty() {
+            return (0.0, 0.0, 0.0, 0.0);
+        }
+        let mean = v.iter().sum::<f64>() / v.len() as f64;
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let q = |f: f64| v[(((v.len() - 1) as f64) * f) as usize];
+        (mean, q(0.5), q(0.99), v[v.len() - 1])
+    }
+
+    /// A LIVE SESSION, headless: the real world, real physics, real streaming,
+    /// the real upload path, and the update dispatch at the block count a
+    /// STREAMED world actually binds.
+    ///
+    /// WHY THIS EXISTS. Every perf number this project has taken so far came out
+    /// of `rt_vs_software_timing`, which builds ONE static world, never ticks
+    /// physics, never streams and never calls `upload_world`. Three cost classes
+    /// are invisible to it BY CONSTRUCTION:
+    ///
+    ///  - `World::sync_light_shell_dirty`, which evaluates shell membership for
+    ///    every dirty brick AND its six neighbours, on the main thread. It runs
+    ///    only when something is dirty, and in that harness nothing ever is.
+    ///  - `upload_voxlight`, which pushes the WHOLE 4 MiB brick -> block table
+    ///    whenever any binding changed, plus one 512-byte DMA per recycled
+    ///    block. Neither can fire in a world where no brick ever changes and no
+    ///    slot is ever recycled.
+    ///  - the update dispatch's real size: a crafted lab scene binds ~2,300
+    ///    blocks, a streamed demo world binds ~60,000.
+    ///
+    /// The owner reported the game running slowly while every harness number
+    /// looked fine, which is the signature of measuring the wrong world. This
+    /// reports CPU milliseconds per stage and GPU milliseconds per pass
+    /// SEPARATELY, because the two things it exists to discriminate are one of
+    /// each.
+    ///
+    /// The session paces itself at 60 Hz on purpose: chunk generation is
+    /// asynchronous, so a loop that ran flat out would finish before the worker
+    /// pool produced anything and would measure a world that never streams.
+    #[test]
+    #[ignore]
+    fn live_session_profile() {
+        let Some((device, queue, _gpu)) = headless_device() else {
+            eprintln!("live_session_profile: no GPU adapter, skipping");
+            return;
+        };
+        let frames: u32 = std::env::var("VOXELG_PROFILE_FRAMES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(600);
+        let mut world = World::new();
+        world.fill_demo_terrain();
+        let vl = VoxLightBuffers::new(&device);
+        let mut stats = VoxLightUploadStats::default();
+
+        // The INIT frame, exactly as `upload_world` runs it under `all_dirty`.
+        // Reported on its own: it is a one-off, and averaging it into the steady
+        // state would both flatter the steady state and hide a hitch that is
+        // real at world load.
+        let t0 = std::time::Instant::now();
+        world.sync_light_shell_all();
+        let init_shell = t0.elapsed().as_secs_f64() * 1000.0;
+        let t1 = std::time::Instant::now();
+        let init_count = upload_voxlight(&queue, &vl, &mut world, &mut stats);
+        let init_upload = t1.elapsed().as_secs_f64() * 1000.0;
+        world.all_dirty = false;
+        world.dirty_bricks.clear();
+        eprintln!(
+            "live_session_profile: init frame  sync_light_shell_all {init_shell:.1} ms, \
+             upload {init_upload:.1} ms, {init_count} blocks bound"
+        );
+        // The init frame is not a steady-state frame; start the counters clean.
+        stats = VoxLightUploadStats::default();
+
+        let mut cam = ab_camera(&world);
+        // A sprint, not a stroll: streaming is the half of the session the old
+        // harness could not reach at all, and a camera that never leaves its
+        // chunk never recycles a slot.
+        const WALK_SPEED: f32 = 24.0;
+        let dt = 1.0 / 60.0_f32;
+        let budget = std::time::Duration::from_secs_f32(dt);
+
+        let mut phys_ms = Vec::with_capacity(frames as usize);
+        let mut stream_ms = Vec::with_capacity(frames as usize);
+        let mut shell_ms = Vec::with_capacity(frames as usize);
+        let mut focus_ms = Vec::with_capacity(frames as usize);
+        let mut upload_ms = Vec::with_capacity(frames as usize);
+        let mut dirty_total = 0u64;
+        let mut dirty_max = 0usize;
+        let (mut count_min, mut count_max) = (u32::MAX, 0u32);
+        let mut shifts = 0u32;
+        let (mut near_min, mut near_max) = (u32::MAX, 0u32);
+
+        let session = std::time::Instant::now();
+        for frame in 0..frames {
+            let frame_start = std::time::Instant::now();
+            cam.pos.x += WALK_SPEED * dt;
+
+            // Physics at the shipped 30 Hz. It runs on a worker thread in the
+            // game, but it holds the world mutex while it runs, so the render
+            // thread pays for it whenever the two collide - which is why it is
+            // timed here rather than assumed free.
+            let mut t = std::time::Instant::now();
+            if frame % 2 == 0 {
+                crate::physics::tick(&mut world);
+            }
+            phys_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+
+            // Streaming, verbatim from `App::render_frame`.
+            t = std::time::Instant::now();
+            let target = World::target_origin_chunk(cam.pos);
+            let drift = target - world.world_origin_chunk;
+            if drift.x.abs() >= crate::app::STREAM_HYSTERESIS
+                || drift.y.abs() >= crate::app::STREAM_HYSTERESIS
+            {
+                world.shift_origin(target);
+                shifts += 1;
+            }
+            world.install_finished_chunks(crate::app::CHUNK_INSTALL_BUDGET);
+            stream_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+
+            // The light field's half of `upload_world`, in the same order and
+            // behind the same sort/dedup.
+            world.dirty_bricks.sort_unstable();
+            world.dirty_bricks.dedup();
+            dirty_total += world.dirty_bricks.len() as u64;
+            dirty_max = dirty_max.max(world.dirty_bricks.len());
+            t = std::time::Instant::now();
+            world.set_light_focus(cam.pos);
+            focus_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+            t = std::time::Instant::now();
+            world.sync_light_shell_dirty();
+            let shell = t.elapsed();
+            shell_ms.push(shell.as_secs_f64() * 1000.0);
+            t = std::time::Instant::now();
+            let live_count = upload_voxlight(&queue, &vl, &mut world, &mut stats);
+            upload_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+            // Feed the same counters `Renderer::upload_world` feeds, so this
+            // harness's summary line and the live game's log line are the same
+            // line and mean the same thing.
+            stats.shell_ns += shell.as_nanos() as u64;
+            stats.upload_ns += t.elapsed().as_nanos() as u64;
+            stats.live = live_count;
+            stats.near = world.light.near_count();
+            count_min = count_min.min(live_count);
+            count_max = count_max.max(live_count);
+            let near = world.light.near_count();
+            near_min = near_min.min(near);
+            near_max = near_max.max(near);
+            world.dirty_bricks.clear();
+            // `upload_mask_clears` consumes these in the game; drop them so the
+            // list cannot grow without bound and distort the streaming timer.
+            world.mask_dirty_tiles.clear();
+            // Let the DMAs actually retire instead of piling up in the queue.
+            queue.submit(std::iter::empty());
+            device.poll(wgpu::PollType::Poll).ok();
+
+            if let Some(rest) = budget.checked_sub(frame_start.elapsed()) {
+                std::thread::sleep(rest);
+            }
+        }
+        let secs = session.elapsed().as_secs_f64();
+
+        let p = |name: &str, v: &mut Vec<f64>| {
+            let (mean, med, p99, max) = ms_stats(v);
+            eprintln!("  {name:<22} mean {mean:6.3} ms  p50 {med:6.3}  p99 {p99:6.3}  max {max:6.3}");
+        };
+        eprintln!(
+            "\n=== live session: {frames} frames in {secs:.1} s, {shifts} origin shift(s), \
+             {dirty_total} dirty bricks total (max {dirty_max}/frame) ==="
+        );
+        eprintln!("CPU, per frame:");
+        p("physics::tick", &mut phys_ms);
+        p("streaming", &mut stream_ms);
+        p("set_light_focus", &mut focus_ms);
+        p("sync_light_shell_dirty", &mut shell_ms);
+        p("upload_voxlight", &mut upload_ms);
+        eprintln!("{}", stats.report(secs));
+        eprintln!(
+            "  live blocks {count_min}..{count_max} (pool {}), overflow total {}",
+            world.light.blocks_max(),
+            world.light.overflow_total(),
+        );
+        let near_now = world.light.near_count();
+        let live_now = world.light.allocated() as u32;
+        eprintln!(
+            "  near prefix {near_min}..{near_max} of the work list; dispatch {} workgroups              against {} if the whole shell were near",
+            voxlight_dispatch_blocks(live_now, near_now),
+            voxlight_dispatch_blocks(live_now, live_now),
+        );
+
+        // ---- GPU: the update pass at the size a live world actually asks for.
+        // Built from the world the session LEFT BEHIND, so the brick data the
+        // shadow rays traverse is the streamed one rather than the pristine
+        // generated one.
+        let g0 = VoxLightGroup0::new(&device, &world, VL_SUN_TIME, &vl);
+        let count = upload_voxlight_fresh(&queue, &vl, &world);
+        assert_eq!(count, live_now, "the GPU section must time the world the session left");
+        // `near` has to reach BOTH the dispatch size and the uniform: the shader
+        // derives the near/far boundary from the uniform, so a closure that
+        // pinned one value while the dispatch used another would size the launch
+        // for one partition and walk a different one.
+        let time_update = |n: u32, near: u32| -> f64 {
+            let params_at = move |round| voxlight_params(n, round, 0, near);
+            let up = VoxLightUpdate {
+                device: &device, queue: &queue, vl: &vl, bg: &g0.bg, rt_bg: None,
+                light: &g0.update, count: n, near,
+            };
+            // A long warm-up, for the reason `rt_vs_software_timing` documents:
+            // these dispatches are sub-millisecond, so a handful of them never
+            // brings the GPU off its idle clock and the first measurement comes
+            // back at twice the other two.
+            up.converge(200, params_at);
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            let t = std::time::Instant::now();
+            up.converge(60, params_at);
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            t.elapsed().as_secs_f64() * 1000.0 / 60.0
+        };
+        eprintln!("GPU, per frame (cs_voxel_light_update, software variant):");
+        // The camera-blind cost (everything near, i.e. the pre-policy dispatch)
+        // against the cost this session's actual partition asks for. Same world,
+        // same pipeline, same submit-and-wait timing: the only difference is how
+        // much of the shell the pass is told to refresh this frame.
+        eprintln!(
+            "  whole shell near ({count} blocks, {} wgs): {:.2} ms",
+            voxlight_dispatch_blocks(count, count),
+            time_update(count, count),
+        );
+        eprintln!(
+            "  camera-aware      ({near_now} near, {} wgs): {:.2} ms",
+            voxlight_dispatch_blocks(count, near_now),
+            time_update(count, near_now),
+        );
+    }
+
+    /// Group-0 bindings plus the light-field pipelines for a headless harness.
+    ///
+    /// Extracted from `VoxLightRig::new` rather than copied into the live-session
+    /// profiler: a second copy of this setup is exactly how two harnesses end up
+    /// measuring two different things while printing the same label. Everything
+    /// here is the SHIPPED layout - `create_compute_bgl` + `make_compute_bg` - so
+    /// the update pass sees the bindings it sees in the game.
+    struct VoxLightGroup0 {
         bg: wgpu::BindGroup,
         update: wgpu::ComputePipeline,
         probe: wgpu::ComputePipeline,
-        /// Blocks bound for this world, i.e. the update pass's dispatch size.
-        count: u32,
-        /// Screen-space bindings the update pass never reads. Held only so the
-        /// bind group's resources outlive it.
-        _keep: Vec<Box<dyn std::any::Any>>,
-        queue: wgpu::Queue,
-        device: wgpu::Device,
-        /// Dropped LAST, after the device, exactly like `headless_device`'s
-        /// callers: the driver crashes on concurrent submission across devices.
-        _gpu: std::sync::MutexGuard<'static, ()>,
+        /// The update pass reads `world_origin` and `sun_time` from here.
+        /// Streaming MOVES the origin, so a harness that streams has to re-push
+        /// it or the pass addresses the toroidal window at the wrong fold.
+        camera_buf: wgpu::Buffer,
+        /// Bindings the update pass never reads, held so the bind group's
+        /// resources outlive it.
+        keep: Vec<Box<dyn std::any::Any>>,
     }
 
-    impl VoxLightRig {
-        /// Bind `world`'s lit shell, push it to the GPU and build the pipelines.
-        /// Returns None when there is no adapter, like every other GPU test.
-        fn new(world: &mut World, sun_time: f32) -> Option<Self> {
-            let (device, queue, gpu) = headless_device()?;
-            let vl = VoxLightBuffers::new(&device);
-            // The two calls the renderer makes on a full-dirty frame, in the
-            // same order: decide which bricks carry lit shell, then upload the
-            // brick table and the compact work list.
-            world.sync_light_shell_all();
-            let count = upload_voxlight(&queue, &vl, world);
-            assert!(
-                count < VL_PROBE_BLOCK,
-                "crafted scene bound {count} blocks and would collide with the probe scratch at {VL_PROBE_BLOCK}",
-            );
-
+    impl VoxLightGroup0 {
+        fn new(device: &wgpu::Device, world: &World, sun_time: f32, vl: &VoxLightBuffers) -> Self {
             // The update pass reads only `camera.world_origin` and
             // `camera.sun_time` from the camera and touches none of the
             // screen-space bindings, so they are sized 8x8 - they exist purely
@@ -8982,12 +9487,12 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 contents: bytemuck::bytes_of(&cu),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
-            let bricks_buf = storage(&device, "bricks", bytemuck::cast_slice(&world.bricks));
-            let tile_mask_buf = storage(&device, "tile_mask", bytemuck::cast_slice(&world.tile_mask));
-            let chunk_mask_buf = storage(&device, "chunk_mask", bytemuck::cast_slice(&world.chunk_mask));
-            let l4_mask_buf = storage(&device, "l4_mask", bytemuck::cast_slice(&world.l4_mask));
-            let bu = storage(&device, "bu", bytemuck::cast_slice(&pack_u8_to_u32(&world.brick_uniform)));
-            let tu = storage(&device, "tu", bytemuck::cast_slice(&pack_u8_to_u32(&world.tile_uniform)));
+            let bricks_buf = storage(device, "bricks", bytemuck::cast_slice(&world.bricks));
+            let tile_mask_buf = storage(device, "tile_mask", bytemuck::cast_slice(&world.tile_mask));
+            let chunk_mask_buf = storage(device, "chunk_mask", bytemuck::cast_slice(&world.chunk_mask));
+            let l4_mask_buf = storage(device, "l4_mask", bytemuck::cast_slice(&world.l4_mask));
+            let bu = storage(device, "bu", bytemuck::cast_slice(&pack_u8_to_u32(&world.brick_uniform)));
+            let tu = storage(device, "tu", bytemuck::cast_slice(&pack_u8_to_u32(&world.tile_uniform)));
             let palette = default_palette();
             let palette_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("palette"),
@@ -8995,31 +9500,34 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
             let words = ((((w + 7) / 8) * ((h + 7) / 8)) as usize + 31) / 32;
-            let tile_dirty_buf = storage(&device, "tile_dirty", bytemuck::cast_slice(&vec![u32::MAX; words]));
-            let players_buf = storage(&device, "players", &vec![0u8; 16 + MAX_REMOTE_PLAYERS * 16]);
-            let (out_tex, output_view) = create_hdr_texture(&device, w, h);
-            let (geom_tex, geom_view) = create_hdr_texture(&device, w, h);
-            let (beam_tex, beam_view) = create_beam_texture(&device, w, h);
-            let (cloud_tex, cloud_sampled_view, _cloud_storage_view) = create_cloud_texture(&device, w, h);
+            let tile_dirty_buf =
+                storage(device, "tile_dirty", bytemuck::cast_slice(&vec![u32::MAX; words]));
+            let players_buf = storage(device, "players", &vec![0u8; 16 + MAX_REMOTE_PLAYERS * 16]);
+            let (out_tex, output_view) = create_hdr_texture(device, w, h);
+            let (geom_tex, geom_view) = create_hdr_texture(device, w, h);
+            let (beam_tex, beam_view) = create_beam_texture(device, w, h);
+            let (cloud_tex, cloud_sampled_view, _cloud_storage_view) =
+                create_cloud_texture(device, w, h);
             let cloud_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("voxlight cloud samp"),
                 mag_filter: wgpu::FilterMode::Linear,
                 min_filter: wgpu::FilterMode::Linear,
                 ..Default::default()
             });
-            let (lin_tex, light_in_view) = create_lighting_texture(&device, w, h);
-            let (lout_tex, light_out_view) = create_lighting_texture(&device, w, h);
-            let transp_buf = create_transp_buf(&device, w, h);
-            let sprites_buf = storage(&device, "sprites", bytemuck::cast_slice(&crate::sprites::encoded()));
-            let (depth_tex, depth_view) = create_depth_texture(&device, w, h);
-            let (ddepth_tex, dummy_depth_view) = create_depth_texture(&device, 1, 1);
-            let bgl = create_compute_bgl(&device);
+            let (lin_tex, light_in_view) = create_lighting_texture(device, w, h);
+            let (lout_tex, light_out_view) = create_lighting_texture(device, w, h);
+            let transp_buf = create_transp_buf(device, w, h);
+            let sprites_buf =
+                storage(device, "sprites", bytemuck::cast_slice(&crate::sprites::encoded()));
+            let (depth_tex, depth_view) = create_depth_texture(device, w, h);
+            let (ddepth_tex, dummy_depth_view) = create_depth_texture(device, 1, 1);
+            let bgl = create_compute_bgl(device);
             let bg = make_compute_bg(
-                &device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
+                device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
                 &palette_buf, &output_view, &beam_view, &tile_dirty_buf, &players_buf,
                 &bu, &tu, &l4_mask_buf, &cloud_sampled_view, &cloud_sampler,
                 &light_in_view, &light_out_view, &transp_buf, &sprites_buf,
-                &dummy_depth_view, &geom_view, &depth_view, &vl,
+                &dummy_depth_view, &geom_view, &depth_view, vl,
             );
 
             // The SOFTWARE variant: `shadow_occluded` forwards to the DDA, so
@@ -9051,12 +9559,58 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
             let keep: Vec<Box<dyn std::any::Any>> = vec![
                 Box::new(out_tex), Box::new(geom_tex), Box::new(beam_tex), Box::new(cloud_tex),
                 Box::new(lin_tex), Box::new(lout_tex), Box::new(depth_tex), Box::new(ddepth_tex),
-                Box::new(camera_buf), Box::new(bricks_buf), Box::new(tile_mask_buf),
+                Box::new(bricks_buf), Box::new(tile_mask_buf),
                 Box::new(chunk_mask_buf), Box::new(l4_mask_buf), Box::new(bu), Box::new(tu),
                 Box::new(palette_buf), Box::new(tile_dirty_buf), Box::new(players_buf),
                 Box::new(transp_buf), Box::new(sprites_buf),
             ];
-            Some(Self { vl, bg, update, probe, count, _keep: keep, queue, device, _gpu: gpu })
+            Self { bg, update, probe, camera_buf, keep }
+        }
+    }
+
+    /// Headless rig for the per-voxel light field: the group-0 render bindings
+    /// (the update pass shares the render layout), a POPULATED
+    /// `VoxLightBuffers` and the update + probe pipelines.
+    struct VoxLightRig {
+        vl: VoxLightBuffers,
+        bg: wgpu::BindGroup,
+        update: wgpu::ComputePipeline,
+        probe: wgpu::ComputePipeline,
+        /// Blocks bound for this world, i.e. the update pass's dispatch size.
+        count: u32,
+        /// Screen-space bindings the update pass never reads. Held only so the
+        /// bind group's resources outlive it.
+        _keep: Vec<Box<dyn std::any::Any>>,
+        queue: wgpu::Queue,
+        device: wgpu::Device,
+        /// Dropped LAST, after the device, exactly like `headless_device`'s
+        /// callers: the driver crashes on concurrent submission across devices.
+        _gpu: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl VoxLightRig {
+        /// Bind `world`'s lit shell, push it to the GPU and build the pipelines.
+        /// Returns None when there is no adapter, like every other GPU test.
+        fn new(world: &mut World, sun_time: f32) -> Option<Self> {
+            let (device, queue, gpu) = headless_device()?;
+            let vl = VoxLightBuffers::new(&device);
+            // The two calls the renderer makes on a full-dirty frame, in the
+            // same order: decide which bricks carry lit shell, then upload the
+            // brick table and the compact work list.
+            world.sync_light_shell_all();
+            let count = upload_voxlight(&queue, &vl, world, &mut VoxLightUploadStats::default());
+            assert!(
+                count < VL_PROBE_BLOCK,
+                "crafted scene bound {count} blocks and would collide with the probe scratch at {VL_PROBE_BLOCK}",
+            );
+
+            let g = VoxLightGroup0::new(&device, world, sun_time, &vl);
+            let mut keep = g.keep;
+            keep.push(Box::new(g.camera_buf));
+            Some(Self {
+                vl, bg: g.bg, update: g.update, probe: g.probe, count,
+                _keep: keep, queue, device, _gpu: gpu,
+            })
         }
 
         /// Run `rounds` update rounds through the shared loop.
@@ -9085,17 +9639,75 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 rt_bg: None,
                 light: &self.update,
                 count: self.count,
+                near: self.count,
             }
             .converge(rounds, |round| VoxLightParamsUniform {
                 live_count: self.count,
                 round: start + round,
                 update_div: VOXLIGHT_UPDATE_DIV,
-                sun_rays: 4,
+                sun_rays: 8,
                 sun_cone: 0.07,
                 light_count: 0,
                 fold: 0.35,
                 ao_strength: 0.85,
+                // No camera focus in a crafted lab scene: the whole shell is
+                // near, i.e. exactly the cadence the field shipped with.
+                near_count: self.count,
+                far_div: VOXLIGHT_FAR_DIV,
+                _pad: [0; 2],
             });
+        }
+
+        /// `rounds` update rounds at a chosen sun-ray count, everything else as
+        /// shipped. The ray count is the estimate's angular resolution, so this
+        /// is how a test asks "what would this look like with more rays".
+        fn converge_rays(&self, rays: u32, rounds: u32) {
+            VoxLightUpdate {
+                device: &self.device,
+                queue: &self.queue,
+                vl: &self.vl,
+                bg: &self.bg,
+                rt_bg: None,
+                light: &self.update,
+                count: self.count,
+                near: self.count,
+            }
+            .converge(rounds, |round| VoxLightParamsUniform {
+                sun_rays: rays,
+                ..voxlight_params(self.count, round, 0, self.count)
+            });
+        }
+
+        /// `rounds` update rounds with the work list partitioned: the first
+        /// `near` entries on the normal cadence, the rest on the far one.
+        fn converge_partitioned(&self, near: u32, start: u32, rounds: u32) {
+            VoxLightUpdate {
+                device: &self.device,
+                queue: &self.queue,
+                vl: &self.vl,
+                bg: &self.bg,
+                rt_bg: None,
+                light: &self.update,
+                count: self.count,
+                near,
+            }
+            .converge(rounds, |round| {
+                voxlight_params(self.count, start + round, 0, near)
+            });
+        }
+
+        /// Wipe every bound block back to "no valid history", so a second
+        /// convergence starts where the first one did.
+        fn zero_live_pool(&self) {
+            let words =
+                self.count as usize * LIGHT_RECORDS_PER_BLOCK as usize * LIGHT_RECORD_WORDS as usize;
+            self.queue.write_buffer(&self.vl.pool, 0, bytemuck::cast_slice(&vec![0u32; words]));
+        }
+
+        /// Re-push the brick table and work list after the CPU-side field was
+        /// repartitioned.
+        fn reupload_list(&self, world: &World) {
+            upload_voxlight_fresh(&self.queue, &self.vl, world);
         }
 
         fn read_words(&self, buf: &wgpu::Buffer, first_word: u64, words: u64) -> Vec<u32> {
@@ -9263,6 +9875,402 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
     /// report `valid` on the ground surface. Without that half, the field could
     /// be perfectly converged and shading would still ignore it - which is
     /// exactly the state every other GPU test in this module leaves it in.
+    /// The field must actually ANSWER at a water surface.
+    ///
+    /// `shade_water_top`'s entire lit/shadowed term is `voxlight_sample(p_hit,
+    /// +Y)` with a single binary shadow ray as the fallback, so if the field
+    /// cannot answer there, water renders through the fallback and every
+    /// measurement taken "with the field on" over water is measuring the
+    /// fallback. Nothing asserted that, and the addressing is not obvious: the
+    /// sample point sits on a QUANTIZED, ANIMATED plate inside the water cell,
+    /// the water voxel under it is occupied (so the sampler's solidity gate
+    /// drops that tap), and the whole answer therefore comes from the row of air
+    /// voxels above.
+    ///
+    /// Probed across the wall's shadow edge, so it also pins the thing that
+    /// matters for the look: LIT reads high, SHADOWED reads low, and there is a
+    /// transition between them rather than one flat value.
+    #[test]
+    fn voxlight_answers_at_a_water_surface() {
+        let (mut world, _cam) = build_water_shadow_world(true);
+        // Sun 30, not VL_SUN_TIME. VL_SUN_TIME is the zenith by construction
+        // ((PI/2 - 1.20)/0.025), and a wall under a vertical sun casts its
+        // shadow onto its own footprint - there would be no shadowed water to
+        // probe. 30 is the same sun `flicker_probe_rt` and the lookdev stills
+        // use, at ~62 degrees, which throws the wall's shadow ~13 voxels in +x.
+        let Some(rig) = VoxLightRig::new(&mut world, 30.0) else {
+            eprintln!("voxlight_answers_at_a_water_surface: no GPU adapter, skipping");
+            return;
+        };
+        rig.converge(VOXLIGHT_CONVERGE_ROUNDS);
+        // The sheet is water at y=64 over x 60..156, z 92..180; the wall stands
+        // at x 108..111. Sun at t=30 comes from -x, so the shadow falls to +x.
+        // Probe the plate's own height range, i.e. where `shade_water_top`
+        // samples: WATER_BASE 0.72 above the cell floor.
+        // x 96..108 is upsun and open, 108..111 IS the wall (probing there asks
+        // about solid stone), 111..136 is the shadow and the penumbra at its end.
+        let z = 130.0;
+        let reqs: Vec<(glam::Vec3, glam::Vec3)> = (96..108)
+            .chain(111..136)
+            .map(|x| (glam::Vec3::new(x as f32 + 0.5, 64.72, z), glam::Vec3::Y))
+            .collect();
+        let got = rig.sample(&reqs);
+        let xs: Vec<u32> = (96..108).chain(111..136).collect();
+        let line: Vec<String> = got
+            .iter()
+            .zip(&xs)
+            .map(|(s, x)| format!("{x}:{}", if s.valid { s.sun as i32 } else { -1 }))
+            .collect();
+        eprintln!("water surface sun across the wall shadow: {}", line.join(" "));
+
+        assert!(
+            got.iter().all(|s| s.valid),
+            "the light field does not answer at the water surface, so water shades through the              per-pixel fallback and every water measurement taken with the field on is measuring              the fallback"
+        );
+        // x < 108 is upsun of the wall and must be lit; a few voxels past the
+        // wall must be in its shadow.
+        let at = |x: u32| got[xs.iter().position(|&v| v == x).unwrap()].sun;
+        let (lit, shadow) = (at(96), at(115));
+        assert!(lit > 200, "open water upsun of the wall reads {lit}/255, not lit");
+        assert!(
+            shadow < 55,
+            "water 4 voxels downsun of a 32-voxel wall reads {shadow}/255, not shadowed"
+        );
+        // And a PENUMBRA between them, which is the whole reason the field
+        // exists on water: a binary ray cannot produce one, so if every probe
+        // were 0 or 255 the field would be doing nothing a shadow ray does not.
+        let partial = got.iter().filter(|s| s.sun > 20 && s.sun < 235).count();
+        assert!(
+            partial > 0,
+            "no probe reads a partial sun visibility, so the field is answering in binary and              the soft shadow it exists to provide is not there"
+        );
+    }
+
+    /// The water plate's ANIMATED, QUANTIZED height must not move the answer.
+    ///
+    /// This is the leading theory for the flickery water shadows, tested rather
+    /// than assumed, and it is WRONG - which is worth a test of its own, because
+    /// it is the obvious theory and it will be proposed again. The worry is that
+    /// `shade_water_top` samples at `p_hit`, `p_hit` sits on a plate that steps
+    /// between seven quantized heights as the wave passes, and a shading point
+    /// crossing a voxel boundary lands on a different record.
+    ///
+    /// It cannot, and the reason is the sampler's SOLIDITY GATE. The plate lives
+    /// inside the water cell (`WATER_BASE` 0.72 +- `WATER_WAVE_AMP` 0.24, so
+    /// 0.48..0.96), the water voxel under it is OCCUPIED, so the tap into it is
+    /// dropped and its weight renormalised away - and the whole answer comes
+    /// from the row of air voxels ABOVE the cell, whose weight cancels. The
+    /// height therefore divides out exactly.
+    ///
+    /// Probed over the full band range, at the shadow edge where any difference
+    /// would be largest.
+    #[test]
+    fn water_plate_height_does_not_move_the_light_sample() {
+        let (mut world, _cam) = build_water_shadow_world(true);
+        let Some(rig) = VoxLightRig::new(&mut world, 30.0) else {
+            eprintln!("water_plate_height_does_not_move_the_light_sample: no GPU adapter, skipping");
+            return;
+        };
+        rig.converge(VOXLIGHT_CONVERGE_ROUNDS);
+        // The seven quantized plate heights: WATER_BASE + band * (AMP / BANDS)
+        // for band -3..3, i.e. exactly what `water_facet` can produce.
+        let heights: Vec<f32> = (-3..=3).map(|b| 0.72 + b as f32 * (0.24 / 3.0)).collect();
+        // Across the penumbra found by `voxlight_answers_at_a_water_surface`,
+        // where the field is neither 0 nor 255 and a wrong record would show.
+        let xs: Vec<u32> = (118..128).collect();
+        let mut per_height = Vec::new();
+        for &h in &heights {
+            let reqs: Vec<(glam::Vec3, glam::Vec3)> = xs
+                .iter()
+                .map(|&x| (glam::Vec3::new(x as f32 + 0.5, 64.0 + h, 130.0), glam::Vec3::Y))
+                .collect();
+            per_height.push(rig.sample(&reqs));
+        }
+        for (hi, got) in per_height.iter().enumerate() {
+            let row: Vec<String> = got
+                .iter()
+                .map(|s| if s.valid { s.sun.to_string() } else { "-".into() })
+                .collect();
+            eprintln!("plate h {:.2}: {}", heights[hi], row.join(" "));
+        }
+        let base = &per_height[0];
+        for (hi, got) in per_height.iter().enumerate().skip(1) {
+            for (i, (a, b)) in base.iter().zip(got.iter()).enumerate() {
+                assert_eq!(
+                    a.valid, b.valid,
+                    "plate height {:.2} changes whether the field answers at x {}",
+                    heights[hi], xs[i],
+                );
+                assert_eq!(
+                    a.sun, b.sun,
+                    "plate height {:.2} moves the sampled sun visibility at x {} from {} to {};                      the wave would then re-shade a still surface every time a cell changed band",
+                    heights[hi], xs[i], a.sun, b.sun,
+                );
+            }
+        }
+    }
+
+    /// Eight rays must reconstruct the same soft shadow a much denser estimate
+    /// does.
+    ///
+    /// The estimator's rays-per-visit is now also its angular RESOLUTION, which
+    /// it was not before: the old scheme spread 32 directions over 8 visits, so
+    /// its time-average was a 32-ray answer even though each visit traced 4.
+    /// Making each visit complete had to pick a number, and 8 is a look decision
+    /// as much as a cost one - too few and a penumbra becomes a visible ladder.
+    ///
+    /// So it is measured against a 32-ray reference on a scene built around a
+    /// penumbra, and the bound is stated in the units the look is judged in: a
+    /// step of the stored byte.
+    #[test]
+    fn eight_sun_rays_match_a_dense_estimate() {
+        let (mut world, _cam) = build_water_shadow_world(true);
+        let Some(rig) = VoxLightRig::new(&mut world, 30.0) else {
+            eprintln!("eight_sun_rays_match_a_dense_estimate: no GPU adapter, skipping");
+            return;
+        };
+        let read = |rays: u32| {
+            rig.zero_live_pool();
+            rig.converge_rays(rays, VOXLIGHT_CONVERGE_ROUNDS);
+            rig.read_live_pool()
+        };
+        let dense = read(32);
+        let shipped = read(8);
+
+        let records = rig.count as usize * LIGHT_RECORDS_PER_BLOCK as usize;
+        let mut diffs = Vec::with_capacity(records);
+        for i in 0..records {
+            let (a, b) = (dense[i * 2], shipped[i * 2]);
+            if (a >> 16) & 0xFF == 0 || (b >> 16) & 0xFF == 0 {
+                continue;
+            }
+            diffs.push(((a & 0xFF) as i32 - (b & 0xFF) as i32).abs());
+        }
+        assert!(!diffs.is_empty(), "nothing converged, so nothing was compared");
+        let n = diffs.len();
+        let mean = diffs.iter().map(|&d| d as f64).sum::<f64>() / n as f64;
+        diffs.sort_unstable();
+        let q = |f: f64| diffs[((n - 1) as f64 * f) as usize];
+        eprintln!(
+            "8-ray vs 32-ray sun visibility over {n} records: mean {mean:.2}/255,              p99 {}/255, p99.9 {}/255, worst {}/255",
+            q(0.99), q(0.999), diffs[n - 1],
+        );
+        // A DISTRIBUTION, not a maximum, because the two direction sets are not
+        // nested: an 8-point and a 32-point sunflower place their samples
+        // differently, so at a hard shadow edge they can disagree by about
+        // 1/8 + 1/32 of the disc however correct both are. The maximum is
+        // therefore not a quality statement; the shape of the tail is.
+        assert!(
+            mean < 2.0,
+            "the shipped estimate is {mean:.2}/255 from a dense one ON AVERAGE, so the              coarsening is not confined to the penumbra and the whole scene has moved"
+        );
+        // Two non-nested stratifications of the same disc can disagree by at
+        // most one step of each ladder where they straddle a hard shadow edge:
+        // (1/8 + 1/32) * 255 = 39.8, plus a step of byte rounding. The tail
+        // landing exactly there is the arithmetic, not a defect - and p99 at
+        // 16/255 is what says it really is only the penumbra.
+        assert!(
+            q(0.999) <= 41,
+            "one record in a thousand differs from a dense estimate by {}/255, past what two              stratifications of the same disc can disagree by: that is not quantization",
+            q(0.999),
+        );
+    }
+
+    /// A CONVERGED record must STOP MOVING, on a scene and a sun that do not.
+    ///
+    /// This is the test that found the water flicker, and it fails at 89/255 on
+    /// the estimator it replaced. That one folded a rotating QUARTER of the sun
+    /// disc into the record at 0.35 per visit. The four quarters of a penumbra
+    /// voxel are four different numbers rather than four looks at one, so the
+    /// fold tracked them instead of averaging them and the stored value
+    /// oscillated for ever.
+    ///
+    /// The oscillation is subtle where the value is read LINEARLY - terrain just
+    /// multiplies by it - and violent where it is read through a STEP.
+    /// `shade_water_top` pushes it through `smoothstep(0.41, 0.59, sun_vis)`, a
+    /// band 45/255 wide, so a swing of 89/255 at a half-lit voxel is the entire
+    /// difference between lit water and shadowed water, every few frames, with
+    /// nothing in the scene moving. That is "shadows on water are too flickery".
+    ///
+    /// The number to watch is the PENUMBRA band, not the mean: fully lit and
+    /// fully shadowed voxels agree across every sample by construction and would
+    /// drown the average.
+    #[test]
+    fn voxlight_sun_is_stable_once_converged() {
+        let mut world = voxlight_shadow_world();
+        let Some(rig) = VoxLightRig::new(&mut world, VL_SUN_TIME) else {
+            eprintln!("voxlight_sun_is_stable_once_converged: no GPU adapter, skipping");
+            return;
+        };
+        rig.converge(VOXLIGHT_CONVERGE_ROUNDS);
+
+        // One reading per visit over a whole eight-epoch cycle.
+        let mut round = VOXLIGHT_CONVERGE_ROUNDS;
+        let records = rig.count as usize * LIGHT_RECORDS_PER_BLOCK as usize;
+        let mut lo = vec![255u8; records];
+        let mut hi = vec![0u8; records];
+        for _ in 0..VOXLIGHT_SUN_EPOCHS {
+            rig.converge_from(round, VOXLIGHT_UPDATE_DIV);
+            round += VOXLIGHT_UPDATE_DIV;
+            let pool = rig.read_live_pool();
+            for i in 0..records {
+                let w = pool[i * 2];
+                if (w >> 16) & 0xFF == 0 {
+                    continue;
+                }
+                let s = (w & 0xFF) as u8;
+                lo[i] = lo[i].min(s);
+                hi[i] = hi[i].max(s);
+            }
+        }
+
+        // The band `shade_water_top`'s smoothstep is sensitive in, in bytes.
+        let (band_lo, band_hi) = (0.41 * 255.0, 0.59 * 255.0);
+        let mut worst = 0u8;
+        let mut band_worst = 0u8;
+        let mut band_n = 0usize;
+        let mut band_unstable = 0usize;
+        for i in 0..records {
+            if hi[i] < lo[i] {
+                continue; // never stamped
+            }
+            let swing = hi[i] - lo[i];
+            worst = worst.max(swing);
+            let mid = (hi[i] as f32 + lo[i] as f32) * 0.5;
+            if mid >= band_lo && mid <= band_hi {
+                band_n += 1;
+                band_worst = band_worst.max(swing);
+                // A swing that crosses the whole smoothstep turns a stable
+                // half-lit surface into a strobing one.
+                if swing as f32 > (band_hi - band_lo) * 0.5 {
+                    band_unstable += 1;
+                }
+            }
+        }
+        eprintln!(
+            "voxlight sun stability over {VOXLIGHT_SUN_EPOCHS} epochs: worst swing {worst}/255              overall; penumbra band holds {band_n} records, worst swing {band_worst}/255,              {band_unstable} of them swing more than half the water smoothstep"
+        );
+        assert!(
+            band_n > 0,
+            "this scene has no half-lit voxels, so it cannot measure what it exists to measure"
+        );
+        // Half the smoothstep's width is 23/255. A converged record must sit
+        // well inside that or water shading is a coin flip at the shadow line.
+        assert!(
+            band_worst <= 23,
+            "a converged record in the penumbra swings {band_worst}/255 over one epoch cycle,              more than half the width of the water smoothstep ({}/255): water at a shadow edge              strobes between lit and shadowed on a scene that is not moving",
+            (band_hi - band_lo) as u32,
+        );
+    }
+
+    /// The FAR half of the work list must converge to the same light as the near
+    /// half, just more slowly.
+    ///
+    /// This is the whole claim the camera-aware update rests on: it is a REFRESH
+    /// RATE and nothing else, so once a far block has had as many visits as a
+    /// near one it holds the same record and no pixel can tell which group it
+    /// was in. If that is false, the policy is not an amortization, it is a
+    /// quality regression at distance.
+    ///
+    /// It is also what made the estimator's independence from the visit count
+    /// non-negotiable. While the sun disc was spread across successive visits,
+    /// `round / update_div` advanced by a whole cycle between two consecutive
+    /// visits of a FAR block, so a far block would have re-sampled the same
+    /// quarter of the disc for ever and its penumbra would never have filled in.
+    /// That is one of the two reasons `vl_sun_visibility` estimates the whole
+    /// disc every visit; the other is the flicker it caused everywhere else.
+    #[test]
+    fn far_shell_converges_to_the_same_light_as_near_shell() {
+        let mut world = voxlight_shadow_world();
+        let Some(rig) = VoxLightRig::new(&mut world, VL_SUN_TIME) else {
+            eprintln!("far_shell_converges_to_the_same_light_as_near_shell: no GPU adapter, skipping");
+            return;
+        };
+        assert!(rig.count > 8, "need enough blocks to split; got {}", rig.count);
+
+        // Reference: the shipped whole-shell cadence.
+        rig.converge(VOXLIGHT_CONVERGE_ROUNDS);
+        let reference = rig.read_live_pool();
+
+        // Now split the work list down the middle and start over. The partition
+        // reorders `live`, but a block stays bound to its brick, so the pool is
+        // comparable BLOCK BY BLOCK across the reorder.
+        // Split on the BRICK index, not on call order: `repartition` is a
+        // two-pointer pass, so it calls the predicate on the same slot more than
+        // once and a counter would partition something other than what it names.
+        let mut bricks = world.light.live_bricks().to_vec();
+        bricks.sort_unstable();
+        let half = rig.count / 2;
+        let pivot = bricks[half as usize - 1];
+        world.light.repartition(|brick| brick <= pivot);
+        assert_eq!(world.light.near_count(), half, "the split must take");
+        rig.reupload_list(&world);
+        rig.zero_live_pool();
+
+        // NOT VACUOUS: after ONE full near cycle the near group has been visited
+        // once end to end and the far group about 1/FAR_DIV of the way through.
+        // If repartitioning did nothing both fractions would be 1 and the
+        // convergence check below would prove nothing at all.
+        rig.converge_partitioned(half, 0, VOXLIGHT_UPDATE_DIV);
+        let early = rig.read_live_pool();
+
+        let stamped = |pool: &[u32], block: u32| -> usize {
+            let base = block as usize * LIGHT_RECORDS_PER_BLOCK as usize
+                * LIGHT_RECORD_WORDS as usize;
+            (0..LIGHT_RECORDS_PER_BLOCK as usize)
+                .filter(|i| (pool[base + i * 2] >> 16) & 0xFF != 0)
+                .count()
+        };
+        // Blocks are handed out in ascending brick order, and the pivot above
+        // splits on brick index, so the near group is exactly block 0..half.
+        let per_block = LIGHT_RECORDS_PER_BLOCK as f64;
+        let near_frac = (0..half).map(|b| stamped(&early, b)).sum::<usize>() as f64
+            / (half as f64 * per_block);
+        let far_frac = (half..rig.count).map(|b| stamped(&early, b)).sum::<usize>() as f64
+            / ((rig.count - half) as f64 * per_block);
+        eprintln!(
+            "after one near cycle: near {:.1}% of records stamped, far {:.1}%              ({} blocks, split at {half})",
+            near_frac * 100.0, far_frac * 100.0, rig.count,
+        );
+        assert!(near_frac > 0.5, "the near group did not refresh ({near_frac:.3})");
+        assert!(
+            far_frac * 4.0 < near_frac,
+            "the far group refreshed at {far_frac:.3} against the near group's {near_frac:.3};              at far_div {VOXLIGHT_FAR_DIV} it should be around an eighth of it, so the partition              is not reaching the dispatch or the shader"
+        );
+
+        // Give the far group the SAME NUMBER OF VISITS the reference had, FROM
+        // ROUND 0 - the probe above is thrown away rather than continued, so
+        // both runs see an identical sequence of visits from an identical start.
+        rig.zero_live_pool();
+        rig.converge_partitioned(half, 0, VOXLIGHT_CONVERGE_ROUNDS * VOXLIGHT_FAR_DIV);
+        let after = rig.read_live_pool();
+
+        let records = rig.count as usize * LIGHT_RECORDS_PER_BLOCK as usize;
+        let (mut worst, mut worst_at, mut invalid) = (0i32, 0usize, 0usize);
+        for i in 0..records {
+            let (a, b) = (reference[i * 2], after[i * 2]);
+            // A solid voxel is zero in both; skip it rather than count it as a
+            // match, or the assertion could pass on an all-solid brick.
+            if (a >> 16) & 0xFF == 0 {
+                continue;
+            }
+            if (b >> 16) & 0xFF == 0 {
+                invalid += 1;
+                continue;
+            }
+            let d = ((a & 0xFF) as i32 - (b & 0xFF) as i32).abs();
+            if d > worst {
+                worst = d;
+                worst_at = i;
+            }
+        }
+        assert_eq!(invalid, 0, "{invalid} records the reference lit came back with no history");
+        assert_eq!(
+            worst, 0,
+            "far-cadence sun visibility differs from near-cadence by {worst}/255 at record              {worst_at}; the two cadences must converge to the SAME field BIT FOR BIT, because              a visit's estimate depends only on geometry and sun direction, so any difference              is a partition that mis-addresses the work list"
+        );
+    }
+
     #[test]
     fn voxlight_field_populates_and_is_sampled() {
         let mut world = voxlight_shadow_world();

@@ -355,6 +355,17 @@ pub struct World {
     /// Only the brick -> block binding lives here; the light records themselves
     /// are GPU-side and never read back.
     pub light: crate::voxlight::LightField,
+    /// Camera position the light field's near/far partition was last built
+    /// against, in WORLD voxels. `None` = no focus has ever been set, which
+    /// means "treat the whole shell as near" - the state every headless harness
+    /// runs in, and the state the field shipped in.
+    light_focus: Option<glam::Vec3>,
+    /// Reusable scratch for the deduplicated shell walk (see
+    /// `sync_light_shell_dirty`).
+    shell_scratch: Vec<u32>,
+    /// One bit per brick, membership of `shell_scratch`. Always all-zero
+    /// between calls; the walk clears exactly the bits it set.
+    shell_seen: Vec<u64>,
     /// Reusable physics scratch buffers (a sorted snapshot of active_bricks and
     /// the per-tick "touched" set), kept here so the CA tick allocates nothing —
     /// previously it cloned active_bricks twice per tick (checklist: physics).
@@ -433,6 +444,9 @@ impl World {
             active_bricks: Vec::with_capacity(4096),
             dirty_bricks: Vec::with_capacity(4096),
             light: crate::voxlight::LightField::new(crate::voxlight::LIGHT_BLOCKS_MAX),
+            light_focus: None,
+            shell_scratch: Vec::with_capacity(8192),
+            shell_seen: vec![0u64; (WORLD_BRICKS_TOTAL as usize).div_ceil(64)],
             phys_scratch: Vec::with_capacity(4096),
             phys_touched: Vec::with_capacity(8192),
             all_dirty: true,
@@ -903,15 +917,47 @@ impl World {
         // back: the caller still needs it for the brick upload. Moving a Vec
         // costs nothing, so this stays allocation-free.
         let changed = std::mem::take(&mut self.dirty_bricks);
+        // Build the CLOSED NEIGHBOURHOOD once, then evaluate each brick once.
+        //
+        // A brick's own change can flip its NEIGHBOURS' shell membership too:
+        // the empty brick above a surface joins the shell the moment that
+        // surface appears. But dirty bricks arrive in contiguous blobs - a chunk
+        // install marks all 512 of a slot's bricks, a spreading lake marks a
+        // sheet of them - so evaluating brick + 6 neighbours per entry
+        // re-evaluated interior bricks up to seven times each, and each
+        // evaluation is itself up to six more scattered reads.
+        //
+        // The dedup is a BITSET, not a sort. Sorting the 7n neighbourhood was
+        // tried first and measured SLOWER than the redundant work it removed
+        // (0.128 ms mean against 0.072 on `live_session_profile`): the duplicate
+        // evaluations hit cache, because a brick's neighbours are its immediate
+        // index neighbours, while an n log n sort of 21,000 indices does not
+        // amortize against work that cheap. A set-and-test over one bit per
+        // brick is O(1) per probe and just as local.
+        let mut seen = std::mem::take(&mut self.shell_seen);
+        let mut touched = std::mem::take(&mut self.shell_scratch);
+        touched.clear();
         for &bi in &changed {
-            // A brick's own change can flip its NEIGHBOURS' shell membership
-            // too: the empty brick above a surface joins the shell the moment
-            // that surface appears. Evaluate the closed neighbourhood.
-            self.eval_light_shell(bi);
             let (nb, n) = self.brick_neighbours(bi);
-            for k in 0..n {
-                self.eval_light_shell(nb[k]);
+            for &b in std::iter::once(&bi).chain(nb[..n].iter()) {
+                let (w, m) = (b as usize / 64, 1u64 << (b % 64));
+                if seen[w] & m == 0 {
+                    seen[w] |= m;
+                    touched.push(b);
+                }
             }
+        }
+        for &bi in &touched {
+            self.eval_light_shell(bi);
+        }
+        // Clear only the bits that were set, so the next call starts from an
+        // all-zero bitset without touching 128 KB of it.
+        for &b in &touched {
+            seen[b as usize / 64] &= !(1u64 << (b % 64));
+        }
+        self.shell_seen = seen;
+        self.shell_scratch = touched;
+        for &bi in &changed {
             // The geometry under this brick's light moved, so whatever it had
             // accumulated is stale.
             self.light.invalidate(bi);
@@ -926,6 +972,103 @@ impl World {
             self.eval_light_shell(bi);
         }
     }
+
+    /// Radius, in WORLD VOXELS, inside which lit shell is refreshed at the full
+    /// rate. Beyond it the update pass visits a block `VOXLIGHT_FAR_DIV` times
+    /// more rarely (see `LightField::near_count`).
+    ///
+    /// It can be this small because the near group is not "what the camera can
+    /// see" - it is "where a lighting CHANGE has to be picked up quickly". Both
+    /// ways a record becomes unreadable promote themselves into the near group
+    /// regardless of distance (`LightField::promote_near`): a newly bound block,
+    /// and an invalidated one. What is left for the radius to cover is the SUN,
+    /// and the sun crosses the sky in minutes, so eight times slower tracking is
+    /// worth a fraction of a degree of lag on surfaces fog is already eating.
+    ///
+    /// 128 was measured first and was far too generous: on the shipped benchmark
+    /// it classified 48-77% of a 60,000-block shell as near, because lit shell is
+    /// a 3D surface and a sphere that size over hilly terrain and canopy sweeps
+    /// up an enormous amount of it. 64 is a radius no player interaction reaches
+    /// past - build reach is single digits - while still covering the ground the
+    /// camera stands on with a wide margin.
+    pub const LIGHT_NEAR_RADIUS: f32 = 64.0;
+
+    /// How far the focus may drift before the partition is rebuilt, in world
+    /// voxels. A deadband for the same reason streaming has one: repartitioning
+    /// walks the whole work list and re-uploads it, and doing that every frame
+    /// to reproduce almost the same answer is the cost this policy exists to
+    /// avoid. 16 voxels is 1/8 of the radius, so a block is at most 16 voxels
+    /// past the boundary before it is reclassified.
+    const LIGHT_FOCUS_DEADBAND: f32 = 16.0;
+
+    /// Point the light field's refresh priority at `pos` (world voxels).
+    ///
+    /// Rebuilds the near/far partition only when the focus has drifted past the
+    /// deadband, so a still camera pays nothing. Returns true if the partition
+    /// was rebuilt.
+    pub fn set_light_focus(&mut self, pos: glam::Vec3) -> bool {
+        // Two triggers, and BOTH are needed.
+        //
+        // The camera moving is the obvious one. The other is the near group
+        // filling up with PROMOTIONS: every newly bound or invalidated block
+        // joins it regardless of distance and nothing takes it out again except
+        // a repartition, so a still camera watching a lake settle drags the
+        // whole shell into the near group one block at a time. Measured with the
+        // camera trigger alone, the near fraction sat at 43-66% of a 60,000
+        // block shell however far the radius was tightened.
+        //
+        // Threshold is a QUARTER of the near group (with a floor, so it still
+        // fires when the group is small), which makes the rebuild frequency
+        // track how much churn there actually is instead of being a fixed
+        // period: a quiet world never pays it, and a busy one pays a full walk
+        // once per few thousand promotions.
+        let crowded = self.light.promotions() > (self.light.near_count() / 4).max(1024);
+        if !crowded {
+            if let Some(prev) = self.light_focus {
+                if prev.distance_squared(pos)
+                    < Self::LIGHT_FOCUS_DEADBAND * Self::LIGHT_FOCUS_DEADBAND
+                {
+                    return false;
+                }
+            }
+        }
+        self.light_focus = Some(pos);
+        // Storage-space distance with x/z wrapped, which is the same answer as
+        // unfolding every brick to world space and subtracting, without the
+        // unfold. The window holds exactly one world voxel per storage cell and
+        // the fold is a plain modulo (`world_to_slot_voxel`), so the toroidal
+        // separation IS the world separation for anything inside the window.
+        let cs = glam::Vec3::new(
+            pos.x.rem_euclid(WORLD_VOXELS_X as f32),
+            pos.y,
+            pos.z.rem_euclid(WORLD_VOXELS_Z as f32),
+        );
+        let r = Self::LIGHT_NEAR_RADIUS;
+        let r2 = r * r;
+        let (ex, ez) = (WORLD_VOXELS_X as f32, WORLD_VOXELS_Z as f32);
+        self.light.repartition(|bi| {
+            let (bx, by, bz) = brick_coords(bi);
+            // Brick CENTRE, so a brick straddling the boundary is judged once
+            // rather than by whichever corner the caller happened to pick.
+            let c = glam::Vec3::new(
+                bx as f32 * BRICK_DIM as f32 + 2.0,
+                by as f32 * BRICK_DIM as f32 + 2.0,
+                bz as f32 * BRICK_DIM as f32 + 2.0,
+            );
+            let dx = {
+                let d = (c.x - cs.x).abs();
+                d.min(ex - d)
+            };
+            let dz = {
+                let d = (c.z - cs.z).abs();
+                d.min(ez - d)
+            };
+            let dy = c.y - cs.y;
+            dx * dx + dy * dy + dz * dz <= r2
+        });
+        true
+    }
+
 
     fn eval_light_shell(&mut self, bi: u32) {
         if self.brick_needs_light(bi) {

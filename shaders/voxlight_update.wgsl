@@ -8,13 +8,14 @@
 // BRICK_VOXELS exactly, so `local_invocation_index` IS the brick voxel index
 // and no bounds check or remainder loop is needed.
 //
-// Determinism is the design constraint. Each round samples a fixed subset of a
-// fixed direction set (spherical Fibonacci over the sun disc), cycled by epoch,
-// so a static scene and static sun converge to a constant instead of
-// random-walking. That is what makes the result stable rather than noisy, and
-// it is the same shape the GI probe grid already uses (gi_probes.wgsl:248).
+// Determinism is the design constraint, and it is stronger than it used to be:
+// a visit estimates the sun disc COMPLETELY, from a direction set that depends
+// on nothing but the ray index, so a static scene under a static sun converges
+// to a fixed point and then stops changing. Cycling a SUBSET of the set per
+// visit - which is what this did - looks like the same thing and is not: the
+// subsets are different numbers rather than repeated looks at one, so the fold
+// tracked them and the record oscillated for ever. See `vl_sun_visibility`.
 
-const VL_SUN_EPOCHS: u32 = 8u;
 // Weighted 6-face + 12-edge occupancy. Face neighbours block twice the solid
 // angle of an edge neighbour, so 2*6 + 12 = 24 is a fully enclosed voxel.
 const VL_AO_DENOM: f32 = 24.0;
@@ -73,10 +74,29 @@ fn vl_voxel_ao(v: vec3<i32>) -> f32 {
     return clamp(1.0 - vl_params.ao_strength * (occ / VL_AO_DENOM), 0.0, 1.0);
 }
 
-/// Fraction of the sun disc reaching `p`, estimated from this round's slice of
-/// the direction set. Returns a CONTINUOUS value; the caller folds it into the
-/// stored estimate.
-fn vl_sun_visibility(p: vec3<f32>, epoch: u32) -> f32 {
+/// Fraction of the sun disc reaching `p`, over a COMPLETE stratified sampling of
+/// the disc. Returns a CONTINUOUS value; the caller folds it into the stored
+/// estimate.
+///
+/// COMPLETE, not a rotating slice, and that is the whole point. This used to
+/// trace a QUARTER of the direction set per visit, selected by an epoch counter,
+/// and fold it in at 0.35 - on the argument that a full cycle averages to the
+/// true soft shadow. It does not. A penumbra voxel's four quarters are FOUR
+/// DIFFERENT NUMBERS, not four noisy looks at one, so the fold tracks them
+/// instead of averaging them and the record oscillates for ever even on a scene
+/// and a sun that never move. Measured by `voxlight_sun_is_stable_once_converged`
+/// on a static scene: a converged penumbra record swung 89/255 over one epoch
+/// cycle, and `shade_water_top` pushes that through a smoothstep only 45/255
+/// wide, so water at a shadow edge strobed between fully lit and fully shadowed.
+///
+/// The same defect, with the same cause and the same fix, was found in the
+/// (since deleted) reflection field in round E of
+/// docs/rt/BASELINE-per-voxel-lighting.md. It was never applied to this pass.
+///
+/// A complete estimate is a deterministic function of geometry and sun
+/// direction, so a static scene converges to a fixed point and stays there, and
+/// a moving sun tracks it smoothly instead of beating against the epoch cycle.
+fn vl_sun_visibility(p: vec3<f32>) -> f32 {
     let s = sun_dir();
     // Tangent frame around the sun direction so the disc is sampled uniformly
     // regardless of sun azimuth (same construction the old per-pixel cone used).
@@ -87,14 +107,14 @@ fn vl_sun_visibility(p: vec3<f32>, epoch: u32) -> f32 {
     let bitangent = cross(s, tangent);
 
     let rays = max(1u, vl_params.sun_rays);
-    let total = f32(rays * VL_SUN_EPOCHS);
     var lit = 0.0;
     for (var i = 0u; i < rays; i = i + 1u) {
-        // Global index into the full direction set, so successive epochs walk
-        // DIFFERENT directions and a complete cycle covers the disc evenly.
-        let gi = f32(epoch * rays + i);
+        // Sunflower stratification of the disc: equal-area rings from the sqrt,
+        // even azimuth from the golden angle. The set depends on NOTHING but the
+        // ray index, so every visit samples exactly the same directions.
+        let gi = f32(i);
         let ang = gi * 2.39996323;             // golden angle
-        let rad = vl_params.sun_cone * sqrt((gi + 0.5) / total);
+        let rad = vl_params.sun_cone * sqrt((gi + 0.5) / f32(rays));
         let d = normalize(s + (tangent * cos(ang) + bitangent * sin(ang)) * rad);
         if (!shadow_occluded(p, d, SHADOW_MAX_DIST)) {
             lit = lit + 1.0;
@@ -124,12 +144,41 @@ fn vl_point_light(p: vec3<f32>) -> vec3<f32> {
     return sum;
 }
 
+/// This round's work-list entry for workgroup `wg`, or >= `live_count` when the
+/// workgroup has nothing to do.
+///
+/// The list is PARTITIONED near-first (`LightField::near_count`). The near
+/// prefix is walked in `update_div` slices exactly as the whole list used to be;
+/// the far remainder is walked in `update_div * far_div` slices, so a distant
+/// block is visited that many times more rarely. Dispatch size is
+/// `ceil(near/div) + ceil(far/(div*far_div))`, and the two groups are told apart
+/// by the workgroup index alone - one dispatch, and every invocation within a
+/// workgroup takes the same path.
+///
+/// Nothing here depends on the visit COUNT, only on which entry is due, because
+/// each visit re-estimates the sun disc completely (`vl_sun_visibility`). A
+/// scheme that instead spread the disc over successive visits could not survive
+/// this split at all: `round / div` advances by a whole cycle between two
+/// consecutive visits of a far block, so a far block would sample the same slice
+/// of the disc for ever.
+fn vl_work(wg: u32) -> u32 {
+    let div = max(1u, vl_params.update_div);
+    let near = min(vl_params.near_count, vl_params.live_count);
+    let near_wgs = (near + div - 1u) / div;
+    if (wg < near_wgs) {
+        let idx = wg * div + (vl_params.round % div);
+        // A near workgroup must not spill into the far region: it would refresh
+        // a far block at the near cadence.
+        return select(vl_params.live_count, idx, idx < near);
+    }
+    let fdiv = div * max(1u, vl_params.far_div);
+    return near + (wg - near_wgs) * fdiv + (vl_params.round % fdiv);
+}
+
 @compute @workgroup_size(64, 1, 1)
 fn cs_voxel_light_update(@builtin(workgroup_id) wg: vec3<u32>,
                          @builtin(local_invocation_index) li: u32) {
-    let div = max(1u, vl_params.update_div);
-    // This round's slice of the work list.
-    let idx = wg.x * div + (vl_params.round % div);
+    let idx = vl_work(wg.x);
     if (idx >= vl_params.live_count) { return; }
     let brick = vl_live_bricks[idx];
     let block = vl_block_of_brick[brick];
@@ -152,26 +201,29 @@ fn cs_voxel_light_update(@builtin(workgroup_id) wg: vec3<u32>,
     }
 
     let p = vec3<f32>(wv) + vec3<f32>(0.5);
-    let epoch = (vl_params.round / div) % VL_SUN_EPOCHS;
 
     let prev = vl_pool[word];
-    let prev_epoch = (prev >> 16u) & 0xFFu;
-    let fresh_sun = vl_sun_visibility(p, epoch);
+    let prev_valid = ((prev >> 16u) & 0xFFu) != 0u;
+    let fresh_sun = vl_sun_visibility(p);
 
-    // Fold: an exponential average over the direction epochs, so the stored
-    // value converges to the mean visibility over the whole disc. A freshly
-    // bound or invalidated record (epoch 0) takes the fresh estimate outright
-    // rather than blending into whatever the previous tenant left behind.
+    // Fold: a temporal smoother over a COMPLETE estimate, so it damps the sun's
+    // motion and geometry edits without ever oscillating. The input is
+    // stationary for a static scene, so this converges to a fixed point and then
+    // stops moving - which the rotating-slice version it replaced could not do.
+    // A freshly bound or invalidated record has no history and takes the fresh
+    // estimate outright rather than blending into the previous tenant's light.
     var sun = fresh_sun;
-    if (prev_epoch != 0u) {
+    if (prev_valid) {
         sun = mix(f32(prev & 0xFFu) * (1.0 / 255.0), fresh_sun, vl_params.fold);
     }
 
     let ao = vl_voxel_ao(wv);
     let pt = vl_point_light(p);
 
-    // epoch byte: 1..255, never 0, since 0 is the "no valid history" marker.
-    let stamp = 1u + (epoch % 255u);
+    // The third byte is the "this record holds a real estimate" marker and
+    // nothing else now: 0 means no history, non-zero means history. It used to
+    // carry the direction epoch as well, and there are no epochs any more.
+    let stamp = 1u;
     vl_pool[word] = (u32(round(clamp(sun, 0.0, 1.0) * 255.0)))
         | (u32(round(clamp(ao, 0.0, 1.0) * 255.0)) << 8u)
         | (stamp << 16u);

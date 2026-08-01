@@ -35,12 +35,12 @@ const FRAME_CAP_HZ: f64 = 144.0;
 /// many chunks off-centre. A deadband stops the window thrashing (and
 /// regenerating an edge column) when the player walks back and forth across a
 /// single chunk boundary (checklist: prefetch with hysteresis).
-const STREAM_HYSTERESIS: i32 = 2;
+pub(crate) const STREAM_HYSTERESIS: i32 = 2;
 
 /// Max finished chunks installed per frame. Caps how many bricks get marked
 /// dirty (and uploaded) per frame so a chunk cross streams in over a handful of
 /// frames instead of one big hitch (checklist: per-frame upload budget).
-const CHUNK_INSTALL_BUDGET: u32 = 6;
+pub(crate) const CHUNK_INSTALL_BUDGET: u32 = 6;
 
 /// On an idle camera, a 1/N slice of the screen's tiles is re-traced each frame
 /// so animated materials (sky, water, foliage) keep moving. N frames = one full
@@ -72,7 +72,7 @@ pub(crate) struct BenchState {
     // Per-segment GPU-pass attribution, fed from the renderer's profiler
     // samples (1 in 64 dirty frames), deduped by its report counter. The
     // residual (segment frame ms - gpu total) exposes CPU/present cost.
-    gpu_acc: [f64; 9],
+    gpu_acc: [f64; crate::renderer::GPU_PROFILE_LABELS.len()],
     gpu_total: f64,
     gpu_n: u32,
     last_report_seen: u64,
@@ -129,7 +129,7 @@ impl BenchState {
         Some(Self {
             segments: segs, idx: 0, seg_start: Instant::now(),
             dts: Vec::with_capacity(4096), results: Vec::new(),
-            gpu_acc: [0.0; 9], gpu_total: 0.0, gpu_n: 0, last_report_seen: 0,
+            gpu_acc: [0.0; crate::renderer::GPU_PROFILE_LABELS.len()], gpu_total: 0.0, gpu_n: 0, last_report_seen: 0,
         })
     }
 
@@ -166,7 +166,7 @@ impl BenchState {
                     self.results.push(line);
                 }
             }
-            self.gpu_acc = [0.0; 9];
+            self.gpu_acc = [0.0; crate::renderer::GPU_PROFILE_LABELS.len()];
             self.gpu_total = 0.0;
             self.gpu_n = 0;
             self.idx += 1;
@@ -584,7 +584,7 @@ impl App {
                 if let Some(p) = &r.gpu_profiler {
                     if p.reports != b.last_report_seen && p.reports > 0 {
                         b.last_report_seen = p.reports;
-                        for i in 0..9 {
+                        for i in 0..crate::renderer::GPU_PROFILE_LABELS.len() {
                             b.gpu_acc[i] += p.last[i];
                         }
                         b.gpu_total += p.last_total;
@@ -796,6 +796,12 @@ impl App {
                     "cpu frame ms: pre {:.2}  world+upload {:.2}  render(acquire+submit+present) {:.2}  | total {:.2}",
                     m(0), m(1), m(2), m(3)
                 );
+                // The light field's share of "world+upload", in bytes and in
+                // milliseconds. Without this the 4 MiB table re-upload and the
+                // per-recycled-block clears sit inside one aggregate number and
+                // cannot be told apart from the brick DMA beside them.
+                let window = self.cpu_prof[3];
+                log::info!("{}", self.renderer.as_mut().unwrap().take_vl_stats().report(window));
                 self.cpu_prof = [0.0; 4];
                 self.cpu_prof_n = 0;
             }

@@ -69,6 +69,16 @@ pub const LIGHT_BLOCK_NONE: u32 = u32::MAX;
 /// the record's `epoch` byte; the GPU side treats 0 as "no valid history".
 pub const LIGHT_EPOCH_RESET: u32 = 0;
 
+/// Table entries that may be swept into one `write_buffer` rather than split
+/// into two, measured in brick indices (4 bytes each).
+///
+/// A `queue.write_buffer` costs a staging-belt allocation, a memcpy and a
+/// recorded copy - order a microsecond - whichever way the bytes go, while
+/// 1024 extra entries is 4 KiB of memcpy, under half a microsecond at any
+/// plausible bandwidth. So merging across a gap this size is strictly cheaper
+/// than emitting a second write, and the coalescer is told to do it.
+pub const LIGHT_TABLE_UPLOAD_GAP: u32 = 1024;
+
 #[derive(Copy, Clone)]
 struct BlockSlot {
     /// Brick this block is bound to.
@@ -94,12 +104,48 @@ pub struct LightField {
     /// ceiling. Bricks rather than blocks: the shader needs the brick anyway to
     /// locate the voxels, and it can reach the block through `block_of_brick`,
     /// so storing bricks here removes a whole block -> brick GPU table.
+    ///
+    /// PARTITIONED: `live[..near_count]` is the shell close to the camera and
+    /// `live[near_count..]` is everything else. See `near_count`.
     live: Vec<u32>,
+    /// Length of the NEAR prefix of `live`.
+    ///
+    /// The update pass refreshes the near prefix on the normal cadence and the
+    /// far remainder far more slowly, which is the whole of the camera-awareness
+    /// policy. It is a REFRESH RATE and nothing else: every block keeps its
+    /// storage and its converged record, so shading reads exactly the same field
+    /// it read before and no pixel changes path because of this split. A static
+    /// scene under a static sun converges and then stops changing, so refreshing
+    /// distant shell rarely costs nothing observable; a moving sun lags at
+    /// distance, where fog has already saturated.
+    ///
+    /// Distance ONLY, deliberately not the view frustum. A frustum test would
+    /// cut roughly another half, but it makes the refresh rate depend on where
+    /// the camera LOOKS, so a fast turn can face shell that has been starved for
+    /// a second - and the field and the per-pixel fallback do not render
+    /// identically, so that transition is a visible pop. Distance is
+    /// view-independent: turning on the spot changes nothing at all.
+    near_count: usize,
+    /// Blocks promoted into the near group since the last `repartition`.
+    ///
+    /// Promotion is one-way, so without a second trigger a STILL camera watching
+    /// physics accumulates every invalidated block into the near group and the
+    /// partition quietly degrades back to "everything is near" - measured, on
+    /// the shipped benchmark, as a near fraction that stayed at 43-66% however
+    /// far the radius was tightened. This is what tells the policy the partition
+    /// has gone stale for a reason other than camera motion.
+    promotions: u32,
     /// Block indices available for reuse.
     free: Vec<u32>,
     /// Blocks whose accumulation must restart (brick edited, slot recycled).
     /// Drained by the renderer each frame into a GPU upload.
+    ///
+    /// DEDUPED through `reset_queued`: physics dirties the same brick on
+    /// consecutive frames all the time, and a block queued twice is a second
+    /// 512-byte DMA that writes the same zeros.
     pending_reset: Vec<u32>,
+    /// Bitset over BLOCK indices: membership of `pending_reset`.
+    reset_queued: Vec<u64>,
     /// Allocation requests refused because the pool was full, since the last
     /// `take_overflow`. Surfaced rather than silently dropped.
     overflow: u32,
@@ -112,10 +158,20 @@ pub struct LightField {
     /// running total is the number that says "this world does not fit", and it
     /// is reported alongside the delta.
     overflow_total: u32,
-    /// Set whenever a binding changed, so the renderer re-uploads the brick
-    /// table and work list only when they actually differ. Without this the
-    /// frame would push 4 MB of unchanged table every time.
-    table_dirty: bool,
+    /// BRICK indices whose table entry changed since the last upload.
+    ///
+    /// The table is 4 MiB of one u32 per brick and used to go WHOLE on any
+    /// binding change. In a live world that is most frames - flowing water flips
+    /// bricks between empty and non-empty, streaming recycles slots - and it
+    /// measured 278 MB/s of PCIe on the shipped benchmark to move a few kilobytes
+    /// of real change. Recording WHICH entries moved lets the upload push only
+    /// the runs that did.
+    table_touched: Vec<u32>,
+    /// Set when the compact work list changed in contents OR ORDER. Separate
+    /// from `table_touched` because the near/far repartition reorders the list
+    /// without touching a single table entry, and the two are 240 KiB and 4 MiB
+    /// respectively - conflating them would re-push the big one for free.
+    list_dirty: bool,
     /// Blocks in the GPU pool backing this field. Held per instance rather than
     /// read from a constant, so a field can never allocate past the buffer it
     /// was actually handed.
@@ -131,14 +187,18 @@ impl LightField {
             block_of_brick: vec![LIGHT_BLOCK_NONE; WORLD_BRICKS_TOTAL as usize],
             slots: Vec::new(),
             live: Vec::new(),
+            near_count: 0,
+            promotions: 0,
             free: Vec::new(),
             pending_reset: Vec::new(),
+            reset_queued: vec![0u64; (blocks_max as usize).div_ceil(64)],
             overflow: 0,
             overflow_total: 0,
             // The GPU table starts all-NONE and the pool starts zeroed
             // (epoch 0 = invalid), which is exactly the empty state, so the
             // first frame has nothing to re-upload.
-            table_dirty: false,
+            table_touched: Vec::new(),
+            list_dirty: false,
             blocks_max,
         }
     }
@@ -150,9 +210,29 @@ impl LightField {
         self.blocks_max
     }
 
-    /// Whether the brick table / work list changed since the last call, and clear.
-    pub fn take_table_dirty(&mut self) -> bool {
-        std::mem::replace(&mut self.table_dirty, false)
+    /// The brick indices whose table entry changed since the last upload
+    /// (sorted, deduped) together with the table itself, so the caller can push
+    /// only the runs that moved.
+    ///
+    /// Both are returned from ONE call because the caller needs them together
+    /// and they are two borrows of the same field; sorting in place here rather
+    /// than making the caller do it keeps the "sorted and deduped" precondition
+    /// of the span coalescer with the data that has to satisfy it.
+    /// `clear_table_touched` acknowledges the upload.
+    pub fn table_delta(&mut self) -> (&[u32], &[u32]) {
+        self.table_touched.sort_unstable();
+        self.table_touched.dedup();
+        (&self.table_touched, &self.block_of_brick)
+    }
+
+    /// Acknowledge that `table_delta`'s runs have been pushed.
+    pub fn clear_table_touched(&mut self) {
+        self.table_touched.clear();
+    }
+
+    /// Whether the compact work list changed in contents or order, and clear.
+    pub fn take_list_dirty(&mut self) -> bool {
+        std::mem::replace(&mut self.list_dirty, false)
     }
 
     /// Block bound to `brick`, if any.
@@ -169,6 +249,58 @@ impl LightField {
     #[inline]
     pub fn live_bricks(&self) -> &[u32] {
         &self.live
+    }
+
+    /// Length of the NEAR prefix of the work list (see `near_count`).
+    #[inline]
+    pub fn near_count(&self) -> u32 {
+        self.near_count as u32
+    }
+
+    /// Blocks promoted into the near group since the last `repartition`.
+    #[inline]
+    pub fn promotions(&self) -> u32 {
+        self.promotions
+    }
+
+    /// Move every brick for which `near` holds into the front of the work list
+    /// and report whether the order changed.
+    ///
+    /// O(n) with one pass and at most one swap per element - no sort, no
+    /// allocation - because the update pass only needs the two GROUPS separated,
+    /// never the blocks ordered by distance within a group. The caller is
+    /// expected to gate this on the camera having actually moved; walking 60,000
+    /// entries every frame to reproduce the same partition would be its own
+    /// version of the problem this exists to fix.
+    pub fn repartition(&mut self, mut near: impl FnMut(u32) -> bool) -> bool {
+        let mut lo = 0usize;
+        let mut hi = self.live.len();
+        let mut moved = false;
+        while lo < hi {
+            if near(self.live[lo]) {
+                lo += 1;
+            } else {
+                hi -= 1;
+                self.live.swap(lo, hi);
+                self.fix_live_idx(lo);
+                self.fix_live_idx(hi);
+                moved = true;
+            }
+        }
+        if moved || lo != self.near_count {
+            self.list_dirty = true;
+        }
+        self.near_count = lo;
+        self.promotions = 0;
+        moved || self.list_dirty
+    }
+
+    /// Repair the back-pointer of the block bound to `live[i]` after a swap.
+    #[inline]
+    fn fix_live_idx(&mut self, i: usize) {
+        let brick = self.live[i];
+        let block = self.block_of_brick[brick as usize];
+        self.slots[block as usize].live_idx = i as u32;
     }
 
     /// Brick -> block table, uploaded verbatim for the shader-side lookup.
@@ -200,7 +332,7 @@ impl LightField {
                 // and those carry a non-zero epoch, so the sampler would treat
                 // them as valid light for this brick until the block's slice
                 // came round. Queue it for zeroing.
-                self.pending_reset.push(b);
+                self.queue_reset(b);
                 b
             }
             None => {
@@ -216,7 +348,16 @@ impl LightField {
         };
         self.live.push(brick);
         self.block_of_brick[brick as usize] = block;
-        self.table_dirty = true;
+        // A NEW block joins the NEAR partition, whatever its distance: see
+        // `promote_near`.
+        let last = self.live.len() - 1;
+        self.live.swap(self.near_count, last);
+        self.fix_live_idx(self.near_count);
+        self.fix_live_idx(last);
+        self.near_count += 1;
+        self.promotions += 1;
+        self.table_touched.push(brick);
+        self.list_dirty = true;
         // A NEVER-BOUND block needs no reset: the pool buffer starts zeroed and
         // the update pass only ever writes blocks that are in the live list, so
         // an untouched slot already reads as epoch 0 (no valid history). This
@@ -237,29 +378,101 @@ impl LightField {
             None => return,
         };
         self.block_of_brick[brick as usize] = LIGHT_BLOCK_NONE;
-        self.table_dirty = true;
-        // Swap-remove from `live`, repairing the moved entry's back-pointer.
+        self.table_touched.push(brick);
+        self.list_dirty = true;
+        // Remove from `live` while KEEPING THE NEAR PREFIX INTACT. A plain
+        // swap_remove would drag the last (far) entry into the near group and
+        // silently corrupt the partition, so a near entry vacates through the
+        // near boundary first: at most two swaps, still O(1).
         let live_idx = self.slots[block as usize].live_idx as usize;
-        let moved_brick = *self.live.last().expect("live non-empty while a block is bound");
-        self.live.swap_remove(live_idx);
-        if moved_brick != brick {
-            let moved_block = self.block_of_brick[moved_brick as usize];
-            self.slots[moved_block as usize].live_idx = live_idx as u32;
+        let last = self.live.len() - 1;
+        if live_idx < self.near_count {
+            let near_last = self.near_count - 1;
+            if live_idx != near_last {
+                self.live.swap(live_idx, near_last);
+                self.fix_live_idx(live_idx);
+            }
+            if near_last != last {
+                self.live.swap(near_last, last);
+                self.fix_live_idx(near_last);
+            }
+            self.near_count -= 1;
+        } else if live_idx != last {
+            self.live.swap(live_idx, last);
+            self.fix_live_idx(live_idx);
         }
+        self.live.pop();
         self.free.push(block);
     }
 
     /// Restart `brick`'s accumulated estimate (its geometry changed). No-op if
-    /// the brick has no block.
+    /// the brick has no block, and idempotent within a frame.
     pub fn invalidate(&mut self, brick: u32) {
         if let Some(b) = self.block_of(brick) {
-            self.pending_reset.push(b);
+            self.queue_reset(b);
+            // An invalidated block has just had its records zeroed, so until the
+            // update pass reaches it again its voxels shade through the
+            // per-pixel fallback. On the FAR cadence that is up to 64 frames of
+            // one surface visibly rendering through a different path - which is
+            // the flicker this policy must not introduce - so anything that goes
+            // dark is pulled back into the near group until it is lit again.
+            self.promote_near(b);
         }
     }
 
-    /// Drain the blocks needing an accumulation reset.
-    pub fn take_pending_reset(&mut self) -> std::vec::Drain<'_, u32> {
-        self.pending_reset.drain(..)
+    /// Move `block`'s work-list entry into the near group if it is not already
+    /// there. O(1), one swap.
+    ///
+    /// The two callers are the two ways a record stops being readable: a NEW
+    /// block has never had one, and an INVALIDATED block just lost the one it
+    /// had. Both shade through the per-pixel fallback until the update pass
+    /// reaches them, and the fallback does not render identically to the field,
+    /// so both have to be refreshed on the fast cadence no matter how far away
+    /// they are. The next repartition demotes them once they are lit.
+    #[inline]
+    fn promote_near(&mut self, block: u32) {
+        let idx = self.slots[block as usize].live_idx as usize;
+        if idx < self.near_count {
+            return;
+        }
+        self.live.swap(idx, self.near_count);
+        self.fix_live_idx(idx);
+        self.fix_live_idx(self.near_count);
+        self.near_count += 1;
+        self.promotions += 1;
+        self.list_dirty = true;
+    }
+
+    /// Queue `block` for zeroing unless it is already queued.
+    ///
+    /// The dedup is not a micro-optimisation: physics re-dirties the same brick
+    /// on consecutive ticks, and `sync_light_shell_dirty` invalidates every
+    /// dirty brick, so without it one settling lake queues the same 512-byte DMA
+    /// over and over.
+    #[inline]
+    fn queue_reset(&mut self, block: u32) {
+        let (w, bit) = (block as usize / 64, 1u64 << (block % 64));
+        if self.reset_queued[w] & bit != 0 {
+            return;
+        }
+        self.reset_queued[w] |= bit;
+        self.pending_reset.push(block);
+    }
+
+    /// The blocks needing an accumulation reset, SORTED so the caller's span
+    /// coalescer can turn consecutive blocks into one write. Cleared by
+    /// `clear_pending_reset`.
+    pub fn pending_reset(&mut self) -> &[u32] {
+        self.pending_reset.sort_unstable();
+        &self.pending_reset
+    }
+
+    /// Acknowledge that the queued resets have been written.
+    pub fn clear_pending_reset(&mut self) {
+        for &b in &self.pending_reset {
+            self.reset_queued[b as usize / 64] &= !(1u64 << (b % 64));
+        }
+        self.pending_reset.clear();
     }
 
     /// Number of allocation requests refused since the last call, and clear.
@@ -287,6 +500,12 @@ impl LightField {
             self.live.len() + self.free.len(),
             self.slots.len(),
             "live and free must partition the allocated slots"
+        );
+        assert!(
+            self.near_count <= self.live.len(),
+            "near prefix ({}) runs past the work list ({})",
+            self.near_count,
+            self.live.len(),
         );
         let mut seen_bricks = std::collections::HashSet::new();
         let mut live_blocks = std::collections::HashSet::new();
@@ -472,7 +691,7 @@ mod tests {
         let mut lf = LightField::new(LIGHT_BLOCKS_MAX);
         lf.allocate(3);
         assert_eq!(
-            lf.take_pending_reset().count(),
+            lf.pending_reset().len(),
             0,
             "a never-bound block is already zeroed in the pool buffer"
         );
@@ -482,7 +701,7 @@ mod tests {
         lf.release(3);
         let b = lf.allocate(99).unwrap();
         assert_eq!(b, 0, "the freed block should be reused");
-        assert_eq!(lf.take_pending_reset().collect::<Vec<_>>(), vec![0]);
+        assert_eq!(lf.pending_reset(), &[0]);
     }
 
     #[test]
@@ -518,7 +737,7 @@ mod tests {
     fn invalidate_without_a_block_is_a_noop() {
         let mut lf = LightField::new(LIGHT_BLOCKS_MAX);
         lf.invalidate(11);
-        assert_eq!(lf.take_pending_reset().count(), 0);
+        assert_eq!(lf.pending_reset().len(), 0);
     }
 
     #[test]
@@ -566,6 +785,157 @@ mod tests {
         assert_eq!(end, LIGHT_POOL_WORDS, "the last block must end exactly at the pool end");
     }
 
+    /// The near/far split must survive `release`, which is the one operation
+    /// that moves an element it was not asked about.
+    ///
+    /// A plain `swap_remove` drags the LAST entry into the hole. When the hole is
+    /// in the near prefix and the last entry is far, that silently promotes a
+    /// distant block to the near cadence and, worse, leaves `near_count`
+    /// describing a list it no longer describes. Nothing downstream would ever
+    /// notice: the field would still render, just refreshing the wrong blocks.
+    #[test]
+    fn release_preserves_the_near_far_partition() {
+        let mut lf = LightField::new(LIGHT_BLOCKS_MAX);
+        for brick in 0..8u32 {
+            lf.allocate(brick).unwrap();
+        }
+        // Bricks 0..4 near, 4..8 far.
+        lf.repartition(|b| b < 4);
+        assert_eq!(lf.near_count(), 4);
+        let near: std::collections::HashSet<u32> =
+            lf.live_bricks()[..4].iter().copied().collect();
+        assert_eq!(near, (0..4).collect(), "the near prefix must be exactly the near bricks");
+
+        // Release from the MIDDLE of the near prefix.
+        lf.release(1);
+        lf.debug_assert_consistent();
+        assert_eq!(lf.near_count(), 3, "the near group lost exactly one member");
+        let near: std::collections::HashSet<u32> =
+            lf.live_bricks()[..3].iter().copied().collect();
+        assert_eq!(near, [0u32, 2, 3].into_iter().collect(), "no far brick promoted itself");
+        let far: std::collections::HashSet<u32> =
+            lf.live_bricks()[3..].iter().copied().collect();
+        assert_eq!(far, (4..8).collect(), "the far group is intact");
+
+        // And from the far group, where near_count must NOT move.
+        lf.release(6);
+        lf.debug_assert_consistent();
+        assert_eq!(lf.near_count(), 3);
+        let far: std::collections::HashSet<u32> =
+            lf.live_bricks()[3..].iter().copied().collect();
+        assert_eq!(far, [4u32, 5, 7].into_iter().collect());
+    }
+
+    /// A newly bound block joins the NEAR group, wherever it is.
+    ///
+    /// It has no converged record, so until it gets one its voxels shade through
+    /// the per-pixel fallback - and the two paths do not look identical. Making
+    /// new blocks wait out a far refresh period would put that difference on
+    /// screen for up to a second after a player places a block.
+    #[test]
+    fn a_new_block_starts_near() {
+        let mut lf = LightField::new(LIGHT_BLOCKS_MAX);
+        for brick in 0..4u32 {
+            lf.allocate(brick).unwrap();
+        }
+        lf.repartition(|_| false);
+        assert_eq!(lf.near_count(), 0, "nothing is near");
+        lf.allocate(99).unwrap();
+        assert_eq!(lf.near_count(), 1);
+        assert_eq!(lf.live_bricks()[0], 99, "the new brick sits in the near prefix");
+        lf.debug_assert_consistent();
+    }
+
+    /// Repartitioning must not lose or duplicate a block, and must leave every
+    /// back-pointer usable.
+    #[test]
+    fn repartition_is_a_permutation() {
+        let mut lf = LightField::new(LIGHT_BLOCKS_MAX);
+        for brick in 0..64u32 {
+            lf.allocate(brick).unwrap();
+        }
+        lf.repartition(|b| b % 3 == 0);
+        lf.debug_assert_consistent();
+        assert_eq!(lf.near_count(), 22, "0,3,..,63 is 22 bricks");
+        assert!(lf.live_bricks()[..22].iter().all(|b| b % 3 == 0));
+        assert!(lf.live_bricks()[22..].iter().all(|b| b % 3 != 0));
+        let all: std::collections::HashSet<u32> = lf.live_bricks().iter().copied().collect();
+        assert_eq!(all, (0..64).collect(), "every brick survives the permutation");
+        // Re-partitioning the other way must be just as clean, including the
+        // back-pointers a later release depends on.
+        lf.repartition(|b| b % 2 == 0);
+        lf.debug_assert_consistent();
+        assert_eq!(lf.near_count(), 32);
+        for brick in 0..64u32 {
+            lf.release(brick);
+            lf.debug_assert_consistent();
+        }
+        assert_eq!(lf.allocated(), 0);
+        assert_eq!(lf.near_count(), 0);
+    }
+
+    /// Queueing the same block twice must produce ONE reset.
+    ///
+    /// Physics re-dirties the same brick tick after tick and every dirty brick
+    /// is invalidated, so without the dedup a settling lake re-queues the same
+    /// 512-byte DMA indefinitely.
+    #[test]
+    fn resets_are_deduped_and_sorted() {
+        let mut lf = LightField::new(LIGHT_BLOCKS_MAX);
+        for brick in [5u32, 9, 1] {
+            lf.allocate(brick).unwrap();
+        }
+        lf.invalidate(5);
+        lf.invalidate(5);
+        lf.invalidate(9);
+        lf.invalidate(5);
+        let blocks: Vec<u32> = lf.pending_reset().to_vec();
+        assert_eq!(blocks.len(), 2, "three invalidates of two bricks are two resets");
+        assert!(blocks.windows(2).all(|w| w[0] < w[1]), "sorted, so runs coalesce");
+        // Clearing must also clear the membership marks, or the block could
+        // never be queued again.
+        lf.clear_pending_reset();
+        assert!(lf.pending_reset().is_empty());
+        lf.invalidate(5);
+        assert_eq!(lf.pending_reset().len(), 1, "a cleared block can be queued again");
+    }
+
+    /// The table delta must name every brick whose entry moved and nothing else.
+    ///
+    /// This is what replaced a 4 MiB whole-table push, so an entry that changed
+    /// without being recorded is a stale GPU table: the shader would read a block
+    /// index for a brick that no longer owns it, i.e. one brick's light on
+    /// another, and only in a live world where bindings churn.
+    #[test]
+    fn the_table_delta_names_exactly_the_entries_that_moved() {
+        let mut lf = LightField::new(LIGHT_BLOCKS_MAX);
+        lf.allocate(10).unwrap();
+        lf.allocate(11).unwrap();
+        {
+            let (touched, _) = lf.table_delta();
+            assert_eq!(touched, &[10, 11]);
+        }
+        lf.clear_table_touched();
+        {
+            let (touched, _) = lf.table_delta();
+            assert!(touched.is_empty(), "a quiet frame pushes nothing");
+        }
+        // A no-op allocate and a no-op release must not dirty anything.
+        lf.allocate(10).unwrap();
+        lf.release(999);
+        {
+            let (touched, _) = lf.table_delta();
+            assert!(touched.is_empty(), "no-ops must not push 4 MiB");
+        }
+        // A real release, and the value at that index must be readable through
+        // the same call.
+        lf.release(11);
+        let (touched, table) = lf.table_delta();
+        assert_eq!(touched, &[11]);
+        assert_eq!(table[11], LIGHT_BLOCK_NONE);
+        assert_ne!(table[10], LIGHT_BLOCK_NONE);
+    }
+
     #[test]
     fn churn_preserves_every_invariant() {
         // Streaming frees and rebinds whole slots constantly; walk a
@@ -576,12 +946,21 @@ mod tests {
         }
         let mut lf = LightField::new(LIGHT_BLOCKS_MAX);
         let mut rng = 12345u32;
-        for _ in 0..4000 {
+        for i in 0..4000 {
             let brick = lcg(&mut rng) % 512;
             if lcg(&mut rng) % 3 == 0 {
                 lf.release(brick);
             } else {
                 lf.allocate(brick);
+            }
+            // Repartition mid-churn, as a moving camera does: allocate, release
+            // and repartition all rewrite `live_idx`, and they have to agree.
+            if i % 97 == 0 {
+                let pivot = lcg(&mut rng) % 512;
+                lf.repartition(|b| b < pivot);
+                lf.debug_assert_consistent();
+                assert!(lf.live_bricks()[..lf.near_count() as usize].iter().all(|&b| b < pivot));
+                assert!(lf.live_bricks()[lf.near_count() as usize..].iter().all(|&b| b >= pivot));
             }
         }
         lf.debug_assert_consistent();

@@ -363,6 +363,13 @@ struct VoxLightParams {
     light_count: u32,
     fold: f32,
     ao_strength: f32,
+    // Length of the NEAR prefix of `vl_live_bricks`. The update pass walks that
+    // prefix on the `update_div` cadence and the remainder `far_div` times more
+    // rarely - the whole camera-awareness policy is these two numbers.
+    near_count: u32,
+    // Extra division applied to the FAR remainder, on top of `update_div`.
+    far_div: u32,
+    _pad: vec2<u32>,
 };
 
 struct VlPointLight {

@@ -583,8 +583,243 @@ read is the whole of this change's part 2.
   band. It is honest at that distance - foam seen from 20 cm IS a solid white
   mass - but it is the one frame in the set that does not sell itself.
 
+## Round G: measuring a LIVE session, which nothing had ever done
+
+Round G starts from a user report - the game runs slowly - that every number in
+rounds A to F contradicts. Both were true, because every number in rounds A to F
+came out of `rt_vs_software_timing`, and that harness builds ONE static crafted
+world: no physics tick, no streaming, no `upload_world`, no `Renderer`. Three
+cost classes are invisible to it BY CONSTRUCTION, and two of them were large.
+
+### The harness that was missing
+
+`live_session_profile` (`src/renderer.rs`, ignored by default) runs the real
+world with `physics::tick` at 30 Hz, real `shift_origin` /
+`install_finished_chunks` streaming, the real `upload_voxlight`, and the real
+update dispatch at the block count a streamed world actually binds. It paces
+itself at 60 Hz because chunk generation is asynchronous - a loop running flat
+out finishes before the worker pool produces anything and measures a world that
+never streams. It reports CPU milliseconds per stage and GPU milliseconds per
+pass SEPARATELY.
+
+`GPU_PROFILE_LABELS` also gained `vlight`: the light-field update used to share
+the `probe` bracket with the GI probe update, so the single largest world-space
+GPU cost in the frame was unattributable in the only profiler that watches the
+real renderer.
+
+### What it found: the update pass is the largest GPU pass in the frame
+
+With the split label, on the in-game benchmark at 1920x1080:
+
+| segment       | vlight | probe | main | gpu total | vlight share |
+|---------------|--------|-------|------|-----------|--------------|
+| water_mid     | 1.02   | 0.49  | 0.72 | 5.19      | 20%          |
+| water_grazing | 0.95   | 0.47  | 0.61 | 5.38      | 18%          |
+| water_strafe  | 0.96   | 0.48  | 3.22 | 7.38      | 13%          |
+| terrain       | 1.29   | 0.52  | 1.22 | 4.72      | 27%          |
+| foliage       | 2.09   | 0.57  | 2.42 | 6.86      | 30%          |
+| meadow        | 1.49   | 0.58  | 0.61 | 4.60      | 32%          |
+
+It is LARGER THAN THE RAYMARCH on four of the six segments, and it is the one
+pass in the frame whose cost has nothing to do with what is on screen: it walked
+the entire resident shell every eight frames with no idea where the camera was.
+
+### And the per-frame CPU upload, which fires in bursts
+
+Same run, from the new `voxlight upload:` log line:
+
+    47 / 120 frames dirty (39%), 278 MB/s table + 24 MB/s resets,
+    295 write_buffer calls per frame (35,336 reset blocks),
+    cpu 0.12 ms shell + 0.68 ms upload per frame
+
+278 MB/s is the 4 MiB brick -> block table going WHOLE on any binding change, and
+295 writes per frame is one 512-byte DMA per invalidated block - installing a
+streamed chunk marks all 512 of a slot's bricks dirty and every one of them
+invalidates its block. In the quiet segments (camera parked, water settled) it is
+0 MB/s and 0 writes, which is exactly why the static harness never saw it: this
+is a STUTTER, not a steady tax, and only a live session has one.
+
+### The fixes
+
+1. CAMERA-AWARE UPDATE. `LightField` partitions its work list near-first
+   (`near_count`); `cs_voxel_light_update` walks the near prefix on the old
+   cadence and the far remainder `VOXLIGHT_FAR_DIV` = 8 times more rarely, from
+   ONE dispatch. It is a REFRESH RATE and nothing else - every block keeps its
+   storage and its converged record, so shading reads the same field and no pixel
+   changes path. Pinned by `far_shell_converges_to_the_same_light_as_near_shell`,
+   which converges both groups and asserts they agree BIT FOR BIT.
+
+   Anything with no readable record promotes itself into the near group whatever
+   its distance (`promote_near`): a newly bound block, and an invalidated one.
+   That is what lets the radius be 64 voxels rather than a guess at "what the
+   camera can see" - measured at 128 it classified 48-77% of the shell as near,
+   because lit shell is a 3D surface and a sphere that size over hills and canopy
+   sweeps up an enormous amount of it.
+
+   The partition is rebuilt when the camera drifts 16 voxels OR when promotions
+   exceed a quarter of the near group. BOTH triggers are needed: promotion is
+   one-way, so with the camera trigger alone a still camera watching a lake
+   settle dragged the whole shell into the near group one block at a time and the
+   near fraction stayed at 43-66% however far the radius was tightened.
+2. DELTA TABLE UPLOAD. `LightField` records which brick entries changed;
+   `upload_voxlight` pushes only those runs through the existing `upload_spans`,
+   which gained a gap tolerance so a scattered handful of changes is not a
+   scattered handful of DMAs. The work list has a SEPARATE flag: it is 240 KiB
+   against the table's 4 MiB and it changes on a different trigger (the
+   repartition reorders it without moving a single table entry).
+3. BATCHED RESETS. Recycled and invalidated blocks are deduped through a bitset
+   and coalesced into runs of consecutive blocks, one write each. NO gap merging
+   here, unlike the table: a block between two resets is another brick's LIVE
+   block and sweeping it up would erase converged light.
+4. BITSET DEDUP IN THE SHELL WALK. `sync_light_shell_dirty` evaluated brick + 6
+   neighbours per dirty brick, and dirty bricks arrive in contiguous blobs, so
+   interior bricks were evaluated up to seven times each. A SORT was tried first
+   and measured SLOWER than the redundant work it removed (0.128 ms mean against
+   0.072); one bit per brick is O(1) per probe and just as local.
+
+### Measured, `live_session_profile`, same machine, same session
+
+600 frames, camera walking at 24 voxels/s, physics at 30 Hz, 3 origin shifts,
+393,216 dirty bricks (max 3,072 on one frame).
+
+| per frame, ms              | before            | after             |
+|----------------------------|-------------------|-------------------|
+| sync_light_shell_dirty     | 0.072 / p99 0.438 | 0.052 / p99 0.333 |
+| set_light_focus (new)      | -                 | 0.041 / p99 1.052 |
+| upload_voxlight            | 0.206 / p99 2.357 | 0.048 / p99 0.512 |
+| table traffic              | 40.6 MB/s         | 2.56 MB/s         |
+| write_buffer calls / frame | 75.5              | 13.2              |
+| reset blocks, 600 frames   | 45,136            | 25,245            |
+
+The light field's whole CPU cost goes 0.278 ms mean to 0.141 ms, and the TAIL -
+which is what a stutter is - goes 3.0 ms to 0.5 ms.
+
+GPU, timed in the SAME run so thermal drift cannot forge it (both lines are 200
+warm-up plus 60 timed submits, back to back):
+
+    whole shell near (49,086 blocks, 6,136 workgroups): 3.64 ms
+    camera-aware     (1,246 near,      904 workgroups): 0.95 ms
+
+3.8x, and the near prefix is 2.4-6.5% of the shell over the walk.
+
+`rt_vs_software_timing` now prints the same pair on the demo world, and it agrees:
+
+    light pass, whole shell near (60,174 blocks, 7,522 workgroups): 4.66 ms
+    camera-aware               ( 2,692 near,     1,236 workgroups): 1.11 ms
+
+The shipped path therefore pays 1.11 ms where the same harness measured 2.05 ms
+before this round (whole shell, 4 rays per visit), on a run whose software column
+reads 9% hotter - so roughly half, while ALSO doubling the estimator's angular
+resolution and removing the oscillation. The FIELD A/B columns are unchanged
+within their usual spread: terrain -1.51 ms, water-close -0.93 ms,
+terrain-covered -4.21 ms, foliage +1.04 ms.
+
+### The water flicker: the leading theory was wrong, and the real cause was worse
+
+The report was that shadows on water are too flickery, and the leading theory was
+that the faceted-water rework and the light field are fighting: the surface
+height is quantized and animated, so the shading point steps across voxel
+boundaries and lands on a different record each step.
+
+THAT IS WRONG, and wrong by construction rather than by measurement error.
+`water_plate_height_does_not_move_the_light_sample` samples the field at all
+SEVEN quantized plate heights across a shadow edge and gets BYTE-IDENTICAL
+answers at every one. The reason is the sampler's solidity gate: the plate lives
+inside the water cell (0.48..0.96 of it), the water voxel under it is occupied so
+that tap is dropped and its weight renormalised away, and the whole answer comes
+from the row of air voxels ABOVE the cell - whose weight then cancels. The height
+divides out exactly.
+
+The real cause is the ESTIMATOR, and it was in the plan document as a claim: "a
+complete cycle folds an exact soft-shadow estimate, so a static scene converges
+to the true penumbra and then stops changing". It does not. The pass traced a
+QUARTER of the sun-disc direction set per visit, selected by an epoch counter,
+and folded it in at 0.35. A penumbra voxel's four quarters are four DIFFERENT
+NUMBERS, not four noisy looks at one, so the fold tracked them instead of
+averaging them.
+
+Measured by `voxlight_sun_is_stable_once_converged`, static scene, static sun:
+
+| quantity                                           | before       | after |
+|----------------------------------------------------|--------------|-------|
+| worst swing of a converged record over one cycle    | 93/255       | 0/255 |
+| worst swing inside the penumbra band                | 89/255       | 0/255 |
+| penumbra records swinging past half the water step  | 2670 of 2670 | 0     |
+
+`shade_water_top` pushes that value through `smoothstep(0.41, 0.59, sun_vis)`, a
+band 45/255 wide, so an 89/255 swing at a half-lit voxel is the ENTIRE difference
+between lit water and shadowed water, every few frames, with nothing in the scene
+moving. Terrain multiplies by the same value linearly and wobbles by a few
+percent, which is why this reads as a water bug and not a lighting bug.
+
+It is the same defect, with the same cause and the same fix, that round E found
+and fixed in the per-voxel REFLECTION field. It was never applied to this pass.
+
+The fix makes a visit's estimate COMPLETE: a fixed sunflower stratification of
+the disc depending on nothing but the ray index, so a static scene converges to a
+fixed point and stays there and a moving sun tracks it smoothly. Rays per visit
+went 4 -> 8, because rays-per-visit is now also the angular RESOLUTION - the old
+scheme's time-average was a 32-ray answer even though each visit traced 4, and 4
+stable rays would have been a five-level penumbra ladder.
+
+What that costs in the look, against a 32-ray reference over 123,446 records
+(`eight_sun_rays_match_a_dense_estimate`): mean 0.58/255, p99 16/255, p99.9
+40/255. The tail sits exactly at (1/8 + 1/32) * 255 = 39.8, which is what two
+non-nested stratifications of one disc can disagree by at a hard edge, and p99 at
+16/255 is what says the coarsening really is confined to the penumbra.
+
+### Flicker rig, before and after
+
+`flicker_probe_rt_views` gained two views it needed and never had:
+`water_top_field`, and the `water_shadow` pair on the crafted wall-in-a-sheet
+scene. Every water number this rig had ever produced was taken with
+`voxlight: false`, i.e. against the per-pixel fallback, so "the field makes water
+flicker" was untestable in it. `water_top` also turned out to frame a pond in
+FULL SUN, where the lit/shadowed smoothstep is saturated and reads the same
+whichever path answers - which is why its field and no-field lines agree to
+eleven pixels and settle nothing.
+
+| view                  | before          | after           |
+|-----------------------|-----------------|-----------------|
+| water_top (fallback)  | 5807 (0.280%)   | 5807 (0.280%)   |
+| water_top_field       | 5796 (0.280%)   | 5796 (0.280%)   |
+| water_graze_nofield   | 5562 (0.268%)   | 5562 (0.268%)   |
+| water_graze_field     | 3833 (0.185%)   | 3802 (0.183%)   |
+| water_shadow_nofield  | 2472 (0.119%)   | 2472 (0.119%)   |
+| water_shadow_field    | 2472 (0.119%)   | 2472 (0.119%)   |
+| terrain_trees         | 23793 (1.147%)  | 23793 (1.147%)  |
+| tree_shadow           | 19691 (0.950%)  | 19691 (0.950%)  |
+| meadow                | 4913 (0.237%)   | 4913 (0.237%)   |
+
+READ THAT HONESTLY: the rig barely moves, and it CANNOT show this fix. Its worlds
+are static and its sun advances 6e-5 rad per frame, so the penumbra band is a
+line a couple of voxels wide and the oscillation had almost nothing to strobe.
+The measurement that shows both the defect and the fix is
+`voxlight_sun_is_stable_once_converged`, which reads the stored value directly
+instead of hunting for its consequences in a still scene. What the rig does
+establish is that nothing REGRESSED, and that the non-field views are unchanged
+to the pixel.
+
+### What this round does NOT claim
+
+End-to-end FPS before and after is NOT quoted, because this machine's thermal
+spread swamped it during the session: the same code and the same six benchmark
+segments read terrain 205 fps on one run and 117 on another, and
+`rt_vs_software_timing`'s own software column - a path none of this work touches -
+moved 21.25 -> 24.39 ms between the before and after runs. The numbers quoted
+above are the ones measured within a single run against their own control: the
+GPU pass A/B, the FIELD A/B columns, and the CPU counters.
+
+`rt_vs_software_timing` now prints the light pass BOTH ways for exactly this
+reason. It binds the shell with `sync_light_shell_all` and no camera, so its
+whole-shell line is the cost of refreshing a 60,000-block world every eight
+frames regardless of where anyone is standing, which is what the renderer used to
+do and is not what it does now. Quoting only that line overstates the live cost
+several times over.
+
 ## Reproducing
 
+    cargo test --lib live_session_profile -- --ignored --nocapture
     cargo test --lib rt_vs_software_timing -- --nocapture --ignored
     cargo test --lib dump_lookdev_views -- --ignored --nocapture
     cargo test --lib flicker_probe_rt_views -- --ignored --nocapture

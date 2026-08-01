@@ -150,23 +150,48 @@ generated. The pool is already a free list with O(1) release
 bound is a policy change in `sync_light_shell_*` rather than a storage
 redesign. `LightField::overflow_total` now makes the trigger for it visible.
 
+The REFRESH half of that idea is already there (`World::set_light_focus`, round
+G), and it deliberately stops short of bounding ALLOCATION: a block outside the
+radius keeps its storage and its converged record and is only revisited more
+rarely, so nothing falls back to the per-pixel path and no boundary is visible.
+Bounding allocation would put a ring in the world where the two shading paths
+meet, and that is a different, larger decision.
+
 ## Update pass: amortized and deterministic
 
 A new compute pass `cs_voxel_light_update` slots in directly after the GI
 probe update, reusing that pass's proven amortization shape.
 
-- The work list is the compact array of allocated blocks.
-- Each frame updates 1/8 of the blocks, strided by a round counter, so the
-  whole resident field refreshes in 8 frames.
+- The work list is the compact array of allocated blocks, PARTITIONED
+  near-first: `LightField::near_count` splits it into shell within
+  `World::LIGHT_NEAR_RADIUS` of the camera and everything else.
+- Each frame updates 1/8 of the NEAR blocks and 1/64 of the far ones, strided by
+  a round counter, from one dispatch. This is a refresh RATE and nothing else:
+  every block keeps its storage and its converged record, so shading reads the
+  same field it read before and no pixel changes path. Anything with no readable
+  record - a newly bound block, an invalidated one - promotes itself into the
+  near group whatever its distance. See round G of the baseline for why this was
+  needed (the pass was the largest single GPU cost in the frame and had no idea
+  where the camera was) and for the measurement that pins the two groups
+  converging to the same field bit for bit.
 - Per air voxel in the block:
   - AO from neighbour occupancy. Purely geometric, so it is written once and
     only recomputed when the brick's voxels change.
-  - `sun_vis` from K rays across the sun DISC, using a deterministic
-    spherical-Fibonacci direction set cycled over epochs exactly as the probe
-    grid cycles its 8 rays over 8 epochs (`gi_probes.wgsl:248`). A complete
-    cycle folds an exact soft-shadow estimate, so a static scene converges to
-    the true penumbra and then stops changing. Determinism is what keeps the
-    result stable instead of noisy.
+  - `sun_vis` from K rays across the sun DISC, over a COMPLETE sunflower
+    stratification of it, evaluated in full on every visit.
+
+    IT USED TO CYCLE A QUARTER OF THE SET PER VISIT over epochs, exactly as the
+    probe grid cycles its 8 rays (`gi_probes.wgsl:248`), on the claim that "a
+    complete cycle folds an exact soft-shadow estimate, so a static scene
+    converges to the true penumbra and then stops changing". THAT CLAIM WAS
+    FALSE and it is withdrawn. A penumbra voxel's four quarters are four
+    different numbers rather than four noisy looks at one, so the fold tracked
+    them instead of averaging them: a converged record swung 89/255 on a static
+    scene under a static sun, and `shade_water_top` reads it through a smoothstep
+    only 45/255 wide, so water at a shadow edge strobed between lit and
+    shadowed. This is the same defect round E found in the (now deleted)
+    reflection field, and it was never applied here. Measured, fixed and pinned
+    by `voxlight_sun_is_stable_once_converged`; see round G of the baseline.
   - Point lights gathered from the light list, radius-culled, shadow-tested.
 
 A moving sun is handled better here than by the current dither: every epoch
@@ -383,6 +408,14 @@ Nothing here is judged by eye alone or declared done off a compile.
   it is recorded in "Reflections: BUILT, MEASURED, AND DELETED" above and in
   rounds D and E of the baseline, because the reasoning is worth keeping even
   though the code is not.
+- THE UPDATE PASS IS CAMERA-AWARE, and this entry is CLOSED. It used to walk
+  the whole resident shell every eight frames whether or not any of it was on
+  screen, which on a streamed world made it the LARGEST single GPU pass in the
+  frame - 0.95 to 2.09 ms, 18-32% of GPU time, ahead of the raymarch on four of
+  six benchmark segments. The work list is now partitioned near-first and the far
+  group refreshes eight times more rarely. Round G of the baseline has the
+  numbers, the two triggers that keep the partition honest, and the test that
+  proves both groups converge to the same field.
 - AO IS RECOMPUTED EVERY ROUND for no reason. It is purely geometric, so
   eighteen occupancy lookups per voxel per round are repeated work; it only
   needs recomputing when the record is reset or its brick is edited.
