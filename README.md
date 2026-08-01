@@ -31,19 +31,20 @@ Traversal and performance:
 
 Shading and effects:
 
-- **Water**: real sub-voxel displaced geometry — each surface water voxel renders a bilinear patch over
-  four per-corner heights. A corner takes the mean fill level of the up-to-4 water columns sharing it
-  (so mixed physics levels L1-L8 ramp smoothly), displaced by a continuous four-wave Gerstner spectrum
-  sampled at the corner's world position (swell λ26, sea λ13, chop λ7 and λ3.5 voxels); any
-  corner-sharing column with water one cell up pins the corner to the cell top, so water bodies that
-  touch diagonally or at different heights knit into one connected surface instead of isolated plates.
-  Shared corners are computed identically from every sharing cell, so continuity is exact and vertical
-  water walls appear only at shores, waterfalls and level steps. Shading uses the carried terrace
-  gradient plus the exact per-pixel field normal; the far LOD tier falls back to a centre-sampled
-  facet. Schlick Fresnel mixes a traced reflection with a Snell-refracted trace beneath the surface
-  (η = 1/1.33); Beer-Lambert per-channel absorption, shoreline foam from underwater hit distance gated
-  by wave crests, a caustic approximation, specular sun glints, and a separate absorption post-effect
-  when the camera is submerged.
+- **Water**: deliberately STYLIZED and faceted rather than photoreal. Each surface water voxel renders
+  one horizontal plate at one quantized height with one flat normal, both taken from a four-wave
+  Gerstner spectrum sampled at the cell centre (swell λ26, sea λ13, chop λ7 and λ3.5 voxels) and
+  quantized to seven height bands and five slope steps per axis. Every pixel of a cell therefore shades
+  identically and the lake reads as a staircase of discrete plates that step up and down as the
+  wavefront passes; where a neighbouring plate stands higher the ray enters below this cell's plate and
+  the entry face is the hit, so a staircase of independent plates is watertight without any shared-corner
+  machinery. The surface reads as LIT or SHADOWED off the per-voxel light field's sun visibility through
+  a hard-ish step, with a flat tone ladder per wave band, Beer-Lambert per-channel absorption over a
+  Snell-refracted trace beneath the surface (η = 1/1.33), a capped Fresnel blend toward the sky at
+  grazing angles, hard-edged quantized foam at wave crests and shorelines drawn from authored
+  quarter-voxel stamps (`src/sprites.rs`), and a separate absorption post-effect when the camera is
+  submerged. Water does not reflect: neither the per-pixel mirror nor the per-voxel reflected-radiance
+  cache that briefly replaced it survives (see `docs/VOXEL_LIGHTING_PLAN.md`).
 - **Glass**: Fresnel reflection plus per-channel refraction for chromatic dispersion (n = 1.48/1.50/1.52),
   total-internal-reflection fallback to the reflected ray, distance-compounding tint; the 3-trace
   dispersion path is gated to grazing angles.

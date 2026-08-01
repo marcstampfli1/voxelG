@@ -104,27 +104,29 @@ World-resident, independent of resolution:
     light pool                 67.1 MB   131,072 blocks * 512 B (60,174 live)
     light brick->block table    4.2 MB   one u32 per brick
     light work list             0.5 MB
-    reflection pool            16.8 MB   16,384 blocks * 1 KiB (2,050 live)
-    reflection table + list     4.3 MB
     GI probe grid              25.2 MB   131,072 probes * 192 B
     occupancy pyramid + hints   1.2 MB
     ------------------------------------
-                              194.8 MB
+                              173.7 MB
 
 Screen-space, at 1920x1080 in the shipped RT + probe-GI configuration:
 
-    transp records + godray scratch + refl history   74.6 MB
+    transp records + godray scratch                  41.4 MB
     GI accumulation (gi_in + gi_out, Rgba32Float)    66.4 MB
     lighting reprojection cache (out + hist)         66.4 MB
     HDR scene + geometry (Rgba16Float)               33.2 MB
     depth, LDR, resolve, bloom, cloud, beam          33.4 MB
     ------------------------------------------------------
-                                                    274.0 MB
+                                                    240.8 MB
 
-Total ~469 MB, plus the RT acceleration structures (not accounted here). The
-light field is 14% of that and the SECOND largest world-resident item after
+Total ~415 MB, plus the RT acceleration structures (not accounted here). The
+light field is 16% of that and the SECOND largest world-resident item after
 the brick pyramid it sits beside, which is proportionate for the thing that
 carries all shadowing, AO and local light.
+
+Both totals came down when the reflection field was deleted (2026-08-01): 21.1 MB
+of world-resident pool and table, and 33.2 MB of screen-space reflection history
+in `transp_buf`, which stylized water has nothing to accumulate into.
 
 It would NOT have been proportionate the other way round, and that is
 measured rather than argued. The 393,216-block pool the broken membership
@@ -190,43 +192,94 @@ one fetch:
   exactly and more cheaply.
 - If all 8 are unusable, fall back to the probe grid term alone.
 
-## Reflections
+## Reflections: BUILT, MEASURED, AND DELETED
 
-Decision (Marc, 2026-07-31): reflections go fully per-voxel, accepting that a
-view-independent cache cannot reproduce a true mirror. Recorded honestly: the
-half-res reflection experiment was already rejected on looks
-(`docs/PERF.md:142`), and per-voxel is a coarser reduction than that was, so
-the water is expected to read flatter. Stills get captured and judged rather
-than argued about.
+Decision (Marc, 2026-07-31): reflections go fully per-voxel. Decision (Marc,
+2026-08-01): they come out entirely, and water becomes deliberately stylized
+instead. The whole per-voxel reflection field is gone - the update pass, its
+pipelines, its pool and tables, its three group-0 bindings, `voxlight_reflection`
+and its four tests - along with the per-pixel mirror trace it fell back to and
+the full-res reflection history that fed it. Glass keeps its own per-pixel
+mirror, which predates all of this.
 
-Within that decision, the storage is chosen to give the best result a
-per-voxel scheme can:
-- Only REFLECTIVE voxels (water surface, glass) get a record, so this is a
-  small sparse set, not another whole-world array.
-- Each stores SH-L1 directional radiance rather than one flat colour. Same
-  per-voxel spatial resolution, but evaluating the SH along the reflection
-  direction retains coarse view dependence for free instead of collapsing the
-  surface to a single wash.
-- One reflection ray per reflective voxel per round, folded into the SH.
-- SAMPLING IS BILINEAR IN THE SURFACE PLANE, not nearest-voxel. This is not a
-  refinement, it is the difference between a surface and a grid: read
-  per-voxel, the field renders water as a patchwork of flat axis-aligned
-  tiles, each a slightly different blue, with a hard step at every voxel
-  boundary. Blending the four records around the sample point across the two
-  axes perpendicular to the normal is what turns the samples back into a
-  surface, and it is the same reason `voxlight_sample` interpolates.
-  Bilinear rather than trilinear because a reflective surface is a sheet one
-  voxel thick, so across the normal there is no second record to blend with.
-  Taps are gated like the light field's: a neighbour with no block or an
-  unwritten record is dropped and the surviving weights renormalised, so the
-  shore of a lake blends toward its own interior rather than toward garbage.
-  The SH COEFFICIENTS are blended and the fit evaluated once; the
-  reconstruction is linear in the moments, so that agrees with blending four
-  evaluated colours everywhere except at the out-of-hemisphere reject and the
-  clamp at zero, both of which are judgements that belong on the blended
-  record. Measured by `voxlight_refl_is_continuous_across_voxel_boundaries`:
-  the step across a cell boundary is 4% of the difference between the two
-  cells' own centres, against 100% for a nearest lookup.
+It is recorded here rather than deleted from the record, because the reason it
+came out is a RESULT and not a preference.
+
+The storage was chosen to give the best result a per-voxel scheme can: only
+reflective voxels got a record; each held SH-L1 directional radiance rather than
+one flat colour, so evaluating along the reflection direction kept coarse view
+dependence; sampling was bilinear in the surface plane, which is the difference
+between a surface and a visible grid of tiles. Three real defects were found and
+fixed in it (a random-walking estimator, a moment matrix solved with the wrong
+measure, and a fit evaluated about the shading normal instead of the gather
+axis), and after those fixes it was measurably STABLER than the per-pixel mirror
+it replaced - 26x fewer strongly flickering pixels on a grazing water view.
+
+What could not be fixed is the basis. The sky's luma over an elevation sweep runs
+0.83 (horizon) -> 0.54 (30 deg) -> 0.83 (70 deg) -> 0.75 (zenith): it has an
+INTERIOR MINIMUM. An L1 reconstruction restricted to a great circle of elevations
+is `a + R*cos(e - phi)`, which over [0,90] admits an interior MAXIMUM only, so a
+linear fit cannot be bright at both ends with a dip between them and the
+least-squares answer is to go flat. Measured, the cache read 0.60 -> 0.65 -> 0.64
+across that sweep, a span of 0.06 against the sky's 0.30, and it ran between
+0.67x and 1.96x the true mirror. Over the band where the reflection carried scene
+content it kept 62.6% of the mirror's spatial contrast at r = 0.76: recognisable
+trees became voxel-scale blobs. Raising that needs an L2 term - 9 coefficients
+per channel instead of 4, roughly 37 MB of pool instead of 16.8 MB - and that is
+a memory price for a photoreal effect the art direction no longer wants.
+
+So the water was not made to reflect better. It was made to stop reflecting.
+
+## Water instead: stylized, faceted, lit-or-shadowed
+
+The replacement is not "the reflection term with a cheaper reflection in it". It
+is a different surface.
+
+- ONE FLAT FACET PER CELL. Every surface water voxel renders one horizontal
+  plate at one quantized height (7 bands over +-0.24 voxels) with one quantized
+  normal (5 slope steps per axis), both from the same Gerstner field sampled at
+  the CELL CENTRE. Every pixel of a cell shades identically by construction. The
+  wave still travels: a cell steps between bands as the wavefront passes.
+- THE CORNER MACHINERY IS GONE with the surface it existed for. Pins, the
+  step-down fold, the two-triangle split and the separate near/far tiers were
+  all there to make neighbouring cells share exact corner heights so the lake was
+  ONE watertight sheet. A faceted lake does not want to be one sheet. What it
+  must not have is holes, and it does not: where a neighbour's plate stands
+  higher the ray enters this cell BELOW its own plate and the entry face is the
+  hit. Cost per surface cell went from up to 24 neighbour probes to 4, and those
+  4 only inside foam range.
+- LIT OR SHADOWED, not reflective. `shade_water_top` reads the per-voxel sun
+  visibility the light field already stores - about world +Y, so a whole plate
+  shares one value - and pushes it through a narrow smoothstep. Water in sun
+  reads bright; water in shadow reads at 0.42 of it with a crisp edge. Measured
+  on a wall cast across a sheet: the shadowed side sits at 0.316 of the lit side
+  and the 0.72-0.90 transition band is 1.1% of the shaded pixels.
+- THE FRESNEL BLEND TOWARD SKY IS KEPT, and capped at 0.45. Kept because
+  without it a lake is one flat blue field from the shore to the horizon - the
+  facet ladder gives cell-scale texture but nothing changes with view angle, so
+  it reads as paint. Capped because the raw Schlick curve runs to 1.0 at graze
+  and turned the terrace lab's low camera into a sheet of milky horizon sky with
+  every facet washed out of it. It blends toward `fog_atmospheric`, the
+  emitter-free sky, so a facet stepping into the mirror direction cannot pop the
+  sun disc or a star.
+- FOAM IS PER-CELL AND HARD-EDGED. A cell foams at a wave crest (top bands, and
+  only half of those - see below) or at the edge of the water body. The stamp is
+  authored ASCII art in `src/sprites.rs` following the same convention as the
+  foliage sprites, but laid out as a LIBRARY of sixteen 4x4 shapes that a
+  per-cell hash indexes, at quarter-voxel texels. Foam takes three values -
+  none, body, highlight - and there is no ramp anywhere in it.
+
+Two numbers here were measured rather than assumed, and both changed the design:
+
+- CREST FOAM IS AMPLIFIED BY GRAZING ANGLE. A crest cell's plate stands 0.16
+  voxels proud and a shallow ray stops at the FIRST plate it dips below, so
+  crests occlude the troughs behind them. Band >= 2 is 13.9% of cells by area
+  (Monte Carlo over the four waves) but covered 24% of a low-angle crop - five
+  times its footprint share, and it read as a white chequerboard. Only half of
+  crest cells now break.
+- THE SHORE TEST IS "NOT WATER", NOT "SOLID". A lake whose rim sits below its
+  surface - water at y on ground at y-1, the common case - has AIR at every
+  lateral neighbour, so a solid-only test foamed nothing at all on it.
 
 ## Point lights
 
@@ -249,10 +302,11 @@ This is a net simplification, not an addition. It removes:
 One world-space mechanism replaces a screen-space cache plus a per-pixel
 trace plus a staleness heuristic. No second path is left that can drift.
 
-Secondary rays gain the most: reflection and glass hits currently re-shade
-fully and deliberately bypass the cache (`raymarch.wgsl:3545`, "secondary
-rays don't use the reprojection cache"), paying a shadow ray, an AO
-evaluation and an 8-probe GI gather per hit. They become one field fetch.
+Secondary rays gain the most: refraction and glass hits re-shade fully and
+deliberately bypass the cache ("secondary rays don't use the reprojection
+cache"), paying a shadow ray, an AO evaluation and an 8-probe GI gather per hit.
+They become one field fetch. Water's own reflection ray no longer exists to
+gain anything (see "Reflections: BUILT, MEASURED, AND DELETED").
 
 ## Invalidation
 
@@ -280,7 +334,10 @@ Nothing here is judged by eye alone or declared done off a compile.
   recorded in `docs/PERF.md` were taken on different hardware and are not
   comparable.
 - Look: `dump_lookdev_views` stills read directly, including the water views
-  that the reflection decision most affects.
+  that the water decisions most affect (`water_view`, `water_graze`,
+  `water_terrace`, and `water_shadow`, which was ADDED for the stylized rework
+  because no natural camera in the demo world has shadowed open water in
+  frame).
 
 ## Staging and current status
 
@@ -300,82 +357,32 @@ Nothing here is judged by eye alone or declared done off a compile.
 5. PARTIAL - point lights are gathered by the update pass, uploaded, and
    surfaced through `Renderer::set_point_lights`. Nothing in the game calls it
    yet, and there is no test covering a lit point light.
-6. DONE - per-voxel reflections: SH-L1 records for water tops and glass faces,
-   an amortized update pass on the same round counter as the light field but on
-   its OWN divisor (`VOXLIGHT_REFL_UPDATE_DIV`, eight times rarer and a
-   COMPLETE hemisphere gather each visit), and a bilinear surface-plane
-   sampler. The look cost the decision predicted is REAL and is recorded
-   honestly in round D of `docs/rt/BASELINE-per-voxel-lighting.md`: the tiling
-   is gone, the under-reconstruction is not.
-
-   Two defects behind the "flickery and not correctly reflecting" report were
-   found and fixed after round D, both in the estimator/fit rather than in the
-   storage or the sampling (round E):
-   - the update pass folded ONE ray of a rotating direction set per visit, so
-     the record random-walked instead of converging (22.7-46.8% peak-to-peak on
-     a static scene; now 0.0%);
-   - the reconstruction solved its moment matrix with a COSINE-weighted
-     `E[(d.t)^2] = 1/4` while the update pass samples uniformly in solid angle,
-     over-weighting the whole view-dependent term by exactly 4/3;
-   - and the sampler evaluated the fit about the SHADING normal rather than the
-     axis the moments were gathered about, which at a steep terrace facet both
-     mis-solved the hemisphere and disabled the out-of-hemisphere reject.
-7. DONE BY CONSTRUCTION - secondary rays read the field. Reflection and glass
+6. BUILT, THEN DELETED - per-voxel reflections. Rounds D and E built it,
+   measured it, fixed three real defects in it and then measured the residual
+   as a hard limit of the L1 basis rather than a bug. Round F removes it and
+   restyles the water. See "Reflections: BUILT, MEASURED, AND DELETED" above
+   for what was learnt and why it did not survive; the numbers are in rounds
+   D, E and F of `docs/rt/BASELINE-per-voxel-lighting.md`.
+7. DONE BY CONSTRUCTION - secondary rays read the field. Refraction and glass
    hits are shaded through the same `shade`, which fetches `voxlight_sample`
    (`raymarch.wgsl`, search `let vlf =`), so a secondary hit pays one field
-   fetch instead of a shadow ray plus an AO evaluation.
-8. DONE - rounds A through D in `docs/rt/BASELINE-per-voxel-lighting.md`,
+   fetch instead of a shadow ray plus an AO evaluation. Water's own surface now
+   reads the field DIRECTLY, in `shade_water_top`, for its lit/shadowed term.
+8. DONE - rounds A through F in `docs/rt/BASELINE-per-voxel-lighting.md`,
    including the populated-field A/B that rounds A-C could not measure.
 
 ### Known follow-ups found while building
 
-- TEMPORAL STABILITY WAS UNMEASURED, IS NOW MEASURED, AND IT WAS BROKEN. This
-  was the whole of the "flickery" half of the user report and it is FIXED. The
-  reflection pass used to visit a block every `VOXLIGHT_UPDATE_DIV` rounds and
-  fold ONE ray of a rotating eight-direction set at 0.125. A hemisphere over
-  water spans an order of magnitude in radiance between the sky overhead and
-  the terrain at the rim, so those eight directions are not eight noisy looks
-  at one number - they are eight different numbers, and an exponential average
-  over them is not the hemisphere mean at any instant. It random-walks behind
-  the direction cycle for ever.
-
-  Measured on a static scene, a static sun and a FIXED query direction
-  (`voxlight_refl_diagnose`, section C): 22.7-46.8% peak-to-peak, with a stored
-  `E[L*d.z]` of -0.17 where the true moment is unambiguously positive. The fix
-  is the one this entry predicted - the probe grid's shape, "fold only finished
-  estimates" - applied as: visit each block eight times more RARELY
-  (`VOXLIGHT_REFL_UPDATE_DIV`) and gather a COMPLETE stratified hemisphere on
-  each visit, for identical rays per frame. The direction set no longer depends
-  on the round either, because rotating it converts a fixed quadrature bias
-  into a varying one, which is flicker by another name.
-
-  The same measurement now reads 0.0% - the record is BITWISE constant once
-  converged - and `m_z` reads +0.035, the right sign. Pinned by
-  `voxlight_refl_record_is_stable_across_rounds`, which fails at 16.6% on the
-  old estimator. `flicker_probe_rt_views` was also finally run against a
-  grazing water view as an A/B, and that is the number that matters most: the
-  per-voxel cache flickers 26x LESS than the per-pixel reflection it replaces
-  (0.023% of pixels strongly flickering against 0.593%) at the same mean luma.
-- THE SAMPLER RE-POLES THE FIT ONTO THE SHADING NORMAL, which is not the axis
-  the record was gathered about. The update pass fits water about world +Y and
-  glass about `vlr_glass_face`; `shade_water_top` and `shade_glass` both pass
-  `hit.normal`. Only the pole-dependent terms move (`m_r` uses `refl_dir`
-  either way), so the error tracks the tilt:
-  - Open water is FINE and this was checked rather than assumed. The Gerstner
-    facet is bounded at 3.0 degrees (max slope 0.0525 from `wave_param`), so
-    the pole term moves under 0.2%, and a full facet-cone sweep moves the
-    reconstruction 0.107 luma against the mirror's own 0.323. The update pass's
-    "a per-facet pole would buy nothing" comment is therefore CORRECT, and the
-    leading theory that the animated normal is what makes water flicker is
-    WRONG - the cache moves LESS than the mirror it replaces, not more.
-  - Terrace steps and pinned corners are NOT fine. The connected surface
-    reaches 45 degrees there, and re-poling also makes `c = dot(refl_dir, n)`
-    read near 1, so the fit believes every query is a pole query and the
-    out-of-hemisphere reject can never fire. Measured at 45 degrees of tilt: 0
-    misses in 16 azimuths, cache spanning 0.43 luma where the mirror spans
-    1.88. Those voxels should be falling back to the per-pixel trace and are
-    not. OPEN; the fix is to pass the gather axis (the dominant axis of `n`)
-    as the pole and keep `refl_dir` as the query, which restores the reject.
+- THE REFLECTION FIELD'S OWN FOLLOW-UPS ARE CLOSED BY DELETION, not by fixing.
+  Three of them were real and were fixed before the deletion (the random-walking
+  estimator, the moment matrix solved with a cosine-weighted measure while the
+  update pass sampled uniformly, and a fit evaluated about the shading normal
+  instead of the gather axis); two were still open when the field came out (the
+  reflection pass's dispatch shape, 33 workgroups instead of 257 after the
+  estimator reshape, and the L2 basis the grazing residual would need). All of
+  it is recorded in "Reflections: BUILT, MEASURED, AND DELETED" above and in
+  rounds D and E of the baseline, because the reasoning is worth keeping even
+  though the code is not.
 - AO IS RECOMPUTED EVERY ROUND for no reason. It is purely geometric, so
   eighteen occupancy lookups per voxel per round are repeated work; it only
   needs recomputing when the record is reset or its brick is edited.
@@ -438,3 +445,9 @@ mechanism instead of a screen-space cache plus a per-pixel trace plus a
 staleness heuristic - has not landed. Two paths still exist and can drift.
 Removing them is only safe once the field is proven to cover the cases they
 handle, which is what the measurement stage is for.
+
+Water is the one surface where that fallback is now a SINGLE binary ray rather
+than the old cone: `shade_water_top` takes `vlf.sun` when the field answers and
+one `shadow_occluded` from just above the cell's top face when it does not. The
+crafted test scenes bind no shell, so that path is exercised on every run rather
+than left to rot.

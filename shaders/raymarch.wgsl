@@ -86,9 +86,9 @@ fn pack_light_cache(shadow: f32, ao: f32, sun_y: f32) -> u32 {
 }
 
 // Deferred transparent pass (#16). cs_main records each transparent (water-top /
-// glass) hit here as (t_hit, mat_code, normal_code, flag) and writes a cheap
-// placeholder colour; the separate cs_transparent pass does the expensive
-// reflection/refraction so the opaque-majority warps in cs_main stay coherent
+// glass) hit here as (t_hit, kind, facet/face code, facet payload) and writes a
+// cheap placeholder colour; the separate cs_transparent pass does the expensive
+// refraction/dispersion so the opaque-majority warps in cs_main stay coherent
 // (less 8x8 divergence). A read_write storage buffer (not a texture) lets both
 // passes share this binding without a read/write aliasing hazard.
 // Deferred transparent records, one per pixel. Explicit u32 schema (bit
@@ -96,20 +96,17 @@ fn pack_light_cache(shadow: f32, ao: f32, sun_y: f32) -> u32 {
 // payloads on all hardware):
 //   x = bitcast<u32>(t_hit)
 //   y = kind: TR_NONE / TR_WATER_TOP / TR_WATER_FACE / TR_GLASS
-//   z = TR_WATER_TOP: pack2x16float(rest-gradient of the surface, i.e. the
-//       level/step part without the wave field - cs_transparent adds the
-//       per-pixel field gradient on top); TR_WATER_FACE/TR_GLASS: axis face
-//       code (encode_face_normal)
-//   w = spare (0)
+//   z = TR_WATER_TOP: pack2x16float(the cell's QUANTIZED facet slope, which is
+//       the whole normal - cs_transparent adds nothing per pixel);
+//       TR_WATER_FACE/TR_GLASS: axis face code (encode_face_normal)
+//   w = TR_WATER_TOP: the cell's wave band + solid-neighbour mask
+//       (water_pack_facet), which drive the facet tone and the foam; 0 otherwise
+//
+// The buffer used to carry a THIRD region, a full-res temporal reflection
+// history for the water mirror. Stylized water has no reflection to accumulate,
+// so that region is gone and this allocation lost a full-res RGBA32 image
+// (33 MB at 1920x1080).
 @group(0) @binding(17) var<storage, read_write> transp_buf: array<vec4<u32>>;
-
-// Reflection history region of transp_buf (third region, after the per-pixel
-// records and the half-res god-ray scratch): rgb (f16x3) + the water surface
-// point that produced it, for reuse validation.
-fn refl_hist_idx(px: vec2<i32>, res: vec2<i32>) -> i32 {
-    let half_res = (res + vec2<i32>(1)) / 2;
-    return res.x * res.y + half_res.x * half_res.y + px.y * res.x + px.x;
-}
 
 const TR_NONE:       u32 = 0u;
 const TR_WATER_TOP:  u32 = 1u;
@@ -366,26 +363,6 @@ struct VoxLightParams {
     light_count: u32,
     fold: f32,
     ao_strength: f32,
-    // Reflection cache (see the block after voxlight_sample). It rides the same
-    // params buffer and round counter as the light field, but NOT the same
-    // divisor: see `refl_update_div`.
-    refl_live_count: u32,
-    refl_rays: u32,
-    refl_fold: f32,
-    // The reflection pass's own amortization divisor.
-    //
-    // It cannot share the light field's. The two passes fold estimates with
-    // completely different variance: a sun-visibility estimate samples a disc a
-    // couple of degrees wide, so any subset of its rays agrees with any other
-    // and a partial estimate is nearly a whole one. A reflection estimate
-    // samples a whole HEMISPHERE whose radiance spans an order of magnitude
-    // between the sky above and the terrain at the rim, so a partial estimate
-    // is not an approximation of the full one - it is a different number. The
-    // reflection pass therefore visits each block RARELY and gathers a COMPLETE
-    // stratified hemisphere every visit (`refl_rays` = VL_REFL_EPOCHS), for the
-    // same rays per frame as the old visit-often-gather-one shape and without
-    // its round-to-round walk. See the block comment on cs_voxel_refl_update.
-    refl_update_div: u32,
 };
 
 struct VlPointLight {
@@ -404,15 +381,6 @@ struct VlPointLight {
 @group(0) @binding(24) var<storage, read> vl_live_bricks: array<u32>;
 @group(0) @binding(25) var<uniform> vl_params: VoxLightParams;
 @group(0) @binding(26) var<storage, read> vl_lights: array<VlPointLight>;
-
-// Reflection cache, same three-buffer shape as the light field above (pool +
-// brick->block table + compact live list) but its own pool, because only
-// REFLECTIVE voxels get a record and that set is orders of magnitude smaller
-// than the lit air shell. Sharing one pool would force the wider 4-word stride
-// onto every lit voxel in the world.
-@group(0) @binding(27) var<storage, read_write> refl_pool: array<u32>;
-@group(0) @binding(28) var<storage, read> refl_block_of_brick: array<u32>;
-@group(0) @binding(29) var<storage, read> refl_live_bricks: array<u32>;
 
 // Shared-exponent HDR packing for the local-light term. One word holds a
 // radiance that can exceed 1.0 without an extra buffer.
@@ -531,298 +499,6 @@ fn voxlight_sample(p_world: vec3<f32>, n: vec3<f32>) -> VoxLight {
     return o;
 }
 
-// ---------------------------------------------------------------------------
-// Per-voxel reflection cache (docs/VOXEL_LIGHTING_PLAN.md, "Reflections").
-//
-// Only REFLECTIVE voxels (water surfaces, glass) get a record, so this is a
-// small sparse set rather than another whole-world array. Each record stores
-// SH-L1 DIRECTIONAL radiance rather than one flat colour. That is deliberate:
-// it is the same per-voxel SPATIAL resolution either way, but evaluating the SH
-// along the reflection direction keeps coarse VIEW dependence for free instead
-// of collapsing the surface to a single wash. A view-independent cache can
-// never be a true mirror; the SH is the most a per-voxel scheme can give, and
-// the per-pixel trace stays as the fallback for any voxel it cannot answer for.
-//
-// Record: 4 words per voxel, block stride 64 * 4 = 256.
-//   word0 = m0        mean radiance over the sampled hemisphere   (DC term)
-//   word1 = mx + m0   mean of radiance * ray.x, DC-biased         (x term)
-//   word2 = my + m0   mean of radiance * ray.y, DC-biased         (y term)
-//   word3 = mz + m0   mean of radiance * ray.z, DC-biased         (z term)
-//
-// The DC bias exists because vl_pack_rgb9e5 stores non-negative values only
-// while the directional moments are signed. It is EXACT, not a lossy clamp: the
-// moments are E[L * d_a] with L >= 0 and |d_a| <= 1, so |m_a| <= m0 holds by
-// construction and m_a + m0 always lands in [0, 2*m0].
-//
-// UNWRITTEN vs CONVERGED-TO-BLACK. An all-zero record means NEVER WRITTEN, and
-// that is unambiguous rather than merely harmless: the update pass floors the
-// stored DC at VL_REFL_MIN before packing, and rgb9e5 encodes any value at or
-// above that floor with a mantissa of at least 256 (the shared exponent is
-// derived from the largest channel), so word0 of a written record can never be
-// 0. VL_REFL_MIN is a fortieth of one 8-bit colour LSB, so the floor is
-// invisible by bound while making "black" and "absent" distinguishable.
-// ---------------------------------------------------------------------------
-
-const VL_REFL_RECORD_WORDS: u32 = 4u;
-// 64 voxels per brick * 4 words per record.
-const VL_REFL_BLOCK_WORDS: u32 = 256u;
-// Written-record floor on the DC term. See the note above.
-const VL_REFL_MIN: f32 = 1.0e-4;
-
-/// First pool word of a world voxel's REFLECTION record, or VL_NONE when the
-/// voxel is outside the window or its brick has no reflection block. Mirrors
-/// vl_record_word against the reflection pool's own brick table and stride.
-fn refl_record_word(world_v: vec3<i32>) -> u32 {
-    let rel = world_v - camera.world_origin;
-    if (rel.x < 0 || rel.x >= WORLD_VOXELS_X
-     || rel.y < 0 || rel.y >= WORLD_VOXELS_Y
-     || rel.z < 0 || rel.z >= WORLD_VOXELS_Z) {
-        return VL_NONE;
-    }
-    let v = world_to_slot_voxel(world_v);
-    let bp = v >> vec3<u32>(2u);
-    let bi = world_brick_idx(bp.x, bp.y, bp.z);
-    let block = refl_block_of_brick[u32(bi)];
-    if (block == VL_NONE) { return VL_NONE; }
-    let local = v - bp * BRICK_DIM;
-    let vi = brick_voxel_idx(local.x, local.y, local.z);
-    return block * VL_REFL_BLOCK_WORDS + u32(vi) * VL_REFL_RECORD_WORDS;
-}
-
-/// Cached reflected radiance for a point on a reflective surface.
-///
-/// Reads the record of the REFLECTIVE VOXEL ITSELF, not of an air neighbour:
-/// the reflected radiance is a property of that surface. (The sun/AO field is
-/// the other way round - visibility belongs to the air cell against the face -
-/// which is why the two samplers do not share a lookup.)
-///
-/// `n` is the SHADING normal and `refl_dir` is the direction to evaluate.
-/// `*ok` comes back false - leaving the caller on its per-pixel path - when
-/// there is no block, when the record has never been written, or when the query
-/// direction lies so far outside the recorded hemisphere that the linear fit
-/// reconstructs a strongly negative radiance, which is proof the record does
-/// not describe it.
-///
-/// `n` IS NOT EXACTLY THE POLE THE RECORD WAS FITTED ABOUT, and the fit below
-/// uses it as though it were. The update pass gathers water about world +Y and
-/// glass about `vlr_glass_face`, both axis aligned; the callers pass
-/// `hit.normal`, which for water is the animated Gerstner facet or, at a
-/// terrace step, the connected surface's own slope. Only the pole-dependent
-/// terms (`m_n` and `c`) are affected - the view-dependent `m_r` term uses
-/// `refl_dir` directly either way - so the error is the size of the tilt, and
-/// the two cases are very different:
-///
-///   - OPEN WATER: the Gerstner facet is bounded at 3.0 degrees of tilt (max
-///     slope 0.0525, from the four amplitudes and wavenumbers in `wave_param`),
-///     so the cosine of the pole error is 0.9986 and the pole term moves by
-///     under 0.2%. Negligible, and MEASURED negligible: sweeping a full facet
-///     cone moves the reconstruction by 0.107 luma where the true mirror moves
-///     0.323 over the same sweep (`voxlight_refl_diagnose`, section B).
-///   - TERRACE STEPS AND PINNED CORNERS: the surface connection reaches 45
-///     degrees, where the pole error is large. Re-poling the fit onto the
-///     query surface's own normal also makes `c = dot(refl_dir, n)` read near
-///     1, so the fit believes every query is a POLE query and the
-///     out-of-hemisphere reject cannot fire: the record answers confidently
-///     for a direction it never sampled. Measured at 45 degrees: 0 misses in
-///     16 azimuths, cache spanning 0.43 luma where the mirror spans 1.88.
-///
-/// That is a real limitation at shorelines. It is NOT fixed here, and it is
-/// recorded in docs/VOXEL_LIGHTING_PLAN.md rather than left implied by a
-/// comment claiming `n` identifies the fitted hemisphere, which it does not.
-///
-/// BILINEAR IN THE SURFACE PLANE. A nearest-voxel read of this field renders
-/// water as a patchwork of flat axis-aligned tiles, one per voxel footprint,
-/// each a slightly different blue - the record set is per-voxel, so reading it
-/// per-voxel makes the storage grid itself visible and erases every
-/// wave-scale gradient. Blending the four records around the sample point in
-/// the surface plane is what turns a set of samples back into a surface, and
-/// is the same reason `voxlight_sample` interpolates rather than point-sampling.
-///
-/// Bilinear rather than trilinear ON PURPOSE: a reflective surface is a sheet
-/// one voxel thick (a lake top, a window pane), so across the NORMAL there is
-/// no second record to blend with - the cell on one side is submerged and the
-/// one on the other is air, and both are cleared to "never written". A
-/// trilinear tap set would spend four of its eight taps on cells that are
-/// rejected by construction.
-///
-/// Taps are gated exactly as `voxlight_sample` gates its own: a neighbour with
-/// no reflection block (the shore of a lake) or an unwritten record (a
-/// non-reflective voxel sharing the block) is DROPPED and the surviving
-/// weights renormalised, so an edge blends toward its own interior instead of
-/// toward garbage.
-fn voxlight_reflection(p_world: vec3<f32>, n: vec3<f32>, refl_dir: vec3<f32>,
-                       ok: ptr<function, bool>) -> vec3<f32> {
-    *ok = false;
-    // Step a hair back along the normal so floor() lands INSIDE the reflective
-    // cell: a glass hit sits exactly on the cube face, and a water plate can
-    // sit flush with its cell's top face, so plain floor(p) can name the air
-    // voxel in front instead.
-    let q = p_world - n * 0.02;
-    let v = vec3<i32>(floor(q));
-    let w = refl_record_word(v);
-    if (w == VL_NONE) { return vec3<f32>(0.0); }
-    let w0 = refl_pool[w];
-    let w1 = refl_pool[w + 1u];
-    let w2 = refl_pool[w + 2u];
-    let w3 = refl_pool[w + 3u];
-    // All zero == never written. Guaranteed distinct from converged-to-black by
-    // the update pass's DC floor (see the block comment above).
-    //
-    // Checked on the HIT voxel's OWN record and treated as a full miss, not as
-    // one dropped tap: the cache describes the surface that was hit, so a voxel
-    // it has nothing for must fall back to the per-pixel trace rather than
-    // borrow its neighbours' reflections.
-    if ((w0 | w1 | w2 | w3) == 0u) { return vec3<f32>(0.0); }
-
-    // The DOMINANT AXIS of the normal, which is both the pole the record was
-    // gathered about and the axis the surface plane is perpendicular to. Both
-    // reflective materials present axis-aligned faces - water reflects off its
-    // cell top (gathered about world +Y), glass off one cube face (gathered
-    // about `vlr_glass_face`) - so quantising `n` to its dominant axis RECOVERS
-    // the gather axis from a shading normal that has been tilted away from it
-    // by the wave field or by a terrace connection.
-    //
-    // Deriving the pole and the two in-plane axes from one branch keeps them
-    // consistent by construction: the plane axes are exactly the two the pole
-    // is not.
-    var pole = vec3<f32>(0.0, sign(n.y), 0.0);
-    var e0 = vec3<f32>(1.0, 0.0, 0.0);
-    var e1 = vec3<f32>(0.0, 0.0, 1.0);
-    let an = abs(n);
-    if (an.x >= an.y && an.x >= an.z) {
-        pole = vec3<f32>(sign(n.x), 0.0, 0.0);
-        e0 = vec3<f32>(0.0, 1.0, 0.0);
-        e1 = vec3<f32>(0.0, 0.0, 1.0);
-    } else if (an.z >= an.x && an.z >= an.y) {
-        pole = vec3<f32>(0.0, 0.0, sign(n.z));
-        e0 = vec3<f32>(1.0, 0.0, 0.0);
-        e1 = vec3<f32>(0.0, 1.0, 0.0);
-    }
-
-    // Weights about the CELL CENTRE, so the lattice is the voxel centres and
-    // not the voxel corners: a point in the middle of its cell reads that cell
-    // alone, a point on a cell boundary reads both sides equally, and the
-    // result is continuous ACROSS the boundary. The centre tap therefore always
-    // carries at least a quarter of the weight, which is what makes it the
-    // right record to gate the whole sample on above.
-    let d = (q - floor(q)) - vec3<f32>(0.5);
-    // sign() is 0 for a component that sits exactly on the centre, which pairs
-    // with a zero weight below, so the degenerate tap costs nothing.
-    let s = vec3<i32>(sign(d));
-    let o0 = vec3<i32>(e0) * s;
-    let o1 = vec3<i32>(e1) * s;
-    let f0 = abs(dot(d, e0));
-    let f1 = abs(dot(d, e1));
-
-    // Accumulate the SH COEFFICIENTS and fit ONCE, rather than fitting each
-    // record and blending four colours. The reconstruction is linear in the
-    // moments for a fixed (n, refl_dir), so the two agree everywhere except at
-    // this function's two nonlinearities - the out-of-hemisphere reject and the
-    // clamp at zero - and both of those are judgements about "does this surface
-    // describe this direction", which belong on the blended record rather than
-    // on each tap. It is also three reconstructions cheaper.
-    var wsum = (1.0 - f0) * (1.0 - f1);
-    let cm0 = vl_unpack_rgb9e5(w0);
-    var acc0 = cm0 * wsum;
-    // The DC bias is undone PER TAP, before the blend: each record is biased by
-    // its OWN dc, so blending the packed words would mix four different biases.
-    var accx = (vl_unpack_rgb9e5(w1) - cm0) * wsum;
-    var accy = (vl_unpack_rgb9e5(w2) - cm0) * wsum;
-    var accz = (vl_unpack_rgb9e5(w3) - cm0) * wsum;
-    for (var k = 1u; k < 4u; k = k + 1u) {
-        let b0 = (k & 1u) != 0u;
-        let b1 = (k & 2u) != 0u;
-        let tw = select(1.0 - f0, f0, b0) * select(1.0 - f1, f1, b1);
-        if (tw <= 0.0) { continue; }
-        let c = v + select(vec3<i32>(0), o0, b0) + select(vec3<i32>(0), o1, b1);
-        let rw = refl_record_word(c);
-        if (rw == VL_NONE) { continue; }
-        let r0 = refl_pool[rw];
-        let r1 = refl_pool[rw + 1u];
-        let r2 = refl_pool[rw + 2u];
-        let r3 = refl_pool[rw + 3u];
-        if ((r0 | r1 | r2 | r3) == 0u) { continue; }
-        let n0 = vl_unpack_rgb9e5(r0);
-        acc0 = acc0 + n0 * tw;
-        accx = accx + (vl_unpack_rgb9e5(r1) - n0) * tw;
-        accy = accy + (vl_unpack_rgb9e5(r2) - n0) * tw;
-        accz = accz + (vl_unpack_rgb9e5(r3) - n0) * tw;
-        wsum = wsum + tw;
-    }
-    // wsum >= 0.25 by construction (the centre tap survived the gate above), so
-    // no divide-by-zero guard is needed here - unlike voxlight_sample, whose
-    // centre tap can itself be dropped by the solidity test.
-    let inv = 1.0 / wsum;
-    let m0 = acc0 * inv;
-    let mx = accx * inv;
-    let my = accy * inv;
-    let mz = accz * inv;
-
-    // Per-channel dot products of the moment VECTOR (mx, my, mz) with the pole
-    // and with the query direction. Written component-wise so all three colour
-    // channels resolve in one set of multiply-adds.
-    //
-    // Against `pole`, NOT the shading normal. The moments were gathered about
-    // the axis-aligned gather axis, so that is the axis their moment matrix was
-    // solved for; feeding the tilted shading normal in here solves a hemisphere
-    // the update pass never sampled. It also destroyed the out-of-hemisphere
-    // reject, because `dot(refl_dir, n)` for a mirror direction about `n` is
-    // `dot(-dir, n)`, which is large whenever the facet faces the viewer - so
-    // every query looked like a POLE query no matter where it actually pointed,
-    // and a 45-degree terrace facet answered confidently for directions the
-    // record had never seen. Measured over a 45-degree facet cone, using the
-    // pole widens the reconstruction from a washed 0.27..0.70 to 0.00..1.93
-    // against the true mirror's own 0.05..1.93; on open water, where the facet
-    // is within 3 degrees of the pole, it changes nothing (0.759 vs 0.757
-    // correlation with the mirror over a grazing lake still).
-    let m_n = mx * pole.x + my * pole.y + mz * pole.z;
-    let m_r = mx * refl_dir.x + my * refl_dir.y + mz * refl_dir.z;
-    let c = clamp(dot(refl_dir, pole), 0.0, 1.0);
-    // Least-squares SH-L1 reconstruction over the hemisphere about `pole`, solved
-    // from that hemisphere's moment matrix. The measure is the one the update
-    // pass samples with - cos(theta) uniform in (0,1], i.e. uniform in SOLID
-    // ANGLE - which gives E[1] = 1, E[d.n] = 1/2 and, for the second moments,
-    //
-    //     E[(d.n)^2] = integral of c^2 dc over (0,1] = 1/3
-    //     E[(d.t)^2] = E[(d.b)^2] = (1 - 1/3) / 2 = 1/3
-    //
-    // so E[d d^T] is exactly I/3 and the fit is
-    //
-    //     a = 4*m0 - 6*m_n,   b = 3*m - (6*m0 - 9*m_n)*n
-    //     f(r) = a + b.r = 4*m0 - 6*m_n + c*(9*m_n - 6*m0) + 3*m_r
-    //
-    // Exact for any field that IS linear and the least-squares projection
-    // otherwise, and frame-free: the tangent terms collapse into m_r, so no
-    // tangent basis is built at sample time.
-    //
-    // THIS USED TO READ 8*m_n and 4*m_r, which is the same solve with
-    // E[(d.t)^2] = 1/4 - the value for a COSINE-WEIGHTED hemisphere, not the
-    // uniform one the update pass actually samples. Mixing the two measures
-    // (E[d.n] = 1/2 and E[(d.n)^2] = 1/3 are both uniform; 1/4 is not)
-    // over-weighted the tangential term by exactly 4/3, so every horizontal
-    // swing of the reflection - which is the whole view-dependent part of it -
-    // came out a third too strong, and so did the estimator's noise. Checked
-    // against a linear field: with 3*m_r the reconstruction returns A + B.r to
-    // the digit, with 4*m_r it returns A + (4/3)*B.r.
-    //
-    // A linear fit OVERSHOOTS a peaked field at the pole (c = 1) and is
-    // accurate near the rim (c = 0). That falls the right way here: c = 1 is
-    // head-on, where Fresnel weights the reflection at ~2%, and c -> 0 is
-    // grazing, where Fresnel weights it most.
-    let e = 4.0 * m0 - 6.0 * m_n + c * (9.0 * m_n - 6.0 * m0) + 3.0 * m_r;
-
-    // A small negative excursion is the ordinary rim behaviour of a linear fit
-    // to a non-negative field and is simply clamped. An excursion past the DC
-    // cannot happen inside the fitted hemisphere, so it means the caller is
-    // querying a face this record was not gathered for (the far side of a glass
-    // pane): report a miss and let the per-pixel path answer instead of
-    // returning a confident black.
-    let dc = max(max(m0.r, m0.g), m0.b);
-    if (min(min(e.r, e.g), e.b) < -dc) { return vec3<f32>(0.0); }
-    *ok = true;
-    return max(e, vec3<f32>(0.0));
-}
-
 fn sky(dir: vec3<f32>) -> vec3<f32> {
     return sky_color(dir);
 }
@@ -892,9 +568,7 @@ override JIT_PHASE_FREEZE: f32 = 0.0;
 // normal builds): each disables one component of water shading so the
 // harness attributes transp milliseconds by differencing runs. Never
 // shipped on - the outputs they produce are placeholders.
-override PROF_TRANSP_NO_REFL: f32 = 0.0;
 override PROF_TRANSP_NO_REFR: f32 = 0.0;
-override PROF_TRANSP_REFL_FLATSHADE: f32 = 0.0;
 override PROF_TRANSP_REFR_FLATSHADE: f32 = 0.0;
 
 // Reprojected shadow/AO cache (#12). Set false to fall back to tracing shadow+AO
@@ -950,13 +624,15 @@ fn cs_clouds(@builtin(global_invocation_id) gid: vec3<u32>) {
     textureStore(cloud_out, vec2<i32>(i32(gid.x), i32(gid.y)), clouds);
 }
 
-// Water-top rest gradient (terrace/level slope without the wave field) of
-// the LAST water surface the primary trace() resolved, transported to the
-// deferred record write in cs_main. A private var instead of a Hit field on
-// purpose: growing Hit bloats registers in every tracer (trace_no_water
-// runs per reflection ray) - measured +1.8 ms on the water scenario.
-// trace() resets it, so a far water cube-top can never read a stale value.
-var<private> water_grad_rest: vec2<f32> = vec2<f32>(0.0);
+// The per-cell FACET of the last water surface the primary trace() resolved -
+// its quantized slope, and its band + shore mask packed by `water_pack_facet` -
+// transported to the deferred record write in cs_main. Private vars instead of
+// Hit fields on purpose: growing Hit bloats registers in every tracer
+// (trace_no_water runs per refraction ray) - measured +1.8 ms on the water
+// scenario when Hit last grew. trace() resets both, so a far water cube-top can
+// never read a stale facet.
+var<private> water_facet_grad: vec2<f32> = vec2<f32>(0.0);
+var<private> water_facet_code: u32 = 0u;
 
 // Axis-aligned face normal <-> small code, for the deferred transparent buffer.
 fn encode_face_normal(n: vec3<f32>) -> u32 {
@@ -974,22 +650,20 @@ fn decode_face_normal(c: u32) -> vec3<f32> {
 }
 
 // Is the eye below the water surface? Shared by cs_main (trace-path choice)
-// and cs_compose (underwater post-effect). Deliberate approximation:
-// own-level height + the field at the eye's XZ, NOT the full corner patch -
-// this runs per pixel, and the 16 corner probes would be full-screen cost
-// while swimming. It only diverges from the drawn patch at terrace lips,
-// where a few cm of eye-height mismatch in the underwater tint is
-// imperceptible.
+// and cs_compose (underwater post-effect). Reads the SAME `water_facet` the
+// tracer draws, so the surface the camera thinks it is under is the surface on
+// screen - exactly, now, rather than to within the old corner-vs-centre
+// mismatch: the facet is a per-cell constant, so there is nothing left to
+// approximate.
 fn camera_in_water() -> bool {
     let cam_voxel_chk = vec3<i32>(floor(camera.origin));
     let cam_mat_chk = voxel_material_at(cam_voxel_chk);
     var in_water = is_water_mat(cam_mat_chk);
     if (in_water && !is_water_mat(voxel_material_at(cam_voxel_chk + vec3<i32>(0, 1, 0)))) {
         let lf = f32(cam_mat_chk - MAT_WATER_L1 + 1u) * 0.125;
-        let f = water_field(camera.origin.xz, camera.time);
-        let s = clamp((WATER_BASE + f.x) * lf, WATER_MIN_H, 1.0);
+        let fc = water_facet(cam_voxel_chk, lf, 0.0);
         let lp_y = camera.origin.y - f32(cam_voxel_chk.y);
-        in_water = lp_y <= s;
+        in_water = lp_y <= fc.h;
     }
     return in_water;
 }
@@ -1018,29 +692,20 @@ fn cs_transparent(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (rec.y != TR_GLASS) {
         hit.mat = MAT_WATER_L8;
         if (rec.y == TR_WATER_TOP) {
-            // Top surface: the carried rest-gradient (terrace/level slope,
-            // zero on flat lakes) plus the exact per-pixel field gradient
-            // (the same field the patches displace by).
-            let p_hit = camera.origin + dir * hit.t_hit;
-            let g_raw = unpack2x16float(rec.z);
-            // Soft-clamp the rest-gradient magnitude with an m^2 weight:
-            // SMOOTH (C1) everywhere so there is no switch-on seam (a hard
-            // threshold left a faint edge where the slope crossed it), yet
-            // negligible on gentle slopes (waves, terrace ramps: m^2 tiny)
-            // and strong on the steep transient slopes a fast-filling pit
-            // leaves for a few frames (their bilinear tilt reads as dark
-            // faceted arches). Geometry (silhouette) unchanged.
-            let m2 = dot(g_raw, g_raw);
-            let g = g_raw / (1.0 + m2 * m2 * 0.6);
-            let f = water_field(p_hit.xz, camera.time);
-            hit.normal = normalize(vec3<f32>(-(g.x + f.y), 1.0, -(g.y + f.z)));
+            // Top surface: the cell's QUANTIZED slope, straight from the
+            // record. No per-pixel wave-field term is added on top any more -
+            // that term is exactly what made the surface read smooth, and one
+            // constant normal per cell is what "flat shaded" means. Every pixel
+            // of a facet resolves the identical normal by construction now,
+            // rather than to within a tolerance.
+            hit.normal = water_facet_normal(unpack2x16float(rec.z));
         } else {
             hit.normal = decode_face_normal(rec.z);
         }
-        // ONE shade_water_top call site: it inlines the reflection and
-        // refraction traces, and duplicating it doubles cs_transparent's
-        // code size (measured ~+1.8 ms on the water scenario).
-        col = shade_water_top(hit, camera.origin, dir, vec2<i32>(i32(gid.x), i32(gid.y)));
+        // ONE shade_water_top call site: it inlines the refraction trace, and
+        // duplicating it doubles cs_transparent's code size (measured ~+1.8 ms
+        // on the water scenario).
+        col = shade_water_top(hit, camera.origin, dir, rec.w);
     } else {
         hit.mat = MAT_GLASS;
         hit.normal = decode_face_normal(rec.z);
@@ -1128,7 +793,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             // undersides carry their axis face code.
             if (hit.normal.y > 0.9) {
                 transp = vec4<u32>(bitcast<u32>(hit.t_hit), TR_WATER_TOP,
-                                   pack2x16float(water_grad_rest), 0u);
+                                   pack2x16float(water_facet_grad), water_facet_code);
             } else {
                 transp = vec4<u32>(bitcast<u32>(hit.t_hit), TR_WATER_FACE,
                                    encode_face_normal(hit.normal), 0u);
@@ -3393,27 +3058,29 @@ fn water_field(xz: vec2<f32>, t: f32) -> vec3<f32> {
     return vec3<f32>(h, dx, dz);
 }
 
-// ---------- VOXEL WATER: connected per-corner surface -----------------------
-// The water surface is real sub-voxel geometry: every surface water voxel
-// (no water above) renders a BILINEAR PATCH over its four top-corner
-// heights. Each corner is derived from the up-to-4 water columns sharing it
-// (own + 2 orthogonal + 1 diagonal):
-//   - PIN rule: any corner-sharing column with water at y+1 pins the corner
-//     to exactly 1.0 (no wave term), so the surface rises to meet the upper
-//     cube's bottom with zero gap - this is what knits diagonally-touching
-//     and different-height water into one connected surface.
-//   - otherwise the corner is the MEAN level_frac of the corner-sharing
-//     water columns at the same y (non-water columns don't contribute, so
-//     shores keep their wall behaviour), scaled into WATER_BASE and
-//     displaced by the wave field sampled AT the corner's world XZ.
-// Shared corners are accumulated in a fixed world order, so any of the 4
-// cells sharing a corner computes bitwise-identical heights: cross-cell
-// continuity is exact by construction, and the below-waterline wall branch
-// provably never fires on internal water-water faces (a patch restricted to
-// a cell edge is the lerp of that edge's shared corners). Flat lakes reduce
-// algebraically to the previous centre-sampled plane. Shading uses the
-// carried rest-gradient plus the exact per-pixel field normal
-// (cs_transparent); only the ray-patch intersection is per-cell geometry.
+// ---------- STYLIZED VOXEL WATER: one flat facet per cell -------------------
+// ART DIRECTION (Marc, 2026-08-01): water is FACETED, not smooth. Every
+// surface water voxel renders ONE horizontal plate at ONE quantized height with
+// ONE flat normal, so the lake reads as a staircase of discrete cells that
+// animate in steps - the same discretisation the rest of the world is built
+// from - rather than as a continuous swell that happens to be made of voxels.
+//
+// This REPLACES the corner-connected bilinear/two-triangle surface. That
+// surface existed to make neighbouring cells share exact corner heights so the
+// lake was one watertight sheet; a faceted lake does not want to be one sheet,
+// it wants to be plates. What it must still not have is HOLES, and it does not:
+// where a neighbouring plate is higher, the ray enters this cell BELOW its own
+// plate and the entry face itself is the hit (the step's riser). So the old
+// pin rule, the step-down fold, the two-triangle split and their up-to-24
+// neighbour probes per cell are all gone, and with them the separate near/far
+// surface tiers - a centre-sampled facet was already what the far tier drew,
+// so near and far now run the SAME code.
+//
+// Heights are quantized to WATER_WAVE_BANDS steps each side of the resting
+// surface and the slope to WATER_SLOPE_STEP, so both the silhouette and the
+// shading take a small number of discrete values per cell. Wave MOTION
+// survives: the band a cell sits in changes as the wavefront passes, so the
+// surface steps up and down in place.
 const WATER_DETAIL_T: f32 = 96.0;   // beyond this, the wave field is skipped (flat rest plane)
 // Beyond this, water really is a plain cube top. The 0.28-voxel drop from
 // cube top (1.0) to rest surface (0.72) subtends under a pixel out here,
@@ -3422,139 +3089,165 @@ const WATER_DETAIL_T: f32 = 96.0;   // beyond this, the wave field is skipped (f
 // as it approached ("far water looks higher"). Grazing cost stays bounded:
 // past 400 the first water cell stops the ray as a cube again.
 const WATER_FAR_T: f32 = 400.0;
-// Corner-connected patches only this near: a 1-voxel terrace step subtends
-// >2 px inside this range and the connection is visible; beyond it the
-// cheap centre-plane facet takes over (water_subvoxel_far) - horizon-
-// skimming rays traverse ~50 surface cells per pixel and paying the
-// 8-probe pin ring for each measured +25% on the water scenario.
-const WATER_NEAR_T: f32 = 48.0;
 const WATER_BASE: f32 = 0.72;       // resting surface height inside the cell
-const WATER_MIN_H: f32 = 0.02;      // corner floor (keeps the patch off the cell floor)
-// Conservative bound on |wave field height|: the four amplitudes sum to
-// ~0.108 voxels (see wave_param), padded a little. Used by the grazing-ray
-// fast-out: with no pinned corner the surface cannot exceed
-// WATER_BASE + WATER_WAVE_MAX.
-const WATER_WAVE_MAX: f32 = 0.12;
+const WATER_MIN_H: f32 = 0.02;      // floor (keeps the plate off the cell floor)
+// |water_field| bound: the four amplitudes in `wave_param` sum to 0.108.
+// Dividing by it turns the raw field into a normalised -1..1 wave phase, which
+// is what the band quantiser wants; the stylized amplitude is then set
+// independently below instead of being whatever the spectrum happened to give.
+const WATER_FIELD_MAX: f32 = 0.108;
+// Stylized half-range of the quantized surface, in voxels. 0.24 with 3 bands
+// puts the step at 0.08 voxels - big enough that a step's riser is a visible
+// sliver at close range, small enough that the surface stays inside its cell
+// (0.72 +- 0.24 = 0.48..0.96, clear of both the cell floor and the cube top,
+// which is what keeps the grazing fast-out and the interior-cell test valid).
+const WATER_WAVE_AMP: f32 = 0.24;
+const WATER_WAVE_BANDS: f32 = 3.0;  // steps each side of rest: 7 discrete heights
+// Fraction of a band spent EASING across its boundary instead of sitting flat
+// on it, FOR THE TONE LADDER ONLY. 0 is a pure staircase, 1 is no quantization.
+//
+// A TEMPORAL fix with no spatial cost, measured rather than guessed. A pure
+// staircase pops a whole cell by one tone step the instant the wave carries it
+// over a boundary, and `flicker_probe_rt_views` reads that plainly: the
+// water_top view went from 0.135% strongly flickering pixels before this rework
+// to 1.177% after, and disabling the tone ladder alone took it back to 0.262% -
+// so the ladder was 78% of the strobing. Easing it reads 0.280%.
+//
+// It costs nothing in the look because what makes the surface read as faceted
+// is the step BETWEEN NEIGHBOURING CELLS, and that is unchanged: two cells a
+// band apart still differ by a full tone step with a hard edge at the cell
+// boundary. Only a cell CROSSING a boundary changes gradually, over several
+// frames instead of one, and 65% of cells still sit exactly on a level.
+//
+// THE HEIGHT IS NOT EASED, and that is the other half of the same measurement.
+// Easing it too took the water_top view to a comparable 0.290% but made the
+// GRAZING view worse, 0.161% -> 0.340%: from a low angle a crest's plate occludes the
+// trough behind it, so a hard-quantized height holds that occlusion boundary
+// still while a sliding one creeps it across pixels every frame. The height's
+// quantization is load-bearing for grazing stability; the tone's was only ever
+// load-bearing for the look, and the look does not need the temporal half of it.
+const WATER_BAND_EASE: f32 = 0.35;
+// Conservative bound on the surface's displacement from WATER_BASE, used by
+// the grazing-ray fast-out. Equal to the amplitude BY CONSTRUCTION now (the
+// quantiser cannot exceed its own top band), rather than a padded guess.
+const WATER_WAVE_MAX: f32 = WATER_WAVE_AMP;
+// Facet slope quantum. The wave field's own max slope is 0.0557 (the sum of
+// A_i * k_i over `wave_param`), so the stylized slope is bounded by
+// 0.0557 * WATER_WAVE_AMP / WATER_FIELD_MAX = 0.124, and a
+// 0.06 step gives five tilts per axis (0, +-0.06, +-0.12): a small, countable
+// set of facet orientations, which is what makes neighbouring cells read as
+// separate flat faces instead of a smooth gradient.
+const WATER_SLOPE_STEP: f32 = 0.06;
+// Cells at or above this band foam at their crest. Band 2 of 3 rather than the
+// top band alone: `band = round(t * 3)` puts band 3 at |t| >= 5/6, which the
+// four-wave spectrum reaches on only a few percent of cells, so crest foam
+// would be a rare speck rather than a feature of the wavefront.
+const WATER_FOAM_BAND: f32 = 2.0;
+// Beyond this the quarter-voxel foam stamp is sub-pixel, so it is faded out
+// rather than left to alias. Inside WATER_DETAIL_T by construction: past that
+// there is no wave field, hence no crest, hence nothing to foam.
+const WATER_FOAM_T: f32 = 64.0;
 
 struct WaterSubHit {
     hit: bool,
     t_hit: f32,
     normal: vec3<f32>,
-    // Rest-only surface gradient at the hit (terrace/level slope without the
-    // wave field), carried to the deferred pass via Hit.aux.
-    grad_rest: vec2<f32>,
+    // The cell's QUANTIZED slope, carried to the deferred pass via the transp
+    // record so cs_transparent reconstructs the same flat facet normal the
+    // tracer used. Named for what it is now: there is no separate "rest"
+    // gradient any more, because there is no per-pixel wave term to add on top.
+    grad: vec2<f32>,
+    // Wave band, -WATER_WAVE_BANDS..WATER_WAVE_BANDS. A FLOAT because the
+    // staircase is eased across its boundaries in time (see WATER_BAND_EASE);
+    // it lands exactly on an integer for most cells and slides between two for
+    // the rest. Paired with the 4-bit mask of lateral neighbours that are not
+    // water (bit 0 +x, 1 -x, 2 +z, 3 -z). Both are per-cell constants and both
+    // drive foam.
+    band: f32,
+    shore: u32,
 };
 
-// Far-tier surface (WATER_NEAR_T..WATER_DETAIL_T): the previous centre-
-// sampled tilted facet. At this distance a cell is a few pixels, terrace
-// connectivity is sub-pixel, and the facet needs no neighbour probes (the
-// caller already did the interior +Y check). Margin-clamped inside the
-// cell so it can never poke into neighbours; the near/far boundary
-// mismatch is the corner-vs-centre field delta (~1e-2 voxels), invisible
-// at 48+ units.
-fn water_subvoxel_far(
-    voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, m: u32,
-    entry_n: vec3<f32>, t_entry: f32, t_exit: f32,
-) -> WaterSubHit {
-    var out: WaterSubHit;
-    out.hit = false;
-    out.grad_rest = vec2<f32>(0.0);
-    let level_frac = f32(m - MAT_WATER_L1 + 1u) * 0.125;
+/// The one flat facet of a water cell: quantized height, quantized slope and
+/// the wave band both came from.
+///
+/// ONE definition, called by the tracer, by `camera_in_water` and by the
+/// still-image tests. A second copy of this arithmetic anywhere would let the
+/// drawn surface and the surface the camera thinks it is under drift apart.
+struct WaterFacet {
+    h: f32,
+    grad: vec2<f32>,
+    band: f32,
+};
+
+/// Quantize a wave phase to the band ladder, EASING across each boundary.
+///
+/// Exactly `round(u)` over the flat core of a band, sliding continuously to the
+/// midpoint at the boundary and picking up again on the other side - so the
+/// result is continuous in `u` and still spends most of its range pinned to an
+/// integer. The continuity is what stops a cell popping a whole step in one
+/// frame as the wave carries it across; the flat core is what keeps
+/// neighbouring cells landing on the same level and reading as one terrace.
+fn water_band_quantize(u: f32) -> f32 {
+    let k = round(u);
+    let d = u - k;
+    let core = 0.5 - WATER_BAND_EASE * 0.5;
+    return k + sign(d) * smoothstep(core, 0.5, abs(d)) * 0.5;
+}
+
+fn water_facet(voxel: vec3<i32>, level_frac: f32, t_view: f32) -> WaterFacet {
+    var o: WaterFacet;
+    // Sampled at the CELL CENTRE, once. That single sample is the whole cell:
+    // it is what makes the facet flat, and it is why every pixel of the cell
+    // shades identically.
     let vc = vec2<f32>(f32(voxel.x) + 0.5, f32(voxel.z) + 0.5);
-    // Third tier (WATER_DETAIL_T..WATER_FAR_T): the flat rest plane. The
-    // wave field is sub-pixel out there, but the SURFACE HEIGHT must stay
-    // at ~0.72 or the level jumps a visible 0.28 voxels at the tier ring.
     var f = vec3<f32>(0.0);
-    if (t_entry <= WATER_DETAIL_T) {
+    if (t_view <= WATER_DETAIL_T) {
         f = water_field(vc, camera.time);
     }
-    let slope = clamp(f.yz, vec2<f32>(-0.30), vec2<f32>(0.30)) * level_frac;
-    let margin = 0.5 * (abs(slope.x) + abs(slope.y)) + 0.02;
-    let h = clamp(WATER_BASE + f.x, margin, 1.0 - margin) * level_frac;
-    let vmin = vec3<f32>(f32(voxel.x), f32(voxel.y), f32(voxel.z));
-    let p0 = origin + dir * t_entry - vmin;
-    let s0 = h + slope.x * (p0.x - 0.5) + slope.y * (p0.z - 0.5);
-    if (p0.y <= s0 + 1e-4) {
-        out.hit = true;
-        out.t_hit = t_entry;
-        // A SIDE entry below the surface out here is a crack between two
-        // INDEPENDENT facets (the far tiers have no corner connection), not a
-        // real waterfall - and shading it with the vertical face normal painted
-        // jittery dark lines along cell edges across distant water. Present it
-        // as the surface (facet normal, y ~ 0.96 > the TR_WATER_TOP gate): a
-        // genuine 1-voxel terrace wall subtends under a pixel beyond
-        // WATER_NEAR_T, so nothing legitimate is lost. Top/bottom entries keep
-        // the true face normal (underside shading stays correct).
-        if (abs(entry_n.y) < 0.5) {
-            out.normal = normalize(vec3<f32>(-slope.x, 1.0, -slope.y));
-        } else {
-            out.normal = entry_n;
-        }
-        return out;
-    }
-    let denom = dir.y - slope.x * dir.x - slope.y * dir.z;
-    if (denom < -1e-6) {
-        let s = (p0.y - s0) / (-denom);
-        if (t_entry + s < t_exit) {
-            out.hit = true;
-            out.t_hit = t_entry + s;
-            out.normal = normalize(vec3<f32>(-slope.x, 1.0, -slope.y));
-            return out;
-        }
-    }
-    return out;
+    // Normalised wave phase in -1..1, then the band. Centred on round() (not
+    // floor) so the resting surface is a band of its own and the ladder is
+    // symmetric.
+    //
+    // `band` is the EASED value and drives the tone; the HEIGHT takes its hard
+    // integer band (`round` of the eased value returns exactly the band the
+    // quantizer picked). See WATER_BAND_EASE for why the two differ.
+    let t = clamp(f.x / WATER_FIELD_MAX, -1.0, 1.0);
+    o.band = clamp(water_band_quantize(t * WATER_WAVE_BANDS), -WATER_WAVE_BANDS, WATER_WAVE_BANDS);
+    let step_h = WATER_WAVE_AMP / WATER_WAVE_BANDS;
+    o.h = clamp((WATER_BASE + round(o.band) * step_h) * level_frac, WATER_MIN_H, 1.0);
+    // Slope on the same stylized scale as the height, then quantized to its own
+    // ladder. Scaled by level_frac exactly as the height is, so a half-full
+    // column's facet is half as steep and the two stay consistent.
+    let g = f.yz * (WATER_WAVE_AMP / WATER_FIELD_MAX) * level_frac;
+    o.grad = round(g / WATER_SLOPE_STEP) * WATER_SLOPE_STEP;
+    return o;
 }
 
-// One corner's (h, h_rest). `lf9`/`up9` describe the 3x3 column
-// neighbourhood: lf9[(ox+1)+(oz+1)*3] = level_frac of the column at lateral
-// offset (ox, oz) if it holds water at this y (0 otherwise); up9 bit i set =
-// that column holds water at y+1. Corner (cx, cz) in {0,1}^2.
-// The k-loop enumerates the corner's 4 sharing columns in increasing z then
-// x WORLD order - keep it that way, bitwise cross-cell equality depends on
-// the accumulation order.
-fn water_corner_h(lf9: ptr<function, array<f32, 9>>, up9: u32, voxel: vec3<i32>, cx: i32, cz: i32) -> vec2<f32> {
-    var pinned_up = false;
-    var sum = 0.0;
-    var cnt = 0.0;
-    for (var k: i32 = 0; k < 4; k = k + 1) {
-        let ox = cx - 1 + (k & 1);
-        let oz = cz - 1 + (k >> 1);
-        let idx = (ox + 1) + (oz + 1) * 3;
-        if (((up9 >> u32(idx)) & 1u) == 1u) { pinned_up = true; }
-        let lf = (*lf9)[idx];
-        if (lf > 0.0) {
-            sum = sum + lf;
-            cnt = cnt + 1.0;
-        }
-    }
-    if (pinned_up) { return vec2<f32>(1.0, 1.0); }
-    // The step-down (waterfall) case is NOT a corner pin - a single pinned
-    // corner sagged the whole cell into a bilinear arch. It is handled as a
-    // clean two-plane fold in water_subvoxel instead, so this returns the
-    // unpinned height even for a step-down corner.
-    let avg = sum / cnt; // own column always counts: cnt >= 1
-    let f = water_field(vec2<f32>(f32(voxel.x + cx), f32(voxel.z + cz)), camera.time);
-    let h_rest = clamp(WATER_BASE * avg, WATER_MIN_H, 1.0);
-    let h = clamp((WATER_BASE + f.x) * avg, WATER_MIN_H, 1.0);
-    return vec2<f32>(h, h_rest);
+/// The facet normal for a quantized slope. One place, so the tracer and the
+/// deferred pass cannot disagree about which way a facet faces.
+fn water_facet_normal(grad: vec2<f32>) -> vec3<f32> {
+    return normalize(vec3<f32>(-grad.x, 1.0, -grad.y));
 }
 
-// True if corner (cx,cz) of this cell has any step-down column (water one
-// level below in a corner-sharing column). Same 4-column enumeration as
-// water_corner_h, so the classification is identical across cells.
-fn corner_has_dn(dn9: u32, cx: i32, cz: i32) -> bool {
-    for (var k: i32 = 0; k < 4; k = k + 1) {
-        let ox = cx - 1 + (k & 1);
-        let oz = cz - 1 + (k >> 1);
-        if (((dn9 >> u32((ox + 1) + (oz + 1) * 3)) & 1u) == 1u) { return true; }
-    }
-    return false;
+/// Pack the per-cell facet band + shore mask into the transp record's spare
+/// word. The band is biased and scaled into a byte: 8 bits over a range of
+/// 2*WATER_WAVE_BANDS is a resolution of 0.024 of a band, two orders finer than
+/// the eased boundary it has to represent.
+fn water_pack_facet(band: f32, shore: u32) -> u32 {
+    let q = clamp((band + WATER_WAVE_BANDS) * (255.0 / (2.0 * WATER_WAVE_BANDS)), 0.0, 255.0);
+    return u32(round(q)) | (shore << 8u);
+}
+fn water_unpack_band(code: u32) -> f32 {
+    return f32(code & 0xFFu) * ((2.0 * WATER_WAVE_BANDS) / 255.0) - WATER_WAVE_BANDS;
+}
+fn water_unpack_shore(code: u32) -> u32 {
+    return (code >> 8u) & 0xFu;
 }
 
 // Sub-voxel water surface for one cell the DDA landed in. `entry_n`/`t_entry`
 // describe the cell's entry face, `t_exit` the exit crossing; `slot_v`/`bp`/
 // `bi` are the DDA's current slot voxel and brick so neighbour probes can
-// take the register-resident fast path. Misses (ray passes above the patch)
+// take the register-resident fast path. Misses (ray passes above the plate)
 // fall through to the next DDA cell.
 fn water_subvoxel(
     voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, m: u32,
@@ -3563,7 +3256,9 @@ fn water_subvoxel(
 ) -> WaterSubHit {
     var out: WaterSubHit;
     out.hit = false;
-    out.grad_rest = vec2<f32>(0.0);
+    out.grad = vec2<f32>(0.0);
+    out.band = 0.0;
+    out.shore = 0u;
     // Interior cell (more water above): a plain cube. Its exposed faces are
     // vertical water walls / undersides.
     if (is_water_mat(neighbor_material(voxel, slot_v, bp, bi, vec3<i32>(0, 1, 0)))) {
@@ -3572,222 +3267,74 @@ fn water_subvoxel(
         out.normal = entry_n;
         return out;
     }
-    // Far tier: centre-plane facet, no neighbourhood probes.
-    if (t_entry > WATER_NEAR_T) {
-        return water_subvoxel_far(voxel, origin, dir, m, entry_n, t_entry, t_exit);
-    }
 
-    // Stage A - pin probes: water at y+1 in the 8 lateral columns (the own
-    // column has none, the interior check above just returned).
-    var up9: u32 = 0u;
-    for (var oz: i32 = -1; oz <= 1; oz = oz + 1) {
-        for (var ox: i32 = -1; ox <= 1; ox = ox + 1) {
-            if (ox == 0 && oz == 0) { continue; }
-            if (is_water_mat(neighbor_material(voxel, slot_v, bp, bi, vec3<i32>(ox, 1, oz)))) {
-                up9 = up9 | (1u << u32((ox + 1) + (oz + 1) * 3));
-            }
-        }
-    }
-    // Grazing fast-out: no pinned corner means the surface cannot exceed
-    // WATER_BASE + WATER_WAVE_MAX (level averaging only lowers it). y is
-    // monotone along the ray, so its min over the cell is at an endpoint.
+    let level_frac = f32(m - MAT_WATER_L1 + 1u) * 0.125;
+    let fc = water_facet(voxel, level_frac, t_entry);
     let vmin = vec3<f32>(f32(voxel.x), f32(voxel.y), f32(voxel.z));
     let y_in = origin.y + dir.y * t_entry - vmin.y;
     let y_out = origin.y + dir.y * t_exit - vmin.y;
-    if (up9 == 0u && min(y_in, y_out) > WATER_BASE + WATER_WAVE_MAX) {
+    // Grazing fast-out: y is monotone along the ray, so its minimum over the
+    // cell is at an endpoint, and the plate can never exceed the top band.
+    if (min(y_in, y_out) > WATER_BASE + WATER_WAVE_MAX) {
         return out;
     }
-
-    // Stage B - level probes: level_frac of the 3x3 columns at this y.
-    var lf9: array<f32, 9>;
-    lf9[4] = f32(m - MAT_WATER_L1 + 1u) * 0.125; // own column
-    for (var oz: i32 = -1; oz <= 1; oz = oz + 1) {
-        for (var ox: i32 = -1; ox <= 1; ox = ox + 1) {
-            if (ox == 0 && oz == 0) { continue; }
-            let lm = neighbor_material(voxel, slot_v, bp, bi, vec3<i32>(ox, 0, oz));
-            if (is_water_mat(lm)) {
-                lf9[(ox + 1) + (oz + 1) * 3] = f32(lm - MAT_WATER_L1 + 1u) * 0.125;
-            }
-        }
-    }
-    // Stage C - step-down probes, only for columns that hold NO water at
-    // this y (a watery column's surface is at this level, it cannot be a
-    // step down; interior lakes therefore pay zero extra probes - the cost
-    // concentrates at shores and terrace rims where it matters).
-    var dn9: u32 = 0u;
-    for (var oz: i32 = -1; oz <= 1; oz = oz + 1) {
-        for (var ox: i32 = -1; ox <= 1; ox = ox + 1) {
-            if (ox == 0 && oz == 0) { continue; }
-            if (lf9[(ox + 1) + (oz + 1) * 3] > 0.0) { continue; }
-            if (is_water_mat(neighbor_material(voxel, slot_v, bp, bi, vec3<i32>(ox, -1, oz)))) {
-                dn9 = dn9 | (1u << u32((ox + 1) + (oz + 1) * 3));
-            }
-        }
-    }
-
-    // The four corner heights (h, h_rest) and the bilinear coefficients
-    // S(x,z) = h00 + a1 x + a2 z + a3 xz over the unit cell.
-    let c00 = water_corner_h(&lf9, up9, voxel, 0, 0);
-    let c10 = water_corner_h(&lf9, up9, voxel, 1, 0);
-    let c01 = water_corner_h(&lf9, up9, voxel, 0, 1);
-    let c11 = water_corner_h(&lf9, up9, voxel, 1, 1);
 
     let p0 = origin + dir * t_entry - vmin;
-
-    // ---- waterfall fold (single-corner step connection) ----
-    // Exactly one corner is pinned to an extreme - either UP to the cell top
-    // (a diagonally-higher pool: water rising to a step) or DOWN toward a
-    // lower pool (the upper ledge's tip). A single odd corner in the
-    // bilinear patch sags/bulges the whole cell into a "weird arch". Fold it
-    // as TWO PLANES instead: a flat plane at the other three corners' height,
-    // and a straight-creased ramp between the fold line and the pinned tip.
-    // The crease is a clean straight edge; no arch, either direction. Two
-    // adjacent pins (a wall) are already linear under the bilinear, and 3+
-    // pins are rare, so both fall through to it.
-    let up00 = c00.x >= 0.99; let up10 = c10.x >= 0.99;
-    let up01 = c01.x >= 0.99; let up11 = c11.x >= 0.99;
-    let d00 = corner_has_dn(dn9, 0, 0); let d10 = corner_has_dn(dn9, 1, 0);
-    let d01 = corner_has_dn(dn9, 0, 1); let d11 = corner_has_dn(dn9, 1, 1);
-    let pin00 = up00 || d00; let pin10 = up10 || d10;
-    let pin01 = up01 || d01; let pin11 = up11 || d11;
-    let pincount = i32(pin00) + i32(pin10) + i32(pin01) + i32(pin11);
-    if (pincount == 1) {
-        // Pin corner (px,pz) in {0,1}^2; its target is the cell top (up) or
-        // the cell floor (down).
-        let px = select(0.0, 1.0, pin10 || pin11);
-        let pz = select(0.0, 1.0, pin01 || pin11);
-        let is_up = up00 || up10 || up01 || up11;
-        let hpin = select(WATER_MIN_H, 1.0, is_up);
-        // h0 = mean of the THREE unpinned corners (the pinned one sits at an
-        // extreme and must not skew the flat height).
-        var pcx = c00.x; var pcy = c00.y;
-        if (pin10) { pcx = c10.x; pcy = c10.y; }
-        if (pin01) { pcx = c01.x; pcy = c01.y; }
-        if (pin11) { pcx = c11.x; pcy = c11.y; }
-        let h0 = (c00.x + c10.x + c01.x + c11.x - pcx) / 3.0;
-        let h0r = (c00.y + c10.y + c01.y + c11.y - pcy) / 3.0;
-        let k = h0 - hpin;
-        let kr = h0r - hpin;
-        // Distance-to-pin coords: du,dv are 0 at the pinned corner, 1 at the
-        // far edges. dd = du+dv; ramp where dd<1, flat where dd>=1.
-        let sx = select(1.0, -1.0, px > 0.5);
-        let sz = select(1.0, -1.0, pz > 0.5);
-        let du0 = select(p0.x, 1.0 - p0.x, px > 0.5);
-        let dv0 = select(p0.z, 1.0 - p0.z, pz > 0.5);
-        let ddu = dir.x * sx;
-        let ddv = dir.z * sz;
-        let dd0 = du0 + dv0;
-        // Entry-below test against the folded surface at p0.
-        let s_entry = select(h0, h0 - k * (1.0 - dd0), dd0 < 1.0);
-        if (p0.y <= s_entry + 1e-4) {
-            out.hit = true;
-            out.t_hit = t_entry;
+    if (p0.y <= fc.h + 1e-4) {
+        // Entered BELOW this cell's plate. The entry face IS the surface here,
+        // and this branch is what makes a staircase of independent plates
+        // watertight: without it a ray would slip through the gap between two
+        // plates at different heights.
+        out.hit = true;
+        out.t_hit = t_entry;
+        // A LATERAL entry from a cell that ALSO holds water is the riser of an
+        // internal step, and it has to be shaded as the surface. Shading it
+        // with its true vertical face normal painted hard navy cracks and
+        // bright grazing slivers along every band boundary - seen on the first
+        // stills of this rework, and the same artifact (with the same fix) the
+        // old far tier already carried. A lateral neighbour that is NOT water
+        // is a genuine wall (a pool's edge, a waterfall face) and keeps its
+        // face normal.
+        if (abs(entry_n.y) < 0.5
+            && is_water_mat(neighbor_material(voxel, slot_v, bp, bi, vec3<i32>(entry_n)))) {
+            out.normal = water_facet_normal(fc.grad);
+        } else {
             out.normal = entry_n;
-            out.grad_rest = select(vec2<f32>(0.0), vec2<f32>(kr * sx, kr * sz), dd0 < 1.0);
-            return out;
         }
-        let s_max = t_exit - t_entry;
-        var best = 1e30;
-        var best_ramp = false;
-        // Flat plane y = h0, valid where dd >= 1.
-        if (abs(dir.y) > 1e-7) {
-            let sf = (h0 - p0.y) / dir.y;
-            if (sf > 0.0 && sf < s_max) {
-                let ddh = dd0 + (ddu + ddv) * sf;
-                if (ddh >= 1.0 - 1e-4) { best = sf; best_ramp = false; }
-            }
-        }
-        // Ramp plane y = h0 - k + k*dd, valid where dd < 1.
-        let denom = dir.y - k * (ddu + ddv);
-        if (abs(denom) > 1e-7) {
-            let sr = (h0 - k + k * dd0 - p0.y) / denom;
-            if (sr > 0.0 && sr < s_max && sr < best) {
-                let ddh = dd0 + (ddu + ddv) * sr;
-                if (ddh <= 1.0 + 1e-4) { best = sr; best_ramp = true; }
-            }
-        }
-        if (best < 1e29) {
+    } else if (dir.y < -1e-7) {
+        let s = (fc.h - p0.y) / dir.y;
+        if (s > 0.0 && t_entry + s < t_exit) {
             out.hit = true;
-            out.t_hit = t_entry + best;
-            out.normal = select(vec3<f32>(0.0, 1.0, 0.0),
-                                normalize(vec3<f32>(-k * sx, 1.0, -k * sz)), best_ramp);
-            out.grad_rest = select(vec2<f32>(0.0), vec2<f32>(kr * sx, kr * sz), best_ramp);
+            out.t_hit = t_entry + s;
+            out.normal = water_facet_normal(fc.grad);
         }
+    }
+    if (!out.hit) {
         return out;
     }
-
-    return water_tri_surface(c00, c10, c01, c11, p0, dir, t_entry, t_exit - t_entry, entry_n);
-}
-
-// Cell water surface as TWO FLAT TRIANGLES instead of a bilinear patch.
-// A bilinear over 4 unequal corners is a hyperbolic saddle that bulges
-// into a curved "arch/fan" - the ugliness around a pit filling in a lake.
-// Splitting the cell along its FLATTER diagonal into two planar triangles
-// removes the bulge (a plane cannot arch) while staying C0: the triangles
-// share two corners and the split diagonal, and neighbouring cells share
-// full edges (both endpoints), so the surface stays watertight. Gentle
-// cells (near-equal corners) are near-coplanar, so the split is invisible.
-// corners: .x = height, .y = rest-height (for the shading gradient).
-fn water_tri_surface(
-    c00: vec2<f32>, c10: vec2<f32>, c01: vec2<f32>, c11: vec2<f32>,
-    p0: vec3<f32>, dir: vec3<f32>, t_entry: f32, s_max: f32, entry_n: vec3<f32>,
-) -> WaterSubHit {
-    var out: WaterSubHit;
-    out.hit = false;
-    out.grad_rest = vec2<f32>(0.0);
-    // Split along the diagonal whose two corners are closest in height, so
-    // the crease runs along the flatter direction.
-    let split_main = abs(c00.x - c11.x) <= abs(c10.x - c01.x);
-
-    var best_s = 1e30;
-    for (var t: i32 = 0; t < 2; t = t + 1) {
-        // Plane height = A + Bx*x + Bz*z over this triangle, plus the rest
-        // plane (Ar,Brx,Brz). `reg` >= 0 marks the triangle's half of the
-        // cell at a point (rx, rz).
-        var A: f32; var Bx: f32; var Bz: f32;
-        var Ar: f32; var Brx: f32; var Brz: f32;
-        if (split_main) {
-            if (t == 0) { // corners c00,c10,c11 ; region x >= z
-                A = c00.x; Bx = c10.x - c00.x; Bz = c11.x - c10.x;
-                Ar = c00.y; Brx = c10.y - c00.y; Brz = c11.y - c10.y;
-            } else {       // corners c00,c01,c11 ; region x <= z
-                A = c00.x; Bx = c11.x - c01.x; Bz = c01.x - c00.x;
-                Ar = c00.y; Brx = c11.y - c01.y; Brz = c01.y - c00.y;
-            }
-        } else {
-            if (t == 0) { // corners c00,c10,c01 ; region x + z <= 1
-                A = c00.x; Bx = c10.x - c00.x; Bz = c01.x - c00.x;
-                Ar = c00.y; Brx = c10.y - c00.y; Brz = c01.y - c00.y;
-            } else {       // corners c10,c01,c11 ; region x + z >= 1
-                A = c10.x + c01.x - c11.x; Bx = c11.x - c01.x; Bz = c11.x - c10.x;
-                Ar = c10.y + c01.y - c11.y; Brx = c11.y - c01.y; Brz = c11.y - c10.y;
+    out.grad = fc.grad;
+    out.band = fc.band;
+    // Shore probes LAST and only when foam can be seen: four neighbour
+    // lookups, against the up-to-24 the corner surface paid on every cell.
+    //
+    // The test is "the neighbour is NOT WATER", i.e. this cell is on the EDGE
+    // OF THE WATER BODY - deliberately wider than "adjacent to solid". A lake
+    // whose rim sits BELOW its surface (the common case: water at y on ground
+    // at y-1) has AIR at every lateral neighbour, so a solid-only test foams
+    // nothing at all on it, which is what the first stills showed on the
+    // terrace lab. Both cases read to a player as the shore.
+    if (t_entry <= WATER_FOAM_T) {
+        var shore = 0u;
+        for (var k = 0u; k < 4u; k = k + 1u) {
+            var d = vec3<i32>(1, 0, 0);
+            if (k == 1u) { d = vec3<i32>(-1, 0, 0); }
+            else if (k == 2u) { d = vec3<i32>(0, 0, 1); }
+            else if (k == 3u) { d = vec3<i32>(0, 0, -1); }
+            if (!is_water_mat(neighbor_material(voxel, slot_v, bp, bi, d))) {
+                shore = shore | (1u << k);
             }
         }
-        // Entry-below test: if p0 is inside this triangle and under its
-        // plane, the entry face IS the surface (a wall / underside).
-        let in_reg0 = select(p0.x + p0.z <= 1.0, p0.x >= p0.z, split_main) == (t == 0);
-        let s_plane_at_p0 = A + Bx * p0.x + Bz * p0.z;
-        if (in_reg0 && p0.y <= s_plane_at_p0 + 1e-4) {
-            out.hit = true;
-            out.t_hit = t_entry;
-            out.normal = entry_n;
-            out.grad_rest = vec2<f32>(Brx, Brz);
-            return out;
-        }
-        // Ray vs plane.
-        let den = dir.y - Bx * dir.x - Bz * dir.z;
-        if (abs(den) < 1e-7) { continue; }
-        let s = (A + Bx * p0.x + Bz * p0.z - p0.y) / den;
-        if (s <= 0.0 || s >= min(s_max, best_s)) { continue; }
-        let px = p0.x + dir.x * s;
-        let pz = p0.z + dir.z * s;
-        let in_reg = select(px + pz <= 1.0001, px >= pz - 1e-4, split_main) == (t == 0);
-        if (!in_reg) { continue; }
-        best_s = s;
-        out.hit = true;
-        out.t_hit = t_entry + s;
-        out.normal = normalize(vec3<f32>(-Bx, 1.0, -Bz));
-        out.grad_rest = vec2<f32>(Brx, Brz);
+        out.shore = shore;
     }
     return out;
 }
@@ -4011,135 +3558,119 @@ fn trace_no_water(origin: vec3<f32>, dir: vec3<f32>, t_cap: f32) -> Hit {
     return out;
 }
 
-fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>, px: vec2<i32>) -> vec3<f32> {
+// Rec.709-ish luma weights for the foam highlight ramp. Named because two
+// separate places below want "how bright is this" and a second spelling of the
+// weights is a second thing to keep in step.
+const WATER_SHADOW_TONE: f32 = 0.42;   // multiplier on water sitting in shadow
+const WATER_SHADOW_EDGE: f32 = 0.50;   // sun-visibility at the light/shadow line
+const WATER_SHADOW_SOFT: f32 = 0.09;   // half-width of that line: HARD-ish, not photoreal
+const WATER_FACET_CONTRAST: f32 = 0.22; // tone spread from trough band to crest band
+const WATER_SKY_MAX: f32 = 0.45;       // ceiling on the grazing Fresnel blend toward sky
+const WATER_FOAM_SHORE_SUB: i32 = 2;   // shore-foam band width, in quarter-voxel texels
+// Eighths of crest cells that actually break into foam. NOT every crest does,
+// and the reason it has to be well under 8 is a grazing-angle effect that only
+// showed up when it was measured: a crest cell's plate stands 0.16 voxels
+// proud, and a shallow ray stops at the FIRST plate it dips below, so crests
+// occlude the troughs behind them and take far more of the screen than their
+// footprint. Band >= 2 is 13.9% of cells by area (Monte Carlo over the four
+// waves in `wave_param`) but covered 24% of the terrace-ramp crop, five times
+// its share. Foaming half of them puts whitecaps back at a plausible density
+// from a low angle without emptying the top-down views.
+const WATER_FOAM_CREST_ODDS: u32 = 4u;
+
+/// Cheap integer hash of a water cell. Large odd multipliers so adjacent cells
+/// land on unrelated values instead of walking the grid. Drives BOTH which foam
+/// shape a cell stamps and how wide its shore band is, from one value, so the
+/// two cannot disagree about which cell they are decorating.
+fn foam_hash(cell: vec3<i32>) -> u32 {
+    return (u32(cell.x) * 73856093u) ^ (u32(cell.z) * 19349663u) ^ (u32(cell.y) * 83492791u);
+}
+
+/// One texel of a foam stamp. `SPR_FOAM_*` is a 4x4 grid of sixteen 4x4 shapes
+/// (see src/sprites.rs); `local` is the position inside the water cell in 0..1
+/// and `h` (from `foam_hash`) picks the shape, so neighbouring cells stamp
+/// DIFFERENT shapes and a shoreline gets a ragged edge instead of a repeated
+/// motif.
+///
+/// Quarter-voxel texels on purpose: the foam has to be visibly made of the same
+/// grid the world is, and a 16x16 stamp inside a voxel would be noise at any
+/// distance the water is actually seen from.
+fn foam_texel(sprite: u32, local: vec2<f32>, h: u32) -> u32 {
+    let sub = clamp(vec2<i32>(floor(local * 4.0)), vec2<i32>(0), vec2<i32>(3));
+    let tile = h & 15u;
+    let tx = (tile & 3u) * 4u + u32(sub.x);
+    let ty = (tile >> 2u) * 4u + u32(sub.y);
+    return sprite_texel(sprite, tx, ty);
+}
+
+// STYLIZED water surface (Marc, 2026-08-01). It reads as LIT or SHADOWED, with
+// discrete flat facets and hard-edged foam - not as a mirror.
+//
+// The reflection is gone entirely, both the per-voxel cache and the per-pixel
+// mirror trace it fell back to. That is the art direction, and it is also why
+// this function no longer touches the reflection history region of transp_buf,
+// runs no secondary trace of its own, and needs no per-pixel jitter.
+//
+// What carries the look instead:
+//   - LIT vs SHADOWED, from the per-voxel sun visibility the light field
+//     already stores, through a HARD-ish step rather than a smooth falloff.
+//   - The per-cell facet band as a flat tone step, so neighbouring cells are
+//     visibly different flat faces and the wave reads as it travels.
+//   - Depth absorption and the water-body tint, KEPT unchanged: they are what
+//     makes this read as water rather than as blue paint.
+//   - A Fresnel blend toward the sky at grazing angles, KEPT. See the note at
+//     the blend itself for why.
+//   - Hard-edged quantized foam at crests and shorelines.
+//
+// `facet_code` is the transp record's spare word: this cell's wave band and its
+// solid-neighbour mask, packed by `water_pack_facet`.
+fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>, facet_code: u32) -> vec3<f32> {
     let p_hit = origin + dir * hit.t_hit;
-    // The plate/wall normal is real (quantised) geometry now — shading uses it
-    // directly instead of a per-pixel Gerstner fake. Every pixel of a plate
-    // shares one normal, so the secondary rays below stay warp-coherent.
+    // ONE flat normal for the whole cell (water_facet_normal of the quantized
+    // slope), or an axis face on a riser. Nothing here perturbs it per pixel.
     let n = hit.normal;
     let s = sun_dir();
     let sc = sun_color(s);
-    // Per-pixel jitter substitute for shading-of-reflections — derive from
-    // hit position since we're not in cs_main scope.
-    let jit = fract(p_hit.x * 17.0 + p_hit.z * 23.0 + camera.time * 13.0);
+    let s_int = sun_intensity(s);
     // Secondary rays don't use the reprojection cache.
     var no_cache = vec2<f32>(0.0);
+    // The water cell this surface belongs to. Stepping down off the plate
+    // rather than using floor(p_hit) directly: a plate can sit flush with its
+    // cell's top face, where floor() names the air voxel in front.
+    let cell = vec3<i32>(floor(vec3<f32>(p_hit.x, p_hit.y - 0.02, p_hit.z)));
 
-    // ---- reflection off the plate ----
-    // trace_no_water: the reflection origin sits INSIDE the water cell (the
-    // plate is below the cube top), so a plain trace would hit the very cell
-    // it started in. Skipping water also keeps the reflection showing terrain
-    // and sky rather than the surface's own neighbouring plates.
-    let refl_dir = reflect(dir, n);
-    // Grazing rays skim the wavy surface and brush dozens of neighbouring
-    // wave-plate AABBs before escaping; lifting the origin with incidence
-    // angle clears the chop (max ~0.35 voxel at full graze - geometrically
-    // invisible, but it skips the candidate forest along the skim path).
-    let graze = 1.0 - clamp(dot(-dir, n), 0.0, 1.0);
-    let refl_origin = p_hit + n * (0.01 + 0.34 * graze * graze);
-    // Temporal reflection accumulation (converging, TAA-family): on a STATIC
-    // camera the reflected scene per pixel varies only with the animated wave
-    // normal, so blending history converges to the cone-filtered (glossy)
-    // reflection - and lets half the pixels per frame skip the trace + full
-    // hit shading entirely (the two largest water costs). Reuse is validated
-    // against the stored surface point; motion traces fresh every frame as
-    // before. History always updates, so stopping the camera never reads
-    // stale content.
-    let res_i = vec2<i32>(camera.resolution);
-    let hidx = refl_hist_idx(px, res_i);
-    // MOVING-camera reuse (one path for both states): find where this
-    // frame's surface point sat in the PREVIOUS frame and read history
-    // there; a static camera reprojects to the same pixel. Validity needs
-    // BOTH a surface-position match (below, as before) and a bounded view
-    // rotation toward the point (~2 deg since last frame) - reflections are
-    // view-dependent, so the angle gate bounds reflection parallax error by
-    // construction. Distance-adaptive for free: close water re-traces
-    // (parallax visible), far water reuses (parallax negligible).
-    var hist_px = px;
-    if (camera.prev_valid > 0.5) {
-        let abs_hit = p_hit + vec3<f32>(camera.world_origin);
-        let dprev = abs_hit - camera.prev_origin;
-        let pz = dot(dprev, camera.prev_forward);
-        if (pz > 0.01) {
-            let aspect = camera.resolution.x / camera.resolution.y;
-            let ndc = vec2<f32>(
-                dot(dprev, camera.prev_right) / (pz * camera.tan_half_fov * aspect),
-                dot(dprev, camera.prev_up) / (pz * camera.tan_half_fov));
-            let uvp = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-            if (uvp.x >= 0.0 && uvp.x < 1.0 && uvp.y >= 0.0 && uvp.y < 1.0) {
-                hist_px = vec2<i32>(uvp * camera.resolution);
-            }
-        }
-    }
-    let hist = transp_buf[refl_hist_idx(hist_px, res_i)];
-    let hist_p = vec3<f32>(bitcast<f32>(hist.z), unpack2x16float(hist.y).y, bitcast<f32>(hist.w));
-    let hist_dp = hist_p - p_hit;
-    let v_now = normalize(p_hit - camera.origin);
-    let v_prev = normalize((p_hit + vec3<f32>(camera.world_origin)) - camera.prev_origin);
-    let angle_ok = dot(v_now, v_prev) > 0.9994; // ~2 degrees
-    let hist_ok = camera.prev_valid > 0.5 && angle_ok && dot(hist_dp, hist_dp) < 0.35;
-    // 8x8-BLOCK stagger, not per-pixel: a pixel checkerboard leaves every
-    // SIMT warp with both tracing and skipping threads, so the warp pays the
-    // trace latency anyway (measured: zero gain). Whole workgroups skipping
-    // coherently is what converts skipped work into time.
-    let stagger_trace = (((px.x >> 3) ^ (px.y >> 3) ^ i32(camera.gi_round)) & 1) == 0;
-    // Per-voxel reflection cache first: the reflected radiance is a stored
-    // property of the water voxel, so the common case is a four-word fetch
-    // instead of a trace plus a full secondary shade. `ok` is false for any
-    // voxel the cache cannot answer for (no block yet, never converged, or a
-    // query outside the recorded hemisphere), and then the per-pixel path below
-    // runs UNCHANGED - a voxel whose reflection has not converged must not
-    // render black.
-    var vl_refl_ok = false;
-    var vl_refl = vec3<f32>(0.0);
-    if (PROF_TRANSP_NO_REFL < 0.5) {
-        vl_refl = voxlight_reflection(p_hit, n, refl_dir, &vl_refl_ok);
-    }
-    var refl_col: vec3<f32>;
-    if (PROF_TRANSP_NO_REFL > 0.5) {
-        // Cost-split probe: whole reflection component off (trace, shade,
-        // history traffic).
-        refl_col = sky(refl_dir);
-    } else if (vl_refl_ok) {
-        refl_col = vl_refl;
-    } else if (hist_ok && !stagger_trace) {
-        let rg = unpack2x16float(hist.x);
-        refl_col = vec3<f32>(rg.x, rg.y, unpack2x16float(hist.y).x);
+    // ---- LIT or SHADOWED ------------------------------------------------
+    // Straight from the per-voxel light field: sun visibility is a stored
+    // property of the air cell above the water, so a whole plate shares one
+    // value and the shadow edge lands on cell boundaries like everything else
+    // in this look. Sampled about world +Y, not the facet normal, because the
+    // record that matters is the one directly over the cell.
+    //
+    // The fallback is ONE shadow ray from just above the cell's top face (the
+    // column above a surface water cell is air by construction), which is what
+    // the specular glint used to trace on its own. Worlds with no bound field -
+    // every crafted test scene - therefore still get a correct shadow, and the
+    // glint below reuses this instead of tracing a second ray.
+    let vlf = voxlight_sample(p_hit, vec3<f32>(0.0, 1.0, 0.0));
+    var sun_vis: f32;
+    if (vlf.valid) {
+        sun_vis = vlf.sun;
+    } else if (s_int > 0.0) {
+        let sky_origin = vec3<f32>(p_hit.x, floor(p_hit.y) + 1.001, p_hit.z);
+        sun_vis = select(1.0, 0.0, shadow_occluded(sky_origin, s, SHADOW_MAX_DIST));
     } else {
-        let refl_hit = trace_secondary(refl_origin, refl_dir, SECONDARY_MAX_T);
-        var fresh: vec3<f32>;
-        if (refl_hit.hit) {
-            if (PROF_TRANSP_REFL_FLATSHADE > 0.5) {
-                // Cost-split probe: trace kept, hit shading replaced by a
-                // palette read.
-                fresh = palette[refl_hit.mat].rgb;
-            } else {
-                fresh = shade(refl_hit, refl_origin, refl_dir, jit, false, false, false, &no_cache, vec3<f32>(0.0));
-            }
-        } else {
-            fresh = sky(refl_dir);
-        }
-        if (hist_ok) {
-            let rg = unpack2x16float(hist.x);
-            refl_col = mix(fresh, vec3<f32>(rg.x, rg.y, unpack2x16float(hist.y).x), 0.55);
-        } else {
-            refl_col = fresh;
-        }
+        sun_vis = 0.0;
     }
-    // History is written on BOTH paths, cached and traced. If the cache path
-    // skipped the store, a pixel that later fell back would read a history
-    // entry from an older frame that still passes the position/angle gates.
-    if (PROF_TRANSP_NO_REFL < 0.5) {
-        transp_buf[hidx] = vec4<u32>(
-            pack2x16float(refl_col.rg),
-            pack2x16float(vec2<f32>(refl_col.b, p_hit.y)),
-            bitcast<u32>(p_hit.x),
-            bitcast<u32>(p_hit.z),
-        );
-    }
+    // HARD-ish, deliberately. A photoreal penumbra over a faceted surface reads
+    // as a smudge across geometry that has no smooth features anywhere else;
+    // this is narrow enough to look like a drawn edge and wide enough that the
+    // edge itself is still antialiased instead of stair-stepping per pixel.
+    // Folded together with the day/night curve so night water is not "lit".
+    let lit = smoothstep(WATER_SHADOW_EDGE - WATER_SHADOW_SOFT,
+                         WATER_SHADOW_EDGE + WATER_SHADOW_SOFT, sun_vis) * s_int;
 
     // ---- refraction: primary ray bent into the water, trace through it ----
-    // Snell's law via WGSL `refract`. eta = n_air / n_water ≈ 1/1.33.
+    // Snell's law via WGSL `refract`. eta = n_air / n_water ~ 1/1.33.
     let eta = 1.0 / 1.33;
     var refr_dir = refract(dir, n, eta);
     // Total internal reflection would return zero; fall back to dir.
@@ -4149,21 +3680,14 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>, px: vec2<i32>) -
     // hit the bed within a few voxels, and a hardware ray query's fixed setup
     // (init + traversal state + candidate handshake) never amortizes on rays
     // that short - measured as RT transp trailing software by ~0.9 ms on
-    // water-close. Long rays (reflections, shadows, primaries, GI) stay on
-    // the RT cores where the hardware wins.
+    // water-close.
     var under_col: vec3<f32>;
     var depth = 4.0;
-    // Hoisted for the shore-foam block below (the trace lives in the else
-    // scope so the cost-split probe can skip it).
-    var under_hit = false;
-    var under_t = 1.0e9;
     if (PROF_TRANSP_NO_REFR > 0.5) {
         // Cost-split probe: whole refraction component off.
         under_col = vec3<f32>(0.05, 0.15, 0.20);
     } else {
         let under = trace_no_water(refr_origin, refr_dir, SECONDARY_MAX_T);
-        under_hit = under.hit;
-        under_t = under.t_hit;
         if (under.hit) {
             if (PROF_TRANSP_REFR_FLATSHADE > 0.5) {
                 // Cost-split probe: trace kept, hit shading replaced by a
@@ -4175,7 +3699,6 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>, px: vec2<i32>) -
                 // so its sun-shadow ray always terminates in the water column above -
                 // shadow_term is 0 by construction. Feed the constant through the
                 // reuse path instead of tracing a per-pixel ray for a known answer.
-                // AO stays computed (reuse_ao = false). Image-identical.
                 // Flat AO for the refracted hit (cost-split PROVEN: traced
                 // AO was 2.55-2.66 ms of the transp pass - the single
                 // largest water cost - while absorption + tint swamp its
@@ -4184,6 +3707,7 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>, px: vec2<i32>) -
                 // identical below. Look signed off 2026-07-23). The shadow
                 // term stays the proven constant 0.
                 var known_dark = vec2<f32>(0.0, 0.4);
+                let jit = fract(p_hit.x * 17.0 + p_hit.z * 23.0);
                 under_col = shade(under, refr_origin, refr_dir, jit, true, true, false, &known_dark, vec3<f32>(0.0));
             }
         } else {
@@ -4200,59 +3724,115 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>, px: vec2<i32>) -
     let water_tint = tint_base * (ambient_color() * 1.6 + sc * 0.20);
     let refr_col = under_col * transmittance + water_tint * (1.0 - transmittance.x);
 
-    // ---- Fresnel mix of reflection and refraction ----
+    // ---- the flat facet tone --------------------------------------------
+    // A cell's wave band as a brightness step. THIS is what makes the surface
+    // read as faceted: the quantized HEIGHT alone moves the silhouette by
+    // 0.08 voxels, which is a sliver at any normal viewing distance, and the
+    // quantized SLOPE only tilts the facet a few degrees. A tone ladder tied
+    // to the same band turns each cell into a visibly distinct flat face, and
+    // because it is driven by the band and not by the height it steps in
+    // lockstep with the geometry rather than fighting it.
+    let band = water_unpack_band(facet_code) / WATER_WAVE_BANDS;
+    let facet_tone = 1.0 + WATER_FACET_CONTRAST * band;
+
+    // ---- sun glint on the facet -----------------------------------------
+    // Broad (pow 32, not 256) and reusing `sun_vis` rather than tracing. A
+    // razor highlight over quantized facets pops a cell fully on or fully off
+    // as the wave steps it into the next band, which is strobing; a broad lobe
+    // moves a few percent per step.
+    let hv = normalize(s - dir);
+    let spec = pow(max(0.0, dot(n, hv)), 32.0);
+    let glint = sc * spec * lit * 0.55;
+
+    var col = refr_col * facet_tone * mix(WATER_SHADOW_TONE, 1.0, lit) + glint;
+
+    // ---- Fresnel toward the sky -----------------------------------------
+    // KEPT, and this was the judgement call the brief asked for. Without it a
+    // lake is one flat blue field from the shore to the horizon: the facet
+    // ladder gives it cell-scale texture but nothing at all changes with view
+    // angle, so it reads as painted, and the far half of a big lake reads as a
+    // solid rectangle. The blend is against `fog_atmospheric`, NOT `sky` -
+    // the same emitter-free sky the fog uses - so the sun disc and the stars
+    // cannot pop when a facet steps into the mirror direction, which is exactly
+    // the strobing a quantized normal invites.
     let cos_theta = clamp(dot(-dir, n), 0.0, 1.0);
     let f0 = 0.02;
-    let fresnel = f0 + (1.0 - f0) * pow(1.0 - cos_theta, 5.0);
+    // CAPPED, not the raw Schlick curve. Uncapped, fresnel runs to 1.0 at true
+    // graze and the far half of any lake becomes a sheet of horizon sky: the
+    // terrace lab's low camera came back milky grey-white with every facet
+    // washed out of it. The cap keeps the view-angle gradient that stops the
+    // surface reading as paint while leaving the water's own colour in charge.
+    let fresnel = min(f0 + (1.0 - f0) * pow(1.0 - cos_theta, 5.0), WATER_SKY_MAX);
+    let sky_col = fog_atmospheric(reflect(dir, n)) * mix(0.55, 1.0, lit);
+    col = mix(col, sky_col, fresnel);
 
-    // ---- specular sun glint (sharper for stronger highlight) ----
-    let h = normalize(s - dir);
-    let spec = pow(max(0.0, dot(n, h)), 256.0);
-    var shadow = 0.0;
-    // Glint gate: the pow-256 highlight covers a few percent of water pixels,
-    // yet every pixel traced this shadow ray. Below spec 0.002 the composite
-    // contribution (sc * spec * 1.4 <= ~0.004) is under one colour LSB -
-    // skipping the trace there is invisible by bound.
-    if (spec > 0.002 && sun_intensity(s) > 0.0 && dot(n, s) > 0.0) {
-        // The hit sits inside the water cell (plate below the cube top), and
-        // water voxels count as solid for trace_any — a shadow ray from p_hit
-        // would self-occlude. Lift the origin to just above the cell's top
-        // face: the column above a surface cell is air by construction.
-        let glint_origin = vec3<f32>(p_hit.x, floor(p_hit.y) + 1.001, p_hit.z);
-        shadow = select(1.0, 0.0, shadow_occluded(glint_origin, s, SHADOW_MAX_DIST));
-    }
+    // Deep-pit floor: at a grazing angle over a deep hole the refraction is
+    // fully absorbed, so the surface would read near-black. Floor it with the
+    // ambient water-body blue so deep water is dark BLUE, not black.
+    col = max(col, water_tint * 0.55 * mix(WATER_SHADOW_TONE, 1.0, lit));
 
-    // ---- shoreline foam: triggered by shallow water (under.t_hit small) ----
-    // The closer the underwater hit, the brighter the white foam contribution.
-    // Wave-crest noise modulates so foam looks like spray, not a flat ring.
+    // ---- stylized foam ---------------------------------------------------
+    // Hard-edged and quantized, at two places a stylized sea has white water:
+    // the top of the wave range, and where it meets solid ground. Both are
+    // PER-CELL decisions (the cell's band; the cell's solid neighbours), so
+    // foam is locked to the voxel grid like everything else here; the authored
+    // stamp only carves each cell's quarter-voxel silhouette so a run of foam
+    // cells has a ragged edge instead of a drawn rectangle.
+    //
+    // No soft ramp anywhere: `foam` is 0, or it is one of two hard levels.
     var foam = 0.0;
-    if (under_hit && under_t < 1.6) {
-        let shore = 1.0 - clamp(under_t / 1.6, 0.0, 1.0);
-        // Crest-driven ONLY (no constant term): calm shallow water - a
-        // filling pool, a thin lake - must NOT foam. Froth appears only
-        // where a positive wave crest breaks over the shallow bottom, so
-        // it reads as spray at the shoreline, not a white sheet over every
-        // shallow patch. Field heights are ±~0.11 voxels, hence the *14.
-        let crest = clamp(water_field(p_hit.xz, camera.time).x * 14.0, 0.0, 1.0);
-        foam = shore * crest * 0.7;
+    let foam_fade = 1.0 - smoothstep(WATER_FOAM_T * 0.75, WATER_FOAM_T, hit.t_hit);
+    if (foam_fade > 0.0 && n.y > 0.5) {
+        let local = p_hit.xz - floor(p_hit.xz);
+        let shore = water_unpack_shore(facet_code);
+        // Distance from the shore edge in quarter-voxel texels, taking the
+        // NEAREST solid side. Quantized to the same 4-texel grid the stamp is
+        // drawn on, so the band edge is a texel boundary and not a curve.
+        let sub = clamp(vec2<i32>(floor(local * 4.0)), vec2<i32>(0), vec2<i32>(3));
+        let fh = foam_hash(cell);
+        // Band width VARIES PER CELL over 0, 1 or 2 quarter-voxel texels, with
+        // a quarter of shore cells drawing NONE. A constant width made a pool's
+        // rim a uniform stripe that read as a drawn outline rather than as
+        // surf - plainly so on the terrace lab, where the camera sits a couple
+        // of voxels off the water - and merely varying 1 vs 2 only softened it:
+        // an unbroken band of any width is still a band. Dropping whole cells
+        // is what breaks the rim into surf.
+        let bw = min(i32((fh >> 6u) & 3u), WATER_FOAM_SHORE_SUB);
+        var near_shore = false;
+        if ((shore & 1u) != 0u && sub.x >= 4 - bw) { near_shore = true; }
+        if ((shore & 2u) != 0u && sub.x < bw) { near_shore = true; }
+        if ((shore & 4u) != 0u && sub.y >= 4 - bw) { near_shore = true; }
+        if ((shore & 8u) != 0u && sub.y < bw) { near_shore = true; }
+        var t = 0u;
+        if (near_shore) {
+            t = foam_texel(SPR_FOAM_SHORE, local, fh);
+        } else if (round(water_unpack_band(facet_code)) >= WATER_FOAM_BAND
+                   && (fh >> 10u) % 8u < WATER_FOAM_CREST_ODDS) {
+            t = foam_texel(SPR_FOAM_CREST, local, fh);
+        }
+        // Two hard levels: body and highlight. Nothing between them.
+        foam = select(select(0.0, 0.72, t == 1u), 1.0, t == 3u) * foam_fade;
     }
-
-    // ---- caustics: brighten the underwater colour where the surface wave
-    // gradient focuses light. Approximation: |∇h| → dispersion factor, where
-    // small gradient = focused beams. Only applies to the refracted column.
-    let caustic = 0.6 + 0.8 * pow(max(0.0, n.y), 18.0);
-
-    var col = mix(refr_col * caustic, refl_col, fresnel) + sc * spec * shadow * 1.4;
-    // Deep-pit floor: at a grazing angle over a deep hole the reflection
-    // looks into the dark pit interior (high Fresnel) and the refraction is
-    // fully absorbed, so the surface would read near-black. Floor it with
-    // the ambient water-body blue so deep water is dark BLUE, not black.
-    // Negligible on bright sky-reflecting water (max keeps the brighter).
-    col = max(col, water_tint * 0.55);
-    // Foam colour also dims at night — at dawn/dusk it picks up the warm
-    // sun tint, at noon it's bright white, at night it fades into ambient.
-    let foam_col = ambient_color() * 1.5 + sc * 0.50;
+    // Foam colour dims at night - at dawn/dusk it picks up the warm sun tint,
+    // at noon it is near-white - and, like the surface under it, drops to the
+    // shadow tone when the cell is not in sun.
+    //
+    // The ambient term is DESATURATED before it is used. Ambient is a strongly
+    // blue sky colour, and white water is white: foam that reads as "a lighter
+    // patch of the same blue" is foam that does not register as foam.
+    //
+    // Scoped honestly, because it was measured: at NOON this changes almost
+    // nothing, since foam is HDR there and the tonemapper saturates it toward
+    // white with or without the desaturation (the brightest 5% of a shoreline
+    // crop reads 13.9 saturation with it against 10.4 without). It earns its
+    // place in the SHADOWED and night ranges, where the tone multiplier keeps
+    // foam well below saturation and the blue cast is plainly visible.
+    let amb = ambient_color();
+    let amb_grey = vec3<f32>(dot(amb, vec3<f32>(0.2126, 0.7152, 0.0722)));
+    let foam_col = (mix(amb, amb_grey, 0.75) * 2.2 + sc * 0.55)
+        * mix(WATER_SHADOW_TONE, 1.0, lit);
     col = mix(col, foam_col, foam);
+
     let fog_t = fog_amount(hit.t_hit);
     return mix(col, fog_atmospheric(dir), fog_t);
 }
@@ -4570,24 +4150,18 @@ fn shade_glass(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     // Secondary rays don't use the reprojection cache.
     var no_cache = vec2<f32>(0.0);
 
+    // Glass keeps its PER-PIXEL mirror. It predates the per-voxel reflection
+    // field and outlived it: a window pane is a small, near-flat, high-Fresnel
+    // surface where a true mirror is the whole effect, and it is not the
+    // stylized-water surface this branch reworked.
     let refl_dir = reflect(dir, n);
     let refl_origin = p_hit + n * 0.01;
-    // Per-voxel reflection cache, same contract as the water surface: a
-    // four-word fetch when the glass voxel's record covers this face, and the
-    // untouched per-pixel trace + shade whenever it does not (no block yet,
-    // never converged, or the record was gathered from the pane's other side).
-    var vl_refl_ok = false;
-    let vl_refl = voxlight_reflection(p_hit, n, refl_dir, &vl_refl_ok);
     var refl_col: vec3<f32>;
-    if (vl_refl_ok) {
-        refl_col = vl_refl;
+    let refl_hit = trace(refl_origin, refl_dir);
+    if (refl_hit.hit) {
+        refl_col = shade(refl_hit, refl_origin, refl_dir, jit, false, false, false, &no_cache, vec3<f32>(0.0));
     } else {
-        let refl_hit = trace(refl_origin, refl_dir);
-        if (refl_hit.hit) {
-            refl_col = shade(refl_hit, refl_origin, refl_dir, jit, false, false, false, &no_cache, vec3<f32>(0.0));
-        } else {
-            refl_col = sky(refl_dir);
-        }
+        refl_col = sky(refl_dir);
     }
 
     // Chromatic dispersion: shift the refractive index slightly per channel.
@@ -5122,14 +4696,16 @@ fn resolve_solid_voxel(voxel: vec3<i32>, m: u32, slot_v: vec3<i32>, bp: vec3<i32
         (*out).voxel = voxel;
         (*out).last_axis = -1; // sub-voxel hit (water is always deferred)
         (*out).t_hit = wh.t_hit;
-        water_grad_rest = wh.grad_rest;
+        water_facet_grad = wh.grad;
+        water_facet_code = water_pack_facet(wh.band, wh.shore);
         return true;
     }
-    return false; // ray passed above the patch
+    return false; // ray passed above the plate
 }
 
 fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
-    water_grad_rest = vec2<f32>(0.0);
+    water_facet_grad = vec2<f32>(0.0);
+    water_facet_code = 0u;
     var out: Hit;
     out.hit = false;
     out.mat = 0u;

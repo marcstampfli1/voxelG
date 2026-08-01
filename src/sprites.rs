@@ -93,8 +93,14 @@ atlas_consts! {
     SPR_TUFT_A = 23;
     SPR_TUFT_B = 24;
     SPR_TUFT_C = 25;
+    /// Stylized water foam, drawn as a 4x4 GRID OF SIXTEEN 4x4 SHAPES rather
+    /// than one 16x16 picture - see the art below. Sparse broken spray for a
+    /// wave crest.
+    SPR_FOAM_CREST = 26;
+    /// The same 16-shape layout, dense: surf piled against a shoreline.
+    SPR_FOAM_SHORE = 27;
     /// Number of 16x16 sprites in the atlas.
-    N_SPRITES = 26;
+    N_SPRITES = 28;
     /// Word offset of the first 32x32 tuft (after the 16x16 sprites).
     TUFT_BASE_WORDS = N_SPRITES * SPRITE_WORDS;
     /// Better Leaves tuft indices: tuft i lives at word
@@ -646,6 +652,63 @@ const ART: [[&str; SPRITE_DIM]; N_SPRITES] = [
         "................",
         "................",
     ],
+    // ---- water foam -------------------------------------------------------
+    // These two are NOT single pictures. Water foam is decided PER VOXEL CELL
+    // (crest band, or adjacent to solid) and drawn at QUARTER-VOXEL texels, so
+    // one cell needs a 4x4 stamp, and a single stamp repeated over a shoreline
+    // reads as wallpaper. Each sprite is therefore a LIBRARY of sixteen 4x4
+    // shapes laid out in a 4x4 grid; the shader hashes the cell coordinates to
+    // pick one (`foam_texel` in shaders/raymarch.wgsl). Tile t occupies
+    // columns 4*(t&3)..+4 and rows 4*(t>>2)..+4.
+    //
+    // Legend as elsewhere, remapped for foam: '#' = foam, '*' = bright crest
+    // highlight. Nothing uses 'o' here - foam is deliberately TWO-TONE and
+    // hard-edged, because a third shade is the beginning of a gradient and the
+    // whole point of this art is that it has none.
+    //
+    // SPR_FOAM_CREST - sparse flecks: broken spray thrown off a wave top. Each
+    // 4x4 shape carries 4-6 texels, so a crest reads as scattered chunks, not
+    // a white cap.
+    [
+        ".#....#.#....#.#",
+        "#..#.#....##....",
+        "..*.#..*.*..#.*.",
+        "...#.#..#....#..",
+        "..#.#....#....##",
+        "#.#..##.#..#.#..",
+        "...**....*#.#...",
+        ".#....#......*..",
+        "#.#..*....#.#..*",
+        "..#*#.#..#.#..#.",
+        ".#....##*....#.#",
+        "#....#....#.#...",
+        ".#.##.....*#.#..",
+        "*....#*.#.#...##",
+        "..#.#..#....#.*.",
+        ".##...#..#.#..#.",
+    ],
+    // SPR_FOAM_SHORE - dense surf. ~80% coverage per shape so a RUN of shore
+    // cells forms one continuous band with a ragged edge, instead of the
+    // disconnected blobs a sparse stamp would give; the holes are what keep
+    // that band from reading as a drawn outline.
+    [
+        "####.######.####",
+        "###.#####*##.###",
+        "#*#####.######.#",
+        ".#####*####.####",
+        "##.#####.#######",
+        "######*######.##",
+        "###*.###########",
+        "#######.#.##.###",
+        "###.#####.######",
+        "####.##########*",
+        "#*#########.####",
+        "######.#####.###",
+        "#####*#####.####",
+        "####.#########.#",
+        ".#########.#####",
+        "#*#############.",
+    ],
 ];
 
 // ---------------------------------------------------------------------------
@@ -1168,6 +1231,62 @@ mod tests {
             assert!(row_count(12) <= 4, "sprite {s} tip row density");
             assert_eq!(row_count(15), 0, "sprite {s} top row clear");
         }
+    }
+
+    /// The two water-foam sprites are SHAPE LIBRARIES, not pictures: sixteen
+    /// independent 4x4 stamps in a 4x4 grid, one of which the shader picks per
+    /// water cell. The contract that makes them work is per-TILE, so it is
+    /// checked per tile:
+    ///  - every tile carries some foam, or a cell that hashed to it would
+    ///    silently draw nothing and punch a hole in a shoreline;
+    ///  - crest tiles stay sparse (broken spray) and shore tiles stay dense (a
+    ///    continuous band with a ragged edge) - that difference IS the art
+    ///    direction, and a shore tile as sparse as a crest tile would turn the
+    ///    shoreline into speckle;
+    ///  - no tile is solid, or its cell reads as a painted rectangle;
+    ///  - the sixteen tiles differ, or the hash buys nothing and the surface
+    ///    reads as wallpaper.
+    #[test]
+    fn foam_stamps_are_a_library_of_distinct_shapes() {
+        let w = encoded();
+        for (s, band, what) in [
+            (SPR_FOAM_CREST, 3..=8, "crest"),
+            (SPR_FOAM_SHORE, 10..=15, "shore"),
+        ] {
+            let mut seen: Vec<u16> = Vec::new();
+            for tile in 0..16usize {
+                let (tx, ty) = ((tile & 3) * 4, (tile >> 2) * 4);
+                let mut bits = 0u16;
+                let mut n = 0usize;
+                for dy in 0..4 {
+                    for dx in 0..4 {
+                        if texel(&w, s, tx + dx, ty + dy) != 0 {
+                            bits |= 1 << (dy * 4 + dx);
+                            n += 1;
+                        }
+                    }
+                }
+                assert!(
+                    band.contains(&n),
+                    "{what} foam tile {tile} has {n} of 16 texels, outside {band:?}"
+                );
+                seen.push(bits);
+            }
+            let distinct: std::collections::HashSet<u16> = seen.iter().copied().collect();
+            assert!(
+                distinct.len() >= 14,
+                "{what} foam has only {} distinct shapes of 16 - the per-cell hash cannot break \
+                 up a shoreline it keeps stamping the same shape onto",
+                distinct.len()
+            );
+        }
+        // Crest spray must carry bright highlight texels: they are the specks
+        // that read as spray rather than as a flat white patch.
+        let accents = (0..SPRITE_DIM)
+            .flat_map(|y| (0..SPRITE_DIM).map(move |x| (x, y)))
+            .filter(|&(x, y)| texel(&w, SPR_FOAM_CREST, x, y) == 3)
+            .count();
+        assert!(accents >= 8, "crest foam needs highlight texels, has {accents}");
     }
 
     /// Contact sheet: every 16x16 sprite scaled x8 into a grid PNG for eye

@@ -59,19 +59,22 @@ Validation tooling added so changes are checkable without a display:
   profiler to justify; near-only foliage removes the worst divergence.)*
 - **LOD** → far terrain terminates at brick (`LOD_BRICK_T`) then tile granularity
   (`TILE_LOD_T`, via a tile-representative material).
-- **connected water surface** → per-corner heights (mean fill level of the
-  corner-sharing columns + Gerstner field at the corner; water one cell up in
-  any sharing column pins the corner to the cell top) with closed-form
-  bilinear-patch intersection, so diagonally-touching / different-height
-  water knits into one surface. Corner tier within `WATER_NEAR_T`, previous
-  centre-plane facet beyond; rest-gradient carried to the deferred pass in
-  the u32 transparent record. Validated by `water_diagonal_connects`
-  (measured thresholds, fails on the pre-fix shader), `water_terrace_ramp`,
-  the `water_terrace` lookdev view and a terrace timing scenario. Cost on
-  the worst-case ocean bench: 12.15 -> 13.5 ms/frame at 1080p (74 fps
-  GPU-bound; breakdown in the feat commit). *(Known scalable follow-up: a
-  per-frame surface-cell corner precompute would take the probes off the
-  per-ray path entirely.)*
+- **faceted water surface** → REPLACED the connected per-corner surface
+  (2026-08-01, art direction): one horizontal plate per surface water cell at
+  one quantized height with one flat normal, both from the Gerstner field
+  sampled at the CELL CENTRE. Where a neighbouring plate stands higher the ray
+  enters below this cell's plate and the entry face is the hit, so a staircase
+  of independent plates has no holes without any shared-corner rule; a lateral
+  entry from another water cell is presented with the plate's own normal so a
+  step riser does not paint a dark crack. The corner pins, the step-down fold,
+  the two-triangle split, the separate near/far tiers and their up-to-24
+  neighbour probes per cell are all gone (4 probes now, and only within foam
+  range). The quantized slope plus the wave band + solid-neighbour mask ride
+  the u32 transparent record to the deferred pass. Validated by
+  `water_terrace_corner_is_plates_not_a_gash`, `water_terrace_ramp`,
+  `water_foam_is_white_and_sits_at_crests_and_shores`,
+  `water_reads_lit_or_shadowed` and the `water_view` / `water_graze` /
+  `water_terrace` / `water_shadow` lookdev views.
 - **falling leaves** → deterministic CPU sim (src/leaffall.rs, SplitMix64,
   256 cap, canopy-top spawns through the fringe cap, ground/water/TTL
   kill) driving an instanced card pass composited AFTER the TAA
@@ -229,8 +232,9 @@ proves sand falls one cell with mass + occupancy conserved.
 
 **Done (transparent/foliage deferred pass, #16):** `cs_main` records water-top /
 glass hits into a read_write storage buffer + writes a cheap placeholder; a
-separate `cs_transparent` pass shades only those pixels (reflection / refraction /
-dispersion) and re-applies clouds + god-rays. Keeps the opaque-majority warps in
+separate `cs_transparent` pass shades only those pixels (refraction / dispersion;
+water's reflection was deleted with the stylized-water rework, glass keeps its
+per-pixel mirror) and re-applies clouds + god-rays. Keeps the opaque-majority warps in
 `cs_main` coherent (less 8×8 divergence) on top of the existing near-only foliage.
 
 **Note — reprojection is static-only.** The Win C shadow/AO cache and the

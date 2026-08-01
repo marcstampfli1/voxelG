@@ -106,12 +106,14 @@ fn resolve_brick_full(bi: i32, bmin: vec3<f32>, o: vec3<f32>, dir: vec3<f32>,
 
 fn trace_rt(origin: vec3<f32>, dir: vec3<f32>, skip_transparent: bool, t_cap: f32) -> Hit {
     var out = rt_hit_none();
-    water_grad_rest = vec2<f32>(0.0);
+    water_facet_grad = vec2<f32>(0.0);
+    water_facet_code = 0u;
     let o = origin - vec3<f32>(camera.world_origin);
     var rq: ray_query;
     rayQueryInitialize(&rq, world_tlas, RayDesc(0u, 0xFFu, 0.0, t_cap, o, dir));
     var best_t = 1.0e30;
     var best_grad = vec2<f32>(0.0);
+    var best_code = 0u;
     while (rayQueryProceed(&rq)) {
         let c = rayQueryGetCandidateIntersection(&rq);
         if (c.kind == RAY_QUERY_INTERSECTION_AABB) {
@@ -120,18 +122,21 @@ fn trace_rt(origin: vec3<f32>, dir: vec3<f32>, skip_transparent: bool, t_cap: f3
             let a = rt_aabbs[c.primitive_index];
             let bmin = vec3<f32>(a.min_x, a.min_y, a.min_z);
             var bh = rt_hit_none();
-            water_grad_rest = vec2<f32>(0.0);
+            water_facet_grad = vec2<f32>(0.0);
+            water_facet_code = 0u;
             let t = resolve_brick_full(bi, bmin, o, dir, origin, best_t, skip_transparent, &bh);
             let ht = bh.t_hit;
             if (t >= 0.0 && bh.hit && ht < best_t) {
                 best_t = ht;
                 out = bh;
-                best_grad = water_grad_rest;
+                best_grad = water_facet_grad;
+                best_code = water_facet_code;
                 rayQueryGenerateIntersection(&rq, ht);
             }
         }
     }
-    water_grad_rest = best_grad;
+    water_facet_grad = best_grad;
+    water_facet_code = best_code;
     return out;
 }
 

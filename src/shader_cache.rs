@@ -1,11 +1,11 @@
 //! Persistent driver pipeline cache.
 //!
 //! WHY this exists: `shaders/raymarch.wgsl` assembles to ~4700 lines and the
-//! renderer compiles seven entry points out of it (`cs_main`, `cs_compose`,
-//! `cs_transparent`, `cs_godrays`, `cs_clouds`, `cs_voxel_light_update`,
-//! `cs_voxel_refl_update`). With `VOXELG_RT=1` the ray-query source is a second
-//! module and seven more compiles come out of that one (`cs_clouds` stays
-//! software, `cs_gi_probe_update` joins), so a launch is fourteen. Turning that
+//! renderer compiles six entry points out of it (`cs_main`, `cs_compose`,
+//! `cs_transparent`, `cs_godrays`, `cs_clouds`, `cs_voxel_light_update`).
+//! With `VOXELG_RT=1` the ray-query source is a second module and six more
+//! compiles come out of that one (`cs_clouds` stays software,
+//! `cs_gi_probe_update` joins), so a launch is twelve. Turning that
 //! SPIR-V into machine code is the driver's job and it is minutes of work on a
 //! cold driver cache, with no window on screen and nothing in the log: the
 //! first launch of a release build looks like a hang.
@@ -17,6 +17,11 @@
 //! Measured by `pipeline_compile_time` below on an RTX 4060 Ti / Vulkan /
 //! NVIDIA 591.86, with the DRIVER's own cache redirected to a scratch directory
 //! so it can be emptied independently of ours:
+//!
+//! The table was taken when each variant still built SEVEN entry points
+//! (`cs_voxel_refl_update` has since been deleted with the reflection field),
+//! so the totals are a slight over-count of what a launch pays today. It is
+//! left as measured rather than rescaled by arithmetic nobody ran:
 //!
 //!                        no blob    our blob
 //!     software (7)       110.0 s       0.9 s   <- what a DEFAULT launch pays
@@ -293,8 +298,8 @@ impl ShaderCache {
 /// Create a compute pipeline through `cache`, logging the driver's compile time.
 ///
 /// WHY the log: a cold compile of one raymarch entry point is seconds, and
-/// seven in a row with a single line at the end is indistinguishable from a
-/// hang. One line per pipeline turns "frozen" into "working, 3 of 7".
+/// six in a row with a single line at the end is indistinguishable from a
+/// hang. One line per pipeline turns "frozen" into "working, 3 of 6".
 pub fn create_compute_timed<'a>(
     device: &wgpu::Device,
     cache: &'a ShaderCache,
@@ -917,7 +922,6 @@ mod tests {
                 "cs_transparent",
                 "cs_gi_probe_update",
                 "cs_voxel_light_update",
-                "cs_voxel_refl_update",
             ]
         } else {
             &[
@@ -926,7 +930,6 @@ mod tests {
                 "cs_compose",
                 "cs_transparent",
                 "cs_voxel_light_update",
-                "cs_voxel_refl_update",
             ]
         };
 

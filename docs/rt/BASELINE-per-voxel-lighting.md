@@ -4,8 +4,9 @@ The BEFORE-baseline below was taken on `feat/per-voxel-lighting` at commit
 a113962 (the manifest fix only, no lighting change yet). THIS IS THE ONLY
 VALID COMPARISON POINT for the rework: the numbers in docs/PERF.md were
 measured on different hardware and are not comparable to anything measured
-here. Rounds A through D follow it, and round D is the one that measures the
-feature rather than the renderer around it.
+here. Rounds A through F follow it: round D is the one that measures the feature
+rather than the renderer around it, and round F is the one that deletes half of
+it and restyles the water.
 
 Machine: winpc (Windows 11). Harness:
 `cargo test --lib rt_vs_software_timing -- --nocapture --ignored`, test profile
@@ -254,6 +255,12 @@ Stills re-captured with `dump_lookdev_views` and read directly.
 
 ## Round E: the "flickery and not correctly reflecting" report
 
+HISTORY. Everything in this section describes the per-voxel reflection field,
+which round F deletes. The code it names (`voxlight_reflection`,
+`cs_voxel_refl_update`, `voxlight_refl_diagnose` and the four `voxlight_refl_*`
+tests) no longer exists; the measurements are kept because they are the reason
+it does not.
+
 Round D shipped a reflection cache that a user then reported as broken:
 flickery, and not reflecting correctly. Both halves were real, both were found
 by measurement, and neither was the thing the report's leading theory blamed.
@@ -407,12 +414,180 @@ Net per frame, as in round D:
 | water-close     | 2.84 ms       | 1.64 ms      | -1.20 ms |
 | terrain-covered | 2.54 ms       | 1.64 ms      | -0.90 ms |
 
+## Round F: the reflection field deleted, water restyled
+
+Round E ended with a reflection cache that was stable, correct in its own terms,
+and still 62.6% of a mirror's contrast. Round F is the answer to that: the whole
+per-voxel reflection field comes out, the per-pixel water mirror comes out with
+it, and water becomes deliberately faceted and stylized (Marc, 2026-08-01). See
+"Reflections: BUILT, MEASURED, AND DELETED" in docs/VOXEL_LIGHTING_PLAN.md.
+
+Everything below was measured on the same machine and harness as rounds A-E,
+with the BEFORE half taken by `git stash`ing this exact change so the two halves
+differ by nothing else.
+
+### Perf
+
+BEFORE was re-measured for this round rather than quoted from round E; this
+machine's documented run-to-run spread is around 15% and round E's absolutes are
+not comparable to today's.
+
+| scenario        | before  | after   | delta            |
+|-----------------|---------|---------|------------------|
+| terrain         | 15.77   | 16.64   | +0.87 (noise)    |
+| foliage         | 19.26   | 19.43   | +0.17 (noise)    |
+| water-close     |  6.01   |  4.12   | -1.89 (-31.4%)   |
+| terrain-covered |  9.90   |  8.41   | -1.49 (-15.1%)   |
+
+Read the terrain and foliage rows as noise, not as a regression: the SOFTWARE
+column moved by more than they did on paths this change cannot touch (terrain
+14.69 -> 15.65, foliage 18.37 -> 16.85), which is the spread rounds A-E already
+documented. Water-close is the row that matters and it is unambiguous.
+
+WHERE the water win comes from is not where it was expected. The transparent
+pass barely moved - 1.00 -> 0.83 ms - even though it lost an entire reflection
+trace plus a full secondary `shade` per pixel. The primary pass is what
+collapsed:
+
+| water-close, RT-primary | before | after |
+|-------------------------|--------|-------|
+| cs_main                 | 4.15   | 2.24  |
+| primary trace only      | 2.50   | 1.12  |
+| cs_transparent          | 1.00   | 0.83  |
+
+The primary TRACE more than halved because the faceted surface needs almost no
+neighbourhood: the corner-connected surface probed up to 24 neighbours per
+surface cell (8 pin + 8 level + up to 8 step-down) to build four shared corner
+heights, and a flat plate needs one probe for "is there water above" plus four
+for the shore mask, and those four only inside foam range. That is a geometry
+saving, and it was not the point of the change - it came free with it.
+
+The reflection UPDATE PASS is also gone from every frame:
+
+    round E:  light pass 1.38 ms + reflection pass 0.51 ms = 1.64 ms
+    round F:  light pass 1.63 ms                           = 1.63 ms
+
+(the light pass's own number is inside this run's spread; the reflection pass's
+0.51 ms is simply not spent any more.)
+
+### What the field is still worth, which is LESS than it was
+
+| scenario        | A/B before        | A/B after        |
+|-----------------|-------------------|------------------|
+| terrain         | -0.97 ms (-5.8%)  | -1.09 ms (-6.1%) |
+| foliage         | +0.70 ms (+3.6%)  | +0.02 ms (+0.1%) |
+| water-close     | -3.31 ms (-34.4%) | -0.65 ms (-13.9%)|
+| terrain-covered | -3.45 ms (-26.0%) | -1.48 ms (-14.9%)|
+
+Water-close falling from -3.31 to -0.65 ms is NOT a regression in the field, and
+it would be easy to report it as one. Most of what the field used to save on
+water was saving the SECONDARY rays: every reflection ray that hit something ran
+a full `shade`, paying a shadow ray and an AO evaluation, and the field answered
+all of them from a record. There are no reflection rays now. What is left is the
+water surface's own sun term, and one field fetch instead of one shadow ray is
+worth 0.65 ms. The frame is 1.89 ms faster in absolute terms; the field's share
+of the credit is smaller because the bill is smaller.
+
+Net per frame against the 1.63 ms update cost, as in rounds D and E: the field
+still pays for itself on terrain-covered (-1.48 vs 1.63, roughly break-even) and
+no longer does on water-close. That is the same open item rounds D and E
+recorded - the update pass is not camera-aware and the per-pixel path it was
+meant to replace is still there - and this round does not close it.
+
+### Temporal stability, and the one place it got worse
+
+`flicker_probe_rt_views`, before and after, on the same machine. The non-water
+views (terrain_trees, tree_shadow, meadow, underwater) are BIT-IDENTICAL across
+the change, which is the check that this is a water-only rework.
+
+| view                 | before          | after           |
+|----------------------|-----------------|-----------------|
+| water_top            | 2796 (0.135%)   | 5807 (0.280%)   |
+| water_graze, no field| 12290 (0.593%)  | 5562 (0.268%)   |
+| water_graze, field   | 474 (0.023%)    | 3833 (0.185%)   |
+
+Stated plainly, because it cuts both ways:
+
+- Against the PER-PIXEL MIRROR - the thing a player was actually looking at
+  before the reflection cache existed - stylized water flickers 2.2x LESS
+  (0.593% -> 0.268%).
+- Against the REFLECTION CACHE, it flickers 8x MORE (0.023% -> 0.185%). The
+  cache was a view-independent value stored per voxel and recomputed rarely; it
+  was almost perfectly still by construction. Quantized animated geometry cannot
+  be, and is not meant to be.
+- The steep view is up 2.1x (0.135% -> 0.280%) and there is no reflection in it
+  either way at that angle, so that number is the animation itself.
+
+It was 8.7x worse than that before it was measured and fixed. The first build
+read 1.177% on water_top, and the cause was found by elimination rather than
+guessed:
+
+| water_top variant            | strong flicker |
+|------------------------------|----------------|
+| before this rework           | 0.135%         |
+| faceted, hard band ladder    | 1.177%         |
+| ... with crest foam disabled | 1.162%         |
+| ... with the TONE ladder off | 0.262%         |
+| ... tone ladder EASED (ship) | 0.280%         |
+
+So the foam was not it (0.015 points) and the tone ladder was 78% of it: a hard
+staircase pops a cell by a whole tone step the instant the wave carries it over
+a band boundary. The fix is `WATER_BAND_EASE`, which spends 35% of each band
+sliding across its boundary instead of sitting on it. It costs nothing in the
+look because the thing that makes the surface read as faceted is the step
+BETWEEN NEIGHBOURING CELLS, which is untouched - only a cell CROSSING a boundary
+changes gradually, over several frames instead of one, and 65% of cells still
+sit exactly on a level.
+
+THE HEIGHT IS DELIBERATELY NOT EASED, and that is the other half of the same
+measurement. Easing it as well took water_top to the same 0.290% but pushed the
+GRAZING view the wrong way, 0.161% -> 0.340%: from a low angle a crest's plate
+occludes the trough behind it, so a hard-quantized height holds that occlusion
+boundary still while a sliding one creeps it across pixels. The height's
+quantization is load-bearing for grazing stability; the tone's was only ever
+load-bearing for the look.
+
+### Look, round F
+
+Stills captured with `dump_lookdev_views` and read directly, including a new
+`water_shadow` view - a wall standing in a flat sheet - because no natural
+camera in the demo world has shadowed open water in frame, and the lit/shadowed
+read is the whole of this change's part 2.
+
+- BEFORE, the water was blue paint. A 3x crop of the middle of `water_view` is a
+  single flat blue with a handful of stray dark pixels in it; the grazing crop is
+  the same blue with soft dark smudges where the reflection cache was
+  reconstructing shoreline vegetation. That is the reflection decision's cost
+  from round D and E, seen plainly.
+- AFTER, the same crops are a mosaic of flat cells at distinct blues with hard
+  boundaries, and chunky near-white foam at the crests. It reads as deliberate
+  stylization rather than as a surface that failed to resolve.
+- `water_shadow` is the clearest of the set: lit facets on one side, navy facets
+  on the other, a crisp near-vertical edge about 2-3 px wide between them, and
+  the foam staying white in both. Measured by `water_reads_lit_or_shadowed`:
+  the shadowed side sits at 0.316 of the lit side, and the 0.72-0.90 ratio band
+  - the penumbra - is 1.1% of the shaded pixels.
+- Three defects were found in the stills and fixed before this round closed, all
+  of which the numbers alone would have missed:
+  - step RISERS shaded with their true vertical face normal painted hard navy
+    cracks and bright grazing slivers along every band boundary. A lateral entry
+    from another water cell is now presented with the plate's own normal.
+  - the shore-foam rule "adjacent to SOLID" foamed nothing at all on a pool
+    whose rim sits below its surface, which is the common case; it is now
+    "adjacent to anything that is not water".
+  - the uncapped Schlick Fresnel turned the terrace lab's low camera into a
+    sheet of milky horizon sky with every facet washed out of it. Capped at 0.45.
+- The weakest view is still `water_terrace`, whose camera sits about two voxels
+  off the water: at that magnification the shoreline foam is a large solid white
+  shape rather than surf, even after breaking a quarter of shore cells out of the
+  band. It is honest at that distance - foam seen from 20 cm IS a solid white
+  mass - but it is the one frame in the set that does not sell itself.
+
 ## Reproducing
 
     cargo test --lib rt_vs_software_timing -- --nocapture --ignored
     cargo test --lib dump_lookdev_views -- --ignored --nocapture
     cargo test --lib flicker_probe_rt_views -- --ignored --nocapture
-    cargo test --lib voxlight_refl_diagnose -- --ignored --nocapture
 
 Re-run on the SAME machine after the rework and compare against this table,
 not against docs/PERF.md.
