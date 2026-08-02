@@ -1,0 +1,49 @@
+warning: unused variable: `output_tex`
+    --> src\renderer.rs:4037:13
+     |
+4037 |         let output_tex = _otex;
+     |             ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_output_tex`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `voxel` (lib test) generated 1 warning (run `cargo fix --lib -p voxel --tests` to apply 1 suggestion)
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.38s
+     Running unittests src\lib.rs (target\debug\deps\voxelg-0dcf7c375cba86f7.exe)
+
+running 1 test
+live_session_profile: init frame  sync_light_shell_all 23.4 ms, upload 0.5 ms, 63903 blocks bound
+
+=== live session: 600 frames in 10.2 s, 3 origin shift(s), 393216 dirty bricks total (max 3072/frame) ===
+CPU, per frame:
+  physics::tick          mean  2.025 ms  p50  0.000  p99  5.984  max  9.627
+  streaming              mean  0.051 ms  p50  0.002  p99  0.196  max 11.547
+  set_light_focus        mean  0.019 ms  p50  0.000  p99  0.733  max  1.016
+  sync_light_shell_dirty mean  0.072 ms  p50  0.001  p99  0.545  max  2.372
+  upload_voxlight        mean  0.051 ms  p50  0.001  p99  0.525  max  3.777
+voxlight upload: 90 / 600 frames dirty (15%), 2.62 MB/s table + 1.36 MB/s resets, 15.0 writes/frame (27238 reset blocks), cpu shell 0.07 ms + upload 0.05 ms per frame; shell 50306 blocks, 1299 near (3%), sweep round 929 wgs of 6289, urgent 45.3 wgs/frame
+  live blocks 46000..63903 (pool 131072), overflow total 0
+  near prefix 1195..2901 of the work list; a sweep round is 929 workgroups against 6289 if the whole shell were near
+  DISPATCH GATE: 600 / 600 frames dispatched (100%), 600 sweep rounds, 1137 wgs/frame mean (27181 urgent bricks total) - against 600 frames x 929 wgs on the frame-counter schedule
+  per second: 58.6 sweep rounds + 2656 urgent bricks => wgs/frame at  60fps 952  144fps 397  240fps 238  400fps 143  (frame-counter schedule: 929 at every rate)
+
+GPU, 1920x1080, RT primary + probe GI (SHIPPED) variant, 50306 live blocks (1299 near => 929 wgs, 6289 if the whole shell were near):
+  segment     vlight  clouds    beam   probe    main  transp compose |    FIXED    frame no-vlight
+scenario anchors: water cell IVec2(496, 112) (64 cols), leaf cell IVec2(240, 208) (175 voxels, ground y=86)
+test renderer::gpu_render_tests::live_session_profile has been running for over 60 seconds
+  sky          0.590   1.200   0.029   0.661   0.489   0.067   0.200 |    1.251    3.340     2.738
+  terrain      0.674   0.531   0.031   0.696   4.450   0.263   0.468 |    1.370    7.480     6.079
+  foliage      0.601   0.686   0.027   0.610  12.834   0.067   0.372 |    1.210   14.828    14.133
+  water        0.686   0.715   0.031   0.594   3.861   1.326   0.458 |    1.280    7.534     7.396
+
+Field coverage of SHADED pixels (green = the field answered, red = it did not and the pixel takes the designed no-direct-sun term):
+scenario anchors: water cell IVec2(496, 112) (64 cols), leaf cell IVec2(240, 208) (175 voxels, ground y=86)
+  sky        field        0 ( 0.000% of shaded)  unanswered        0 ( 0.000%)  unshaded (sky/glass)  2073600
+  terrain    field  1401797 (100.000% of shaded)  unanswered        0 ( 0.000%)  unshaded (sky/glass)   671803
+  foliage    field  1464815 (99.992% of shaded)  unanswered      115 ( 0.008%)  unshaded (sky/glass)   608670
+    unanswered pixels span x 340..=1407, y 288..=422 of 1920x1080; first: [(585, 288), (587, 288), (584, 292), (583, 293), (586, 297), (586, 301), (586, 302), (586, 305), (661, 306), (587, 307), (587, 310), (588, 314)]
+  water      field  1796325 (99.996% of shaded)  unanswered       73 ( 0.004%)  unshaded (sky/glass)   277202
+    unanswered pixels span x 494..=1896, y 98..=337 of 1920x1080; first: [(832, 98), (509, 132), (795, 176), (796, 176), (798, 176), (796, 177), (798, 177), (1549, 203), (1556, 203), (1896, 208), (1660, 219), (494, 329)]
+test renderer::gpu_render_tests::live_session_profile ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 154 filtered out; finished in 67.41s
+

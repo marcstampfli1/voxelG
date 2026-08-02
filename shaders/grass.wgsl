@@ -34,8 +34,75 @@ struct GrassCell {
 override GRASS_BLADES: u32 = 24u;
 override GRASS_SEGS: u32 = 4u;
 override GRASS_WIDTH_MUL: f32 = 1.0;
-override GRASS_FAR_T: f32 = 90.0;
+/// Set from Rust (renderer.rs create_grass_pipelines) to grass::GRASS_LOD2_T,
+/// which is m_to_vox(22.5). The default is only what the naga validation
+/// test compiles against.
+override GRASS_FAR_T: f32 = 225.0;
 override GRASS_CHUNKY: f32 = 0.0;
+
+// ---- physical scale (LOCAL copy - pinned by a test) --------------------
+// This is the one shader renderer.rs assembles WITHOUT build.rs's
+// world_consts prelude: grass_source() is `COMMON_WGSL + this file`, so
+// VOXELS_PER_METRE is not in scope here the way it is in raymarch/taa/beam/
+// physics. Every length below is still written in METRES and converted
+// through this single local factor, because a bare voxel count silently
+// changes what it MEANS when the voxel changes size - blade widths, clump
+// size, wind wavelengths and the fog ramp would all have shrunk 2.5x at
+// 25 cm -> 10 cm, turning a meadow into moss.
+// SYNC: src/world_dims.rs VOXELS_PER_METRE. `grass::shader_scale_matches_
+// world_dims` fails the build if this drifts. (Adding WORLD_CONSTS_WGSL to
+// grass_source() and deleting this is strictly better; until then the test
+// is what keeps the two honest.)
+const VOX_PER_M: f32 = 10.0;
+
+// Footprint of one grass CELL (one instance, GRASS_BLADES blades). SYNC:
+// grass::CELL_M. The CPU emits one cell per CELL_M x CELL_M of grass top and
+// the roots below scatter across exactly that square, so blades per square
+// metre is fixed in metres rather than following the voxel.
+const GRASS_CELL_M: f32 = 0.25;
+const GRASS_CELL_VOX: f32 = GRASS_CELL_M * VOX_PER_M;
+
+// Wind gust wavelengths, as the real sizes they always were: a ~79 m front
+// rolling across the meadow with a ~14 m ripple riding it. `s` below is a
+// voxel-space distance, so the per-metre rate is divided down once here.
+// SYNC: raymarch.wgsl wind_gust - the same two numbers live there and must
+// be converted the same way or blades, cross quads and tree cards stop
+// riding one wind.
+const WIND_FRONT_K: f32 = 0.080 / VOX_PER_M;  // 2*pi/0.080 = 78.5 m
+const WIND_RIPPLE_K: f32 = 0.44 / VOX_PER_M;  // 2*pi/0.44  = 14.3 m
+// Rolling height field: ~4.5 m of tall waves and short hollows.
+// SYNC: raymarch.wgsl flora_field.
+const FLORA_FIELD_K: f32 = 0.222 / VOX_PER_M;
+// Clump cells: ~0.65 m Voronoi patches sharing facing/height/colour.
+// SYNC: raymarch.wgsl worley2 in turf_blade_hit.
+const CLUMP_CELL_VOX: f32 = 0.65 * VOX_PER_M;
+// Hill-scale hue drift over the carpet fallback: ~7.6 m features.
+const HUE_DRIFT_K: f32 = 0.132 / VOX_PER_M;
+// Wind PHASE gradient: neighbouring blades desync over ~4 m / ~2.9 m.
+// SYNC: raymarch.wgsl's per-voxel `phase` in flora/turf/leaf quads.
+const PHASE_KX: f32 = 1.60 / VOX_PER_M;
+const PHASE_KZ: f32 = 2.20 / VOX_PER_M;
+// Blade geometry. The old code multiplied the dimensionless height product
+// by an implicit "1.0" that was one voxel, i.e. 25 cm; BLADE_H_UNIT is that
+// unit made explicit, so a blade stays roughly 15..38 cm tall.
+const BLADE_H_UNIT: f32 = 0.25 * VOX_PER_M;
+const BLADE_HW: f32 = 0.009 * VOX_PER_M;      // 9 mm half-width at the root
+const DROOP_K: f32 = 1.4 / VOX_PER_M;         // droop per metre of bend
+// Chunky style: value strata banded over 26 cm of WORLD height.
+const BAND_H: f32 = 0.2625 * VOX_PER_M;
+// Near-plane guard, and the numerator of the pass's reversed-z depth
+// (depth = NEAR_T / view_z, so keeping the two equal keeps the depth
+// distribution identical in metres). 1.25 cm.
+const NEAR_T: f32 = 0.0125 * VOX_PER_M;
+// Manual depth test against the raymarch primary hit: a 5 mm absolute bias
+// plus a 0.2% slope term (a RATIO, so scale-free).
+const DEPTH_BIAS: f32 = 0.005 * VOX_PER_M;
+// A root-colour tap only counts when its depth agrees with the root's own
+// distance to within 0.75 m.
+const ROOT_DEPTH_TOL: f32 = 0.75 * VOX_PER_M;
+// Distance haze: clear to 10 m, then an exponential ramp at 0.026 per metre.
+const FOG_START: f32 = 10.0 * VOX_PER_M;
+const FOG_K: f32 = 0.026 / VOX_PER_M;
 
 // ---- small local copies (SYNC comments point at the originals) ----------
 
@@ -50,8 +117,8 @@ fn hash3f(pin: vec3<f32>) -> f32 {
 // quads and tree cards all ride one wind).
 fn wind_gust(p_xz: vec2<f32>, wdir: vec2<f32>) -> f32 {
     let s = dot(p_xz, wdir);
-    let front = 0.5 + 0.5 * sin(s * 0.020 - camera.time * 0.9);
-    let ripple = 0.5 + 0.5 * sin(s * 0.11 - camera.time * 2.1);
+    let front = 0.5 + 0.5 * sin(s * WIND_FRONT_K - camera.time * 0.9);
+    let ripple = 0.5 + 0.5 * sin(s * WIND_RIPPLE_K - camera.time * 2.1);
     return 0.25 + 0.75 * front * (0.6 + 0.4 * ripple);
 }
 
@@ -85,13 +152,13 @@ fn vnoise3g(p: vec3<f32>) -> f32 {
     return mix(mix(a, b, u.y), mix(c, d, u.y), u.z);
 }
 fn flora_field_g(xz: vec2<f32>) -> f32 {
-    return 0.60 + 0.40 * vnoise3g(vec3<f32>(xz.x * 0.055, 3.7, xz.y * 0.055));
+    return 0.60 + 0.40 * vnoise3g(vec3<f32>(xz.x * FLORA_FIELD_K, 3.7, xz.y * FLORA_FIELD_K));
 }
 
 // Clump field: a cheap jittered-lattice Voronoi (SYNC: same role as
-// raymarch worley2, cells ~2.6 voxels). Returns the clump id hash.
+// raymarch worley2, cells ~0.65 m). Returns the clump id hash.
 fn clump_id(xz: vec2<f32>) -> f32 {
-    let p = xz / 2.6;
+    let p = xz / CLUMP_CELL_VOX;
     let ip = floor(p);
     let fp = fract(p);
     var best = 1e9;
@@ -165,7 +232,9 @@ fn vs_grass(@builtin(vertex_index) vid: u32,
     let sf = f32(cell.seed & 0xFFFFu) / 65535.0;
     let bh = hash3f(vec3<f32>(sf * 511.0, f32(blade) * 7.13 + 0.31, f32(blade) * 2.9 + sf * 97.0));
     let root2 = vec2<f32>(fract(bh * 13.7), fract(bh * 41.9));
-    let rootw = cell.pos + vec3<f32>(root2.x, 0.0, root2.y);
+    // Roots scatter across the cell's own 0.25 m footprint, whatever that is
+    // in voxels - the CPU emits one cell per GRASS_CELL_M square.
+    let rootw = cell.pos + vec3<f32>(root2.x, 0.0, root2.y) * GRASS_CELL_VOX;
 
     let cid = clump_id(rootw.xz);
     let clump_ang = fract(cid * 7.13) * 6.2832;
@@ -178,15 +247,17 @@ fn vs_grass(@builtin(vertex_index) vid: u32,
     // Chunky field: heights pull toward one even canopy level - an even
     // surface is what reads as a FIELD instead of individual shapes.
     hfrac = mix(hfrac, 0.88, GRASS_CHUNKY * 0.55);
-    let h = field * clump_h * hfrac * (1.02 + GRASS_CHUNKY * 0.18);
+    let h = field * clump_h * hfrac * (1.02 + GRASS_CHUNKY * 0.18) * BLADE_H_UNIT;
     let curve = 0.16 + 0.30 * fract(bh * 13.0);
     // Wind bends the CURVE (control points), not the whole blade rigidly.
-    let phase = rootw.x * 0.40 + rootw.z * 0.55 + bh * 6.28;
+    // curve/base_amp/1.7 are all RATIOS of h, so only the phase gradient
+    // (a spatial frequency) needs converting.
+    let phase = rootw.x * PHASE_KX + rootw.z * PHASE_KZ + bh * 6.28;
     let wind = wind_off(rootw.xz, phase, 0.30);
     let arc2 = fdir * curve * h + wind * h * 1.7;
     // Gentle arc: meadow blades bow, they do not hook over. Tips stay
     // above ~80% height even in gusts.
-    let droop = clamp(length(arc2) * 0.35, 0.0, 0.20);
+    let droop = clamp(length(arc2) * DROOP_K, 0.0, 0.20);
     let cp0 = rootw;
     let cp1 = rootw + vec3<f32>(arc2.x * 0.5, h * 0.85, arc2.y * 0.5);
     let cp2 = rootw + vec3<f32>(arc2.x, h * (1.0 - droop), arc2.y);
@@ -209,13 +280,13 @@ fn vs_grass(@builtin(vertex_index) vid: u32,
     let spike = 1.0 - t0 * 0.98;
     let paddle = 1.0 - pow(t0, 2.2) * 0.92;
     let plump = mix(spike, paddle, GRASS_CHUNKY);
-    var hw = 0.036 * (1.0 + GRASS_CHUNKY * 1.15) * GRASS_WIDTH_MUL
+    var hw = BLADE_HW * (1.0 + GRASS_CHUNKY * 1.15) * GRASS_WIDTH_MUL
         * (0.8 + 0.4 * fract(bh * 17.0)) * plump;
 
     let wp0 = p + wide3 * hw * cs;
     let d = wp0 - camera.origin;
     let z = dot(d, camera.forward);
-    if (z < 0.05) {
+    if (z < NEAR_T) {
         o.pos = vec4<f32>(0.0, 0.0, 2.0, 1.0);
         return o;
     }
@@ -236,7 +307,7 @@ fn vs_grass(@builtin(vertex_index) vid: u32,
     // Same TAA sub-pixel jitter as the raymarch rays: the blades sit on the
     // jittered sample grid, and the TAA resolve integrates them.
     ndc = ndc - vec2<f32>(camera.jitter.x, -camera.jitter.y) * 2.0 / camera.resolution;
-    o.pos = vec4<f32>(ndc.x * z2, ndc.y * z2, 0.05, z2);
+    o.pos = vec4<f32>(ndc.x * z2, ndc.y * z2, NEAR_T, z2);
     o.uv = vec2<f32>(cs, t0);
     o.view_t = length(d2);
     o.wy = wp.y;
@@ -244,7 +315,7 @@ fn vs_grass(@builtin(vertex_index) vid: u32,
     // Project the root to screen space (stable: no jitter - a jittered grid
     // made the sampled texel alternate per frame, flickering the lighting).
     let rd = rootw - camera.origin;
-    let rz = max(dot(rd, camera.forward), 0.05);
+    let rz = max(dot(rd, camera.forward), NEAR_T);
     let rndc = vec2<f32>(dot(rd, camera.right) / (rz * camera.tan_half_fov * aspect),
                          dot(rd, camera.up) / (rz * camera.tan_half_fov));
     o.root_px = vec2<f32>(rndc.x * 0.5 + 0.5, 0.5 - rndc.y * 0.5) * camera.resolution;
@@ -253,7 +324,7 @@ fn vs_grass(@builtin(vertex_index) vid: u32,
     // Fallback carpet (only for occluded / off-screen roots): the palette
     // green with the hill-scale hue drift - never per-blade variance.
     let ground = vec3<f32>(0.30, 0.65, 0.20); // palette[MAT_GRASS], SYNC renderer default_palette
-    let hue_t = vnoise3g(vec3<f32>(rootw.x * 0.033, 12.5, rootw.z * 0.033));
+    let hue_t = vnoise3g(vec3<f32>(rootw.x * HUE_DRIFT_K, 12.5, rootw.z * HUE_DRIFT_K));
     o.albedo0 = ground * mix(vec3<f32>(1.02, 0.98, 0.85), vec3<f32>(1.22, 1.08, 0.62), hue_t);
     // ONE shared tip lighten - zero per-blade colour variance, exactly as
     // the macro-calm description states.
@@ -264,13 +335,13 @@ fn vs_grass(@builtin(vertex_index) vid: u32,
 // SYNC: raymarch.wgsl fog_amount shape (approximate; grass ends at
 // GRASS_FAR_T where fog is still mild, so a matched curve suffices).
 fn fog_amount_g(t: f32) -> f32 {
-    return 1.0 - exp(-max(t - 40.0, 0.0) * 0.0065);
+    return 1.0 - exp(-max(t - FOG_START, 0.0) * FOG_K);
 }
 
 @fragment
 fn fs_grass(in: VsOut) -> @location(0) vec4<f32> {
     let scene_t = textureLoad(scene_depth, vec2<i32>(in.pos.xy), 0).r;
-    if (in.view_t > scene_t + 0.02 + scene_t * 0.002) {
+    if (in.view_t > scene_t + DEPTH_BIAS + scene_t * 0.002) {
         discard;
     }
 
@@ -305,7 +376,7 @@ fn fs_grass(in: VsOut) -> @location(0) vec4<f32> {
         let sp = rpx + off;
         let p2 = vec2<i32>(sp);
         let d = textureLoad(scene_depth, p2, 0).r;
-        if (abs(d - in.root_dist) < 3.0) {
+        if (abs(d - in.root_dist) < ROOT_DEPTH_TOL) {
             inherited += textureSampleLevel(terrain_color, lin_sampler, sp / resf, 0.0).rgb;
             w_inherit += 1.0;
         }
@@ -349,7 +420,7 @@ fn fs_grass(in: VsOut) -> @location(0) vec4<f32> {
     // gradient): carpet -> mid band (+13%) -> tip band (shared lighten).
     // Band coordinate: per-blade height for spikes, shared WORLD height
     // for the chunky style - strata as one horizontal field surface.
-    let hband = clamp((in.wy - in.gy) / 1.05, 0.0, 1.0);
+    let hband = clamp((in.wy - in.gy) / BAND_H, 0.0, 1.0);
     let band = mix(sblade, hband, GRASS_CHUNKY);
     let step_w = 0.03 + GRASS_CHUNKY * 0.02;
     let s1 = smoothstep(0.52 - step_w, 0.52 + step_w, band);

@@ -18,12 +18,18 @@ pub const BRICK_VOXELS: u32 = BRICK_DIM * BRICK_DIM * BRICK_DIM;
 // not silently change meaning when the voxel does. So body sizes and movement
 // tuning are written in SI and converted here, exactly once.
 //
-// Today one voxel is 25 cm: WORLD_VOXELS_X = 512 spans the "~128 m world" of
-// docs/IMPLEMENTED.md, and docs/SCALE_TO_10CM.md is the (not yet executed) plan
-// to shrink the voxel to 10 cm by tripling the dims below. When that lands,
-// THIS constant changes to 0.10 and the player stays 1.8 m tall - which is the
-// whole point of routing gameplay through it instead of hardcoding voxel counts.
-pub const VOXEL_METRES: f32 = 0.25;
+// One voxel is 10 cm (was 25 cm until docs/SCALE_TO_10CM.md landed). The player
+// stayed 1.8 m tall across that change without a single gameplay constant being
+// retuned, which is the whole point of routing sizes through this rather than
+// hardcoding voxel counts.
+//
+// This is ALSO the conversion the renderer's distance budgets and worldgen's
+// feature sizes go through. A view distance or a mountain amplitude written as a
+// bare voxel count silently shrinks by 2.5x when this constant moves; written as
+// `m_to_vox(175.0)` it does not. Everything scale-dependent in `raymarch.wgsl`
+// and `voxel.rs` is written that way now, and `build.rs` emits VOXELS_PER_METRE
+// into the shader prelude so WGSL uses the same one source of truth.
+pub const VOXEL_METRES: f32 = 0.10;
 pub const VOXELS_PER_METRE: f32 = 1.0 / VOXEL_METRES;
 
 /// Metres -> voxels. Use at every gameplay constant so the SI value stays
@@ -39,9 +45,19 @@ pub const fn vox_to_m(voxels: f32) -> f32 {
     voxels * VOXEL_METRES
 }
 
-pub const WORLD_BRICKS_X: u32 = 128;
-pub const WORLD_BRICKS_Y: u32 = 64;
-pub const WORLD_BRICKS_Z: u32 = 128;
+// The loaded streaming window, in bricks. MUST be a multiple of 80: 16 keeps the
+// tile (x4) and chunk (x4) levels of the pyramid exact, and 5 keeps
+// PROBE_SPACING (20 voxels) dividing the voxel extent. Y only needs 16 and 5 as
+// well, which 160 satisfies.
+//
+// 400 x 160 x 400 bricks = 1600 x 640 x 1600 voxels = 160 x 64 x 160 m at 10 cm.
+// That is 1.25x today's 128 m per horizontal axis (1.56x the area) at 2.5x the
+// linear resolution, and it was chosen by measurement, not by guess: see the
+// size ladder in docs/SCALE_TO_10CM.md, which reports what 320 (128 m, the
+// same world as the 25 cm build) and 400 each cost per pass.
+pub const WORLD_BRICKS_X: u32 = 400;
+pub const WORLD_BRICKS_Y: u32 = 160;
+pub const WORLD_BRICKS_Z: u32 = 400;
 pub const WORLD_BRICKS_TOTAL: u32 = WORLD_BRICKS_X * WORLD_BRICKS_Y * WORLD_BRICKS_Z;
 
 pub const WORLD_VOXELS_X: u32 = WORLD_BRICKS_X * BRICK_DIM;
@@ -72,7 +88,45 @@ pub const WORLD_L4_TOTAL: u32 = WORLD_L4_X * WORLD_L4_Y * WORLD_L4_Z;
 // list is appended to `vl_live_bricks` at exactly this offset, so both sides
 // must agree and `build.rs` emits it into the shader prelude. The rationale for
 // the value is on `voxlight::LIGHT_BLOCKS_MAX`, which re-exports this.
-pub const LIGHT_BLOCKS_MAX: u32 = 131_072;
+// 2^21. The lit shell is a SURFACE, so it grows with the square of the linear
+// resolution: at 25 cm the demo world bound 63,903 blocks, and 2.5x finer voxels
+// over a 1.25x wider window is 6.25 x 1.56 = 9.8x that, ~625 k. The old 131,072
+// ceiling would have been overrun 5x, and overflow does not degrade gracefully -
+// `allocate` fills in brick-index order, which is z-major, so the shortfall
+// lands as a hard geographic band (that exact failure is the round-D story on
+// `voxlight::LIGHT_BLOCKS_MAX`).
+//
+// What pays for it is LIGHT_RECORDS_PER_BLOCK dropping 64 -> 8 (records at 2x
+// voxel spacing): a block is 64 B instead of 512 B, so 16x the blocks cost 2x
+// the pool - 128 MiB against 64 MiB - and the field is still finer in metres
+// than the 25 cm build shipped. Measured headroom on the demo world is in
+// `the_demo_world_light_shell_fits_the_pool_and_still_covers_it`.
+pub const LIGHT_BLOCKS_MAX: u32 = 2_097_152;
+
+// Edge of a light record's cell, in voxels. A record covers a
+// LIGHT_RECORD_STEP^3 group, so a brick holds (BRICK_DIM/STEP)^3 of them.
+//
+// 2 at 10 cm is a 20 cm light field: FINER than the 25 cm one that shipped, at
+// 1/8 the storage. 1 (a record per voxel, which is what 25 cm ran) would put the
+// demo world's shell at ~5 M blocks x 512 B = 2.5 GB of pool for detail below
+// the size of the pixel it is interpolated across. 4 (40 cm) is the next step up
+// and is the knob to turn if the pool ever needs to shrink again.
+//
+// It MUST divide BRICK_DIM: the update pass indexes records within one brick and
+// the sampler folds a voxel coord to a record coord by a shift, and both would
+// straddle a brick boundary otherwise.
+pub const LIGHT_RECORD_STEP: u32 = 2;
+pub const LIGHT_RECORD_DIM: u32 = BRICK_DIM / LIGHT_RECORD_STEP;
+pub const LIGHT_RECORDS_PER_BLOCK: u32 = LIGHT_RECORD_DIM * LIGHT_RECORD_DIM * LIGHT_RECORD_DIM;
+
+/// A record is two u32 words:
+///   word0: sun_vis u8 | ao u8 | epoch u8 | flags u8
+///   word1: point-light radiance, packed RGB9E5
+pub const LIGHT_RECORD_WORDS: u32 = 2;
+
+/// u32 words per block. The shader needs this to address the pool, so it is
+/// derived here and emitted by `build.rs` rather than written out twice.
+pub const LIGHT_BLOCK_WORDS: u32 = LIGHT_RECORDS_PER_BLOCK * LIGHT_RECORD_WORDS;
 
 // Urgent-list slots reserved past the work list in the same buffer. This is a
 // PER-DISPATCH budget, not a queue length: the CPU queue is unbounded and drains
@@ -88,11 +142,16 @@ pub const LIGHT_URGENT_BUDGET: u32 = 512;
 // grid is world-space and toroidal like the voxel storage, so it follows the
 // streaming window at O(1) and per-pixel GI is a cheap trilinear probe sample
 // instead of a fresh bounce ray. PROBE_SPACING must divide the world dims.
-pub const PROBE_SPACING: u32 = 8;
-pub const PROBE_DIM_X: u32 = WORLD_VOXELS_X / PROBE_SPACING; // 64
+//
+// The spacing is a REAL-WORLD 2 m, not a voxel count: an irradiance cache is a
+// property of the room, not of the grid, so 8 voxels at 25 cm and 20 voxels at
+// 10 cm are the same cache. Leaving it at 8 would have bought a 2.5x finer probe
+// grid nobody asked for and 15.6x the probes to update.
+pub const PROBE_SPACING: u32 = (2.0 * VOXELS_PER_METRE) as u32; // 2 m
+pub const PROBE_DIM_X: u32 = WORLD_VOXELS_X / PROBE_SPACING; // 80
 pub const PROBE_DIM_Y: u32 = WORLD_VOXELS_Y / PROBE_SPACING; // 32
-pub const PROBE_DIM_Z: u32 = WORLD_VOXELS_Z / PROBE_SPACING; // 64
-pub const PROBE_TOTAL: u32 = PROBE_DIM_X * PROBE_DIM_Y * PROBE_DIM_Z; // 131072
+pub const PROBE_DIM_Z: u32 = WORLD_VOXELS_Z / PROBE_SPACING; // 80
+pub const PROBE_TOTAL: u32 = PROBE_DIM_X * PROBE_DIM_Y * PROBE_DIM_Z; // 204800
 
 // ---- storage chunks (the "chunked world") ----
 // A storage chunk holds 8x8x8 bricks = 32x32x32 voxels. Generation, dirty

@@ -49,6 +49,41 @@ struct GiProbe {
 
 @group(1) @binding(5) var<storage, read_write> gi_probes: array<GiProbe>;
 
+// ---- physical scale ----
+// Everything below that is a DISTANCE is written in metres and converted
+// through VOXELS_PER_METRE (build.rs emits it into the world_consts prelude
+// this shader is assembled behind, from src/world_dims.rs). Probe biases,
+// the Chebyshev slack and the relocation budget are all properties of the
+// ROOM the cache describes, not of the grid it is stored on: as bare voxel
+// counts every one of them would have shrunk 2.5x when the voxel did, and a
+// surface bias that no longer clears the surface is exactly how DDGI starts
+// self-shadowing.
+//
+// Query bias off the surface, along the normal AND back toward the camera,
+// so the Chebyshev activation front lands in open air.
+const GI_SURFACE_BIAS: f32 = 0.25 * VOXELS_PER_METRE;   // 25 cm each way
+// Chebyshev slack: full weight within this of the probe's mean visible
+// distance, so the falloff factor is exactly 1.0 at the crossing.
+const GI_CHEB_SLACK: f32 = 0.0875 * VOXELS_PER_METRE;   // 8.75 cm
+// Variance floor as a standard deviation: 12.5 cm of transition (~1 voxel
+// at 25 cm, ~1.25 voxels at 10 cm) is what reads as soft shading rather
+// than a hard edge, and it is the LENGTH that has to hold, not the voxel
+// count. Squared here because the test compares against a variance.
+const GI_CHEB_SIGMA: f32 = 0.125 * VOXELS_PER_METRE;
+const GI_CHEB_VAR_FLOOR: f32 = GI_CHEB_SIGMA * GI_CHEB_SIGMA;
+// Gather-ray tmin (self-hit guard) and the shadow-ray origin lift off the
+// hit face.
+const GI_RAY_TMIN: f32 = 0.005 * VOXELS_PER_METRE;      // 5 mm
+const GI_SHADOW_BIAS: f32 = 0.0075 * VOXELS_PER_METRE;  // 7.5 mm
+// Probe relocation: nudge away when the nearest surface is within
+// GI_RELOC_NEAR, at most GI_RELOC_STEP per round, never further than
+// GI_RELOC_MAX from the cell centre (well inside the 2 m cell either way);
+// drift home once clear by GI_RELOC_CLEAR.
+const GI_RELOC_NEAR: f32 = 0.30 * VOXELS_PER_METRE;
+const GI_RELOC_STEP: f32 = 0.0875 * VOXELS_PER_METRE;
+const GI_RELOC_MAX: f32 = 0.875 * VOXELS_PER_METRE;
+const GI_RELOC_CLEAR: f32 = 0.625 * VOXELS_PER_METRE;
+
 // ---- probe grid geometry ----
 
 // Linear slot index for a world probe-grid coordinate (toroidal fold).
@@ -110,7 +145,7 @@ fn sample_probes(p_world: vec3<f32>, n: vec3<f32>, v: vec3<f32>) -> vec3<f32> {
     // on the wall it protects, where its transition band painted probe-grid-
     // scale shapes onto flat surfaces. Irradiance is still evaluated with
     // the true surface normal.
-    let p_q = p_world + n * 1.0 - v * 1.0;
+    let p_q = p_world + n * GI_SURFACE_BIAS - v * GI_SURFACE_BIAS;
     // Grid coordinate of p (probes sit at cell centers, hence the -0.5 shift).
     let pg = p_q / f32(PROBE_SPACING) - vec3<f32>(0.5);
     let base = vec3<i32>(floor(pg));
@@ -157,13 +192,13 @@ fn sample_probes(p_world: vec3<f32>, n: vec3<f32>, v: vec3<f32>) -> vec3<f32> {
         // weight ~7x at the crossing - once the probe field became temporally
         // stable, that step stood still as crisp block-aligned GI edges on
         // walls (the threshold surface cutting through geometry).
-        let delta = max(dist_pp - (mu + 0.35), 0.0);
+        let delta = max(dist_pp - (mu + GI_CHEB_SLACK), 0.0);
         if (delta > 0.0) {
             let mu2 = sh_eval_scalar(pr.sh_dist2, to_point);
-            // Variance floor 0.25 (was 0.02): the falloff used to collapse
-            // within ~0.2 voxels, a razor-thin front that still read as a
-            // hard edge; ~1 voxel of transition reads as soft shading.
-            let variance = max(mu2 - mu * mu, 0.25);
+            // Variance floor (was 0.02 voxels^2): the falloff used to
+            // collapse within ~5 cm, a razor-thin front that still read as a
+            // hard edge; ~12.5 cm of transition reads as soft shading.
+            let variance = max(mu2 - mu * mu, GI_CHEB_VAR_FLOOR);
             // No lower clamp (was 0.02): a probe buried in terrain or far
             // behind a wall must be able to vanish from the blend entirely -
             // the old floor let near-black probes leak dark diamonds into
@@ -189,7 +224,7 @@ fn probe_ray_radiance(o: vec3<f32>, d: vec3<f32>, near_t: ptr<function, f32>, ne
     let sc = sun_color(s);
     let amb = ambient_color();
     var rq: ray_query;
-    rayQueryInitialize(&rq, world_tlas, RayDesc(0u, 0xFFu, 0.02, GI_DIST, o, d));
+    rayQueryInitialize(&rq, world_tlas, RayDesc(0u, 0xFFu, GI_RAY_TMIN, GI_DIST, o, d));
     var best_t = 1.0e30;
     var hv = vec3<i32>(0);
     var hn = vec3<i32>(0);
@@ -236,7 +271,7 @@ fn probe_ray_radiance(o: vec3<f32>, d: vec3<f32>, near_t: ptr<function, f32>, ne
     let q_ndl = max(0.0, dot(qn, s));
     var q_shadow = 0.0;
     if (q_ndl > 0.0) {
-        let q_world = (o + d * best_t) + vec3<f32>(camera.world_origin) + qn * 0.03;
+        let q_world = (o + d * best_t) + vec3<f32>(camera.world_origin) + qn * GI_SHADOW_BIAS;
         q_shadow = select(1.0, 0.0, shadow_occluded(q_world, s, SHADOW_MAX_DIST));
     }
     return vec4<f32>(q_albedo * (sc * (q_ndl * q_shadow) + amb * 0.35), best_t);
@@ -385,9 +420,10 @@ fn cs_gi_probe_update(@builtin(global_invocation_id) gid: vec3<u32>) {
     // to stay well inside its own cell); drift home once clear so a changed
     // world re-relocates. near_t is measured from the relocated origin.
     var off = off_prev;
-    if (near_t < 1.2) {
-        off = clamp(off + near_n * min(1.2 - near_t, 0.35), vec3<f32>(-3.5), vec3<f32>(3.5));
-    } else if (near_t > 2.5) {
+    if (near_t < GI_RELOC_NEAR) {
+        off = clamp(off + near_n * min(GI_RELOC_NEAR - near_t, GI_RELOC_STEP),
+                    vec3<f32>(-GI_RELOC_MAX), vec3<f32>(GI_RELOC_MAX));
+    } else if (near_t > GI_RELOC_CLEAR) {
         off = off * 0.98;
     }
     pr.st_info = vec4<f32>(pr.st_info.x, off);

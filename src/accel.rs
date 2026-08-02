@@ -817,8 +817,12 @@ mod tests {
         world.process_pending_gen_blocking();
         rebuild_world_accel(&mut accel, &device, &queue, &world.tile_mask, world.world_origin_voxel());
         let wo = world.world_origin_voxel();
-        // Straight down onto regenerated terrain: RT and CPU must agree.
-        let eye = Vec3::new(40.0, 140.0, 40.0);
+        // Straight down onto regenerated terrain: RT and CPU must agree. The eye
+        // height comes from the TERRAIN, not from a voxel literal: 140 was above
+        // the surface at 25 cm and is 14 m up - i.e. underground - at 10 cm.
+        let ground = crate::voxel::sample_terrain(
+            wo.x as f32 + 40.0, wo.z as f32 + 40.0, world.seed).h as f32;
+        let eye = Vec3::new(40.0, ground + crate::voxel::m_to_vox(10.0), 40.0);
         let dir = Vec3::new(0.001, -1.0, 0.001).normalize();
         let h = &probe_with_accel(&device, &queue, &world, &accel, &[GpuRay::new(eye, dir)])[0];
         let oracle = raycast(eye + Vec3::new(wo.x as f32, wo.y as f32, wo.z as f32), dir, &world, wo);

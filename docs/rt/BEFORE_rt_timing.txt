@@ -1,0 +1,44 @@
+warning: unused variable: `output_tex`
+    --> src\renderer.rs:4037:13
+     |
+4037 |         let output_tex = _otex;
+     |             ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_output_tex`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `voxel` (lib test) generated 1 warning (run `cargo fix --lib -p voxel --tests` to apply 1 suggestion)
+    Finished `test` profile [optimized + debuginfo] target(s) in 2.66s
+     Running unittests src\lib.rs (target\debug\deps\voxelg-0dcf7c375cba86f7.exe)
+
+running 1 test
+voxlight field: light 63903 / 131072 blocks
+voxlight field: converged over 192 rounds in 0.9 s
+  light blocks cover brick z 0..=127 (world z voxels 0..512 of 512)
+voxlight update cost per frame: light pass 4.37 ms, WHOLE SHELL NEAR              (NOT included in any column below)
+  camera-aware (2906 of 63903 blocks near, 1318 of 7988 workgroups): 1.09 ms
+scenario anchors: water cell IVec2(496, 112) (64 cols), leaf cell IVec2(16, 272) (305 voxels, ground y=90)
+  SAMPLER COST [terrain]: populated 12.54 / 13.51 ms  vs  UNLIT (empty field) 12.17 ms  =>  +0.86 ms (+7.0%)
+test renderer::gpu_render_tests::rt_vs_software_timing has been running for over 60 seconds
+  static-cam [terrain]: RT-prim+PROBE-GI 12.94 ms
+rt_vs_software_timing [terrain] 1920x1080: software 12.40 ms  |  RT-occl 11.68 ms (1.06x)  |  RT-primary 11.88 ms (1.04x sw)  |  swPrim+perpixelGI 19.98 ms (0.62x sw)  |  RT-prim+perpixelGI 18.76 ms (0.66x sw)  |  RT-prim+PROBE-GI 12.54 ms (0.99x sw)
+  per-pass [terrain] SW: main 10.57  transp 0.06  compose 0.43  ||  RT-prim+GI: main 12.49  transp 0.07  compose 0.43
+  primary-trace-only [terrain]: SW cs_main 6.45  ||  RT-primary cs_main 6.05  (=> SW shade 4.71, RT-prim+GI shade 6.02)
+  SAMPLER COST [foliage]: populated 17.91 / 17.22 ms  vs  UNLIT (empty field) 17.50 ms  =>  +0.07 ms (+0.4%)
+  static-cam [foliage]: RT-prim+PROBE-GI 17.91 ms
+rt_vs_software_timing [foliage] 1920x1080: software 11.70 ms  |  RT-occl 13.52 ms (0.87x)  |  RT-primary 16.99 ms (0.69x sw)  |  swPrim+perpixelGI 27.84 ms (0.42x sw)  |  RT-prim+perpixelGI 26.59 ms (0.44x sw)  |  RT-prim+PROBE-GI 17.91 ms (0.65x sw)
+  per-pass [foliage] SW: main 13.35  transp 0.15  compose 0.41  ||  RT-prim+GI: main 16.52  transp 0.07  compose 0.50
+  primary-trace-only [foliage]: SW cs_main 7.95  ||  RT-primary cs_main 9.10  (=> SW shade 6.85, RT-prim+GI shade 6.93)
+  SAMPLER COST [water-close]: populated 6.35 / 6.44 ms  vs  UNLIT (empty field) 5.14 ms  =>  +1.25 ms (+24.3%)
+  static-cam [water-close]: RT-prim+PROBE-GI 5.89 ms
+rt_vs_software_timing [water-close] 1920x1080: software 5.35 ms  |  RT-occl 5.71 ms (0.94x)  |  RT-primary 5.50 ms (0.97x sw)  |  swPrim+perpixelGI 10.66 ms (0.50x sw)  |  RT-prim+perpixelGI 9.42 ms (0.57x sw)  |  RT-prim+PROBE-GI 6.35 ms (0.84x sw)
+  per-pass [water-close] SW: main 3.72  transp 0.94  compose 0.46  ||  RT-prim+GI: main 3.38  transp 1.32  compose 0.54
+  primary-trace-only [water-close]: SW cs_main 2.59  ||  RT-primary cs_main 1.80  (=> SW shade 0.91, RT-prim+GI shade 1.92)
+  SAMPLER COST [terrain-covered]: populated 10.63 / 10.74 ms  vs  UNLIT (empty field) 10.15 ms  =>  +0.54 ms (+5.3%)
+  static-cam [terrain-covered]: RT-prim+PROBE-GI 10.45 ms
+rt_vs_software_timing [terrain-covered] 1920x1080: software 8.35 ms  |  RT-occl 8.69 ms (0.96x)  |  RT-primary 8.83 ms (0.95x sw)  |  swPrim+perpixelGI 14.32 ms (0.58x sw)  |  RT-prim+perpixelGI 15.99 ms (0.52x sw)  |  RT-prim+PROBE-GI 10.63 ms (0.79x sw)
+  per-pass [terrain-covered] SW: main 9.17  transp 0.16  compose 0.53  ||  RT-prim+GI: main 8.69  transp 0.21  compose 0.53
+  primary-trace-only [terrain-covered]: SW cs_main 4.47  ||  RT-primary cs_main 3.65  (=> SW shade 4.62, RT-prim+GI shade 4.96)
+test renderer::gpu_render_tests::rt_vs_software_timing ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 154 filtered out; finished in 98.06s
+

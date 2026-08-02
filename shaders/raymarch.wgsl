@@ -368,9 +368,62 @@ fn voxel_material_at(world_v: vec3<i32>) -> u32 {
 // ---------------------------------------------------------------------------
 
 const VL_NONE: u32 = 0xFFFFFFFFu;
-const VL_RECORD_WORDS: u32 = 2u;
-// 64 voxels per brick * 2 words per record.
-const VL_BLOCK_WORDS: u32 = 128u;
+const VL_RECORD_WORDS: u32 = u32(LIGHT_RECORD_WORDS);
+const VL_BLOCK_WORDS: u32 = u32(LIGHT_BLOCK_WORDS);
+// Voxel edge of one record's cell. A record covers a VL_STEP^3 group, so the
+// light lattice is coarser than the voxel grid; see LIGHT_RECORD_STEP.
+const VL_STEP: i32 = LIGHT_RECORD_STEP;
+const VL_STEP_F: f32 = f32(LIGHT_RECORD_STEP);
+
+/// Index of the record covering in-brick voxel `local`.
+/// Mirrors `voxlight::light_record_idx` (x + z*D + y*D^2, one level up from
+/// `brick_voxel_idx`); the update pass inverts exactly this.
+fn light_record_idx(local: vec3<i32>) -> i32 {
+    let r = local / VL_STEP;
+    return r.x + r.z * LIGHT_RECORD_DIM + r.y * LIGHT_RECORD_DIM * LIGHT_RECORD_DIM;
+}
+
+/// Occupancy bits of the VL_STEP^3 voxel group `r` (in-brick record coords)
+/// within brick `bi`, as a mask over ONE half of the brick's 64-bit occupancy.
+///
+/// The whole group lives in one half by construction: the brick voxel index is
+/// x + z*4 + y*16, so a 2^3 group is the bit pattern {0,1,4,5,16,17,20,21}
+/// (= 0x00330033) shifted by 2*rx + 8*rz, which never crosses bit 31, and the
+/// y half is picked by ry. ONE storage word answers "is any of these 8 solid",
+/// which is what keeps the coarser gate as cheap per tap as the per-voxel one
+/// was - the gate runs eight times per shaded pixel.
+///
+/// PINNED to VL_STEP == 2 by `voxlight::the_group_mask_matches_the_record_step`.
+fn vl_group_occ(bi: i32, r: vec3<i32>) -> u32 {
+    let pat = 0x00330033u << u32(2 * r.x + 8 * r.z);
+    let b = bricks[bi];
+    return select(b.occ_lo, b.occ_hi, r.y == 1) & pat;
+}
+
+/// Does the record cell hold a REAL OPAQUE OCCLUDER, so light must not be
+/// interpolated through it?
+///
+/// The per-voxel field asked this of one voxel. A record cell is 8 of them, and
+/// "ANY of the 8 is opaque" is the rule that keeps a one-voxel wall opaque at
+/// the coarser spacing: a wall thinner than a record cell still lands inside
+/// SOME cell, and that cell then vetoes every tap that would have crossed it.
+/// (`voxlight_does_not_leak_through_a_one_voxel_wall` is the test.)
+fn vl_group_blocks(bi: i32, r: vec3<i32>) -> bool {
+    var m = vl_group_occ(bi, r);
+    // Empty group: the common case in the lit shell, and it answers in one load.
+    if (m == 0u) { return false; }
+    let vbase = select(0, 32, r.y == 1);
+    loop {
+        if (m == 0u) { break; }
+        let b = i32(firstTrailingBit(m));
+        m = m & (m - 1u);
+        // Foliage is a semi-transparent volume, not a wall: it carries light and
+        // never vetoes. Stone, water and glass do. Same rule as the per-voxel
+        // field, applied to whichever voxels of the group are occupied.
+        if (!is_foliage_mat(brick_voxel_material(bi, vbase + b))) { return true; }
+    }
+    return false;
+}
 
 struct VoxLightParams {
     live_count: u32,
@@ -439,18 +492,23 @@ fn vl_pack_rgb9e5(c: vec3<f32>) -> u32 {
 /// used to be `vl_record_word` plus a separate `is_voxel_solid`, i.e. two full
 /// descents per tap, eight times per shaded pixel.
 struct VlTap {
-    /// First pool word of the record, or VL_NONE when the voxel is outside the
+    /// First pool word of the record, or VL_NONE when the cell is outside the
     /// window or its brick has no light block.
     word: u32,
-    /// True when the voxel is a REAL OPAQUE OCCLUDER, so light must not be
-    /// interpolated through it. See `vl_tap`.
+    /// True when the record cell holds a REAL OPAQUE OCCLUDER, so light must not
+    /// be interpolated through it. See `vl_group_blocks`.
     blocks: bool,
 };
 
-fn vl_tap(world_v: vec3<i32>) -> VlTap {
+/// `rc` is a WORLD RECORD-CELL coordinate, i.e. a world voxel divided by
+/// VL_STEP. The cell's low voxel is `rc * VL_STEP`, and because the window
+/// extent and the brick dim are both multiples of VL_STEP, the whole cell folds
+/// into one brick and never straddles a slot seam.
+fn vl_tap(rc: vec3<i32>) -> VlTap {
     var o: VlTap;
     o.word = VL_NONE;
     o.blocks = false;
+    let world_v = rc * VL_STEP;
     let rel = world_v - camera.world_origin;
     if (rel.x < 0 || rel.x >= WORLD_VOXELS_X
      || rel.y < 0 || rel.y >= WORLD_VOXELS_Y
@@ -463,8 +521,7 @@ fn vl_tap(world_v: vec3<i32>) -> VlTap {
     let block = vl_block_of_brick[u32(bi)];
     if (block == VL_NONE) { return o; }
     let local = v - bp * BRICK_DIM;
-    let vi = brick_voxel_idx(local.x, local.y, local.z);
-    o.word = block * VL_BLOCK_WORDS + u32(vi) * VL_RECORD_WORDS;
+    o.word = block * VL_BLOCK_WORDS + u32(light_record_idx(local)) * VL_RECORD_WORDS;
 
     // OCCUPANCY, through the same mask hierarchy `is_voxel_solid` walks. The
     // tile and chunk masks are cleared the frame a streaming slot is recycled
@@ -478,7 +535,6 @@ fn vl_tap(world_v: vec3<i32>) -> VlTap {
     let ti = world_tile_idx(tp.x, tp.y, tp.z);
     let brick_lin = (bp.x & 3) + (bp.z & 3) * 4 + (bp.y & 3) * 16;
     if (!tile_has_child(ti, brick_lin)) { return o; }
-    if (!brick_voxel_solid(bi, vi)) { return o; }
     // OCCUPIED IS NOT THE SAME AS OPAQUE, and conflating them is what left over
     // half of a canopy view without a light record.
     //
@@ -495,7 +551,7 @@ fn vl_tap(world_v: vec3<i32>) -> VlTap {
     // a tap. Stone, water and glass still do: they are opaque, they occlude
     // shadow rays, and they are what the wall-leak rule was written for
     // (`voxlight_does_not_leak_through_a_one_voxel_wall`).
-    o.blocks = !is_foliage_mat(brick_voxel_material(bi, vi));
+    o.blocks = vl_group_blocks(bi, local / VL_STEP);
     return o;
 }
 
@@ -542,12 +598,21 @@ fn voxlight_sample(p_world: vec3<f32>, n: vec3<f32>) -> VoxLight {
     //
     // `vl_tap` returns before the occupancy walk when the brick has no block, so
     // this miss costs exactly what the old `vl_record_word` cost.
-    let centre = vec3<i32>(floor(p_world + n * 0.5));
-    if (vl_tap(centre).word == VL_NONE) { return o; }
+    let ps = p_world + n * 0.5;
+    if (vl_tap(vec3<i32>(floor(ps / VL_STEP_F))).word == VL_NONE) { return o; }
 
-    // Step into the air voxel against the face, then place the lattice on
-    // voxel CENTRES so the eight taps straddle the surface.
-    let g = (p_world + n * 0.5) - vec3<f32>(0.5);
+    // Step into the air voxel against the face, then place the lattice on RECORD
+    // centres so the eight taps straddle the surface. A record sits at the centre
+    // of the LOW voxel of its VL_STEP^3 cell, i.e. at `rc * VL_STEP + 0.5`, so
+    // the lattice is uniform with spacing VL_STEP and the interpolation below is
+    // the same trilinear it always was, one level coarser.
+    //
+    // Anchoring on the low voxel rather than on the cell's geometric centre is
+    // deliberate: it keeps the sample point a VOXEL centre (safe as a shadow-ray
+    // origin, and exactly what the per-voxel field did) and it keeps the nearest
+    // record ~1.5 voxels off a surface whichever parity the surface has, instead
+    // of alternating between 2 and 3.
+    let g = (ps - vec3<f32>(0.5)) / VL_STEP_F;
     let b = floor(g);
     let f = g - b;
     let base = vec3<i32>(b);
@@ -600,7 +665,7 @@ fn sky(dir: vec3<f32>) -> vec3<f32> {
 // the horizon melts consistently (clouds previously stayed fully crisp while
 // the ground fogged out).
 fn fog_amount(t: f32) -> f32 {
-    return clamp((t - 60.0) / 340.0, 0.0, 0.85);
+    return clamp((t - 15.0 * VOXELS_PER_METRE) / (85.0 * VOXELS_PER_METRE), 0.0, 0.85);
 }
 
 fn fog_atmospheric(dir: vec3<f32>) -> vec3<f32> {
@@ -1150,6 +1215,10 @@ var<private> shadow_wind_freeze: bool = false;
 // Guarded by a bool rather than an impossible sentinel coordinate: `&&`
 // short-circuits, so the render path pays one bool test per occluding candidate
 // and never the coordinate compare.
+//
+// The skip is a RECORD CELL, not a single voxel: a record covers a VL_STEP^3
+// group, so all of the group's own foliage has to be excluded, not just the one
+// voxel the sample point happens to sit in.
 var<private> shadow_skip_active: bool = false;
 var<private> shadow_skip_voxel: vec3<i32> = vec3<i32>(0);
 
@@ -1361,7 +1430,7 @@ fn leaf_cap_hit(nb_min: vec3<f32>, origin: vec3<f32>, dir: vec3<f32>, cap_y: f32
 // scatters individual leaf-silhouette cards through its VOLUME; beyond it
 // the cheap horizontal cap tuft covers canopy tops instead (two-tier LOD,
 // same pattern as the water corner/centre tiers).
-const LEAF_CLOUD_T: f32 = 32.0;
+const LEAF_CLOUD_T: f32 = 8.0 * VOXELS_PER_METRE;
 
 // Which leaf silhouette a species' cards carry.
 fn leaf_card_sprite(mat: u32) -> u32 {
@@ -1851,7 +1920,7 @@ fn sprite_cross_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u3
 // through wind_time(), so shadow rays sample the frozen phase exactly like
 // the cross quads). Same primitives as sprite_cross_hit: plane test, sprite
 // texel alpha, cross_sprite_tint ramp.
-const FLORA_NEAR_T: f32 = 28.0;
+const FLORA_NEAR_T: f32 = 7.0 * VOXELS_PER_METRE;
 const FLORA_BLADES: i32 = 18;
 
 // Rolling grass height: a smooth ~18-voxel field so blade and tuft heights
@@ -1962,7 +2031,7 @@ fn flora_clump_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32
 // per-blade lean and the shared wind (tip-weighted, frozen-phase safe via
 // wind_offset). Misses fall through to the grass top below, whose combed
 // sheen shading is the between-blades and beyond-TURF_T look.
-const TURF_T: f32 = 48.0;
+const TURF_T: f32 = 12.0 * VOXELS_PER_METRE;
 
 // One flat tapered ribbon piece: closest approach of the (unit) ray to the
 // segment a->b, accepted when the perpendicular offset decomposes into
@@ -3137,14 +3206,14 @@ fn water_field(xz: vec2<f32>, t: f32) -> vec3<f32> {
 // shading take a small number of discrete values per cell. Wave MOTION
 // survives: the band a cell sits in changes as the wavefront passes, so the
 // surface steps up and down in place.
-const WATER_DETAIL_T: f32 = 96.0;   // beyond this, the wave field is skipped (flat rest plane)
+const WATER_DETAIL_T: f32 = 24.0 * VOXELS_PER_METRE;   // beyond this, the wave field is skipped (flat rest plane)
 // Beyond this, water really is a plain cube top. The 0.28-voxel drop from
 // cube top (1.0) to rest surface (0.72) subtends under a pixel out here,
 // and fog has saturated by 280 - while the old 96 cutoff put the drop in
 // plain view: the water level visibly sank in a radius around the camera
 // as it approached ("far water looks higher"). Grazing cost stays bounded:
 // past 400 the first water cell stops the ray as a cube again.
-const WATER_FAR_T: f32 = 400.0;
+const WATER_FAR_T: f32 = 100.0 * VOXELS_PER_METRE;
 const WATER_BASE: f32 = 0.72;       // resting surface height inside the cell
 const WATER_MIN_H: f32 = 0.02;      // floor (keeps the plate off the cell floor)
 // |water_field| bound: the four amplitudes in `wave_param` sum to 0.108.
@@ -3202,7 +3271,7 @@ const WATER_FOAM_BAND: f32 = 2.0;
 // Beyond this the quarter-voxel foam stamp is sub-pixel, so it is faded out
 // rather than left to alias. Inside WATER_DETAIL_T by construction: past that
 // there is no wave field, hence no crest, hence nothing to foam.
-const WATER_FOAM_T: f32 = 64.0;
+const WATER_FOAM_T: f32 = 16.0 * VOXELS_PER_METRE;
 
 struct WaterSubHit {
     hit: bool,
@@ -3905,7 +3974,7 @@ fn is_blend_mat(m: u32) -> bool {
     return m == 1u || m == 2u || m == 3u || m == 4u || m == 15u;
 }
 
-const BLEND_T: f32 = 64.0;   // beyond this an edge fade is sub-pixel
+const BLEND_T: f32 = 16.0 * VOXELS_PER_METRE;   // beyond this an edge fade is sub-pixel
 const BLEND_W: f32 = 0.42;   // fade starts this far from the shared edge
 
 // Connected-texture cross-fade for terrain top faces: bilinear-blend the
@@ -3952,11 +4021,11 @@ fn blended_palette(p_hit: vec3<f32>, voxel: vec3<i32>, m: u32) -> vec3<f32> {
 // Beyond this the one-bounce indirect (RT variant) is faded out: its contribution
 // is small at distance and fog covers it, and it is the priciest per-pixel term.
 // Pulled in from 120 so fewer pixels pay for GI (perf).
-const GI_MAX_T: f32 = 90.0;
+const GI_MAX_T: f32 = 22.5 * VOXELS_PER_METRE;
 
 // Shader-pure grass turf: micro-normal/sheen terms fade out by here (the
 // blade-scale detail is sub-pixel long before this).
-const GRASS_SHADE_T: f32 = 96.0;
+const GRASS_SHADE_T: f32 = 24.0 * VOXELS_PER_METRE;
 
 // A sun-visibility and AO pair a CALLER can prove, so `shade` neither traces nor
 // samples for it.
@@ -4292,8 +4361,8 @@ fn shade_glass(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
 // Slab must stay inside the world's vertical extent (Y = 256, 64 bricks
 // of 4) so rays under a cloud that also cross terrain keep a consistent
 // depth story; 165..235 leaves headroom for the tower tops.
-const CLOUD_BASE: f32 = 190.0;
-const CLOUD_TOP:  f32 = 290.0;
+const CLOUD_BASE: f32 = 47.5 * VOXELS_PER_METRE;
+const CLOUD_TOP:  f32 = 72.5 * VOXELS_PER_METRE;
 
 fn render_clouds(origin: vec3<f32>, dir: vec3<f32>, t_terrain: f32, pix: vec2<f32>) -> vec4<f32> {
     // Slab intersection. A horizontal ray (|dir.y| ~ 0) is parallel to the
@@ -4476,7 +4545,9 @@ fn cs_godrays(@builtin(global_invocation_id) gid: vec3<u32>) {
 // (hardware RT) - the ONE source of the shadow occluder rule.
 fn shadow_voxel_occludes(voxel: vec3<i32>, m: u32, t_cur: f32, origin: vec3<f32>, dir: vec3<f32>) -> bool {
     // A light-field gather never occludes itself: see `shadow_skip_active`.
-    if (shadow_skip_active && all(voxel == shadow_skip_voxel)) { return false; }
+    if (shadow_skip_active
+        && all(voxel >= shadow_skip_voxel)
+        && all(voxel < shadow_skip_voxel + vec3<i32>(VL_STEP))) { return false; }
     if (m == MAT_LEAF_FRINGE || m == MAT_TURF) {
         // Invisible canopy fringe never occludes shadow rays; turf blades
         // are below shadow scale (their root-dark ramp is the self-shadow)
@@ -4592,44 +4663,44 @@ fn axis_select(v: vec3<f32>, ax: i32) -> f32 {
 
 // LOD: past this many voxels of distance, terminate the DDA at brick
 // granularity instead of per-voxel.
-const LOD_BRICK_T: f32 = 400.0;
+const LOD_BRICK_T: f32 = 100.0 * VOXELS_PER_METRE;
 
 // Even further out, terminate at TILE (16-voxel) granularity: far terrain is
 // blocky but each occupied tile costs one hit instead of a brick/voxel descent
 // (checklist: tile-level LOD for far terrain).
-const TILE_LOD_T: f32 = 520.0;
+const TILE_LOD_T: f32 = 130.0 * VOXELS_PER_METRE;
 
 // Distance-based ray budget (in voxels). Traversal stops here regardless of how
 // many DDA steps it took — replaces the old fixed voxel-step count so small
 // voxels can't run the loop out before reaching far geometry (holes-through-
 // terrain) and so empty rays don't waste steps. Comfortably covers the loaded
 // window (the camera sits at its centre).
-const MAX_RAY_DIST: f32 = 700.0;
+const MAX_RAY_DIST: f32 = 175.0 * VOXELS_PER_METRE;
 // Secondary rays (water reflection/refraction, glass) stop here: fog is 41%
 // by 200 and the fresnel-weighted reflection of far geometry is
 // indistinguishable from the sky it fades into - while traversal cost scales
 // with range. Applied identically to the software and RT secondary paths.
-const SECONDARY_MAX_T: f32 = 200.0;
+const SECONDARY_MAX_T: f32 = 50.0 * VOXELS_PER_METRE;
 
 // Beyond this distance, sub-voxel foliage (sprite cross-quads, leaf cutout
 // faces) is treated as a solid cube rather than ray-marched. Authored-sprite
 // foliage is cheap (2 plane tests + 1 texel fetch vs the old 22-blade
 // procedural bundle), so the detail radius is much wider than the old 72.
-const FOLIAGE_NEAR_T: f32 = 128.0;
+const FOLIAGE_NEAR_T: f32 = 32.0 * VOXELS_PER_METRE;
 
 // Shadow / occlusion rays give up past this distance (treated as lit). Far
 // shadows contribute little and are the most expensive secondary rays
 // (checklist: cheaper secondary rays / coarse shadows).
-const SHADOW_MAX_DIST: f32 = 480.0;
+const SHADOW_MAX_DIST: f32 = 120.0 * VOXELS_PER_METRE;
 
 // Beyond this distance, skip per-corner ambient occlusion (its contact-shadow
 // detail is sub-pixel far away). 12 hierarchical lookups/pixel saved on the
 // bulk of the screen.
-const AO_DIST: f32 = 64.0;
+const AO_DIST: f32 = 16.0 * VOXELS_PER_METRE;
 
 // God-ray occlusion cap: shafts only need nearby occluders, so the per-step
 // occlusion test bails out much sooner than a full-length shadow ray.
-const GOD_RAY_OCCL_DIST: f32 = 160.0;
+const GOD_RAY_OCCL_DIST: f32 = 40.0 * VOXELS_PER_METRE;
 
 // Resolve ONE solid voxel the primary ray reached: decide whether it is a real
 // visible hit and, if so, fill `out`. Shared by the software DDA (trace) and the

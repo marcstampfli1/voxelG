@@ -40,7 +40,7 @@ fn vl_brick_world_base(brick: u32) -> vec3<i32> {
     );
 }
 
-/// Face-independent ambient occlusion for an AIR voxel.
+/// Face-independent ambient occlusion for a record CELL whose low voxel is `v`.
 ///
 /// The per-pixel formula this replaces (`compute_ao`) evaluated four corners of
 /// one FACE and bilinearly blended them. A per-voxel field cannot be
@@ -48,21 +48,29 @@ fn vl_brick_world_base(brick: u32) -> vec3<i32> {
 /// smooth gradient comes from the trilinear fetch instead of the in-face blend.
 /// `ao_occluder` is reused verbatim so decoration cells (grass tufts, flowers,
 /// the invisible canopy fringe) still do not stamp AO squares onto the ground.
+///
+/// The offsets are -1 and +VL_STEP, NOT +/-1, because the cell is VL_STEP voxels
+/// wide: the voxels TOUCHING it are one below its low face and VL_STEP above its
+/// low corner. At VL_STEP == 1 this is exactly the per-voxel formula it grew
+/// from; at 2 it measures occlusion over a 20 cm neighbourhood, which is the
+/// same real-world contact scale the 25 cm build's +/-1 kernel had.
 fn vl_voxel_ao(v: vec3<i32>) -> f32 {
+    let n = -1;
+    let p = VL_STEP;
     var occ = 0.0;
     // 6 face neighbours, weight 2.
-    if (ao_occluder(v + vec3<i32>(1, 0, 0))) { occ = occ + 2.0; }
-    if (ao_occluder(v + vec3<i32>(-1, 0, 0))) { occ = occ + 2.0; }
-    if (ao_occluder(v + vec3<i32>(0, 1, 0))) { occ = occ + 2.0; }
-    if (ao_occluder(v + vec3<i32>(0, -1, 0))) { occ = occ + 2.0; }
-    if (ao_occluder(v + vec3<i32>(0, 0, 1))) { occ = occ + 2.0; }
-    if (ao_occluder(v + vec3<i32>(0, 0, -1))) { occ = occ + 2.0; }
+    if (ao_occluder(v + vec3<i32>(p, 0, 0))) { occ = occ + 2.0; }
+    if (ao_occluder(v + vec3<i32>(n, 0, 0))) { occ = occ + 2.0; }
+    if (ao_occluder(v + vec3<i32>(0, p, 0))) { occ = occ + 2.0; }
+    if (ao_occluder(v + vec3<i32>(0, n, 0))) { occ = occ + 2.0; }
+    if (ao_occluder(v + vec3<i32>(0, 0, p))) { occ = occ + 2.0; }
+    if (ao_occluder(v + vec3<i32>(0, 0, n))) { occ = occ + 2.0; }
     // 12 edge neighbours, weight 1.
     for (var a = 0u; a < 3u; a = a + 1u) {
         for (var s0 = 0u; s0 < 2u; s0 = s0 + 1u) {
             for (var s1 = 0u; s1 < 2u; s1 = s1 + 1u) {
-                let d0 = select(-1, 1, s0 == 1u);
-                let d1 = select(-1, 1, s1 == 1u);
+                let d0 = select(n, p, s0 == 1u);
+                let d1 = select(n, p, s1 == 1u);
                 var e = vec3<i32>(0);
                 if (a == 0u) { e = vec3<i32>(0, d0, d1); }
                 else if (a == 1u) { e = vec3<i32>(d0, 0, d1); }
@@ -196,53 +204,75 @@ fn vl_work(wg: u32) -> u32 {
     return vl_live_bricks[idx];
 }
 
+// Bricks one workgroup covers. A record is a VL_STEP^3 group, so a brick holds
+// only LIGHT_RECORDS_PER_BLOCK of them - 8 at VL_STEP 2. A workgroup of 8 would
+// leave three quarters of every warp idle on the hardware this targets, so one
+// workgroup gathers several bricks and stays 64 wide. `voxlight_wgs` in
+// renderer.rs converts a work-list length into a dispatch size with the same
+// divisor, and there is no second copy of it.
+const VL_WG_BRICKS: u32 = 64u / u32(LIGHT_RECORDS_PER_BLOCK);
+
 @compute @workgroup_size(64, 1, 1)
 fn cs_voxel_light_update(@builtin(workgroup_id) wg: vec3<u32>,
                          @builtin(local_invocation_index) li: u32) {
-    let brick = vl_work(wg.x);
+    let rpb = u32(LIGHT_RECORDS_PER_BLOCK);
+    // Lanes are grouped by brick so the 8 lanes sharing a block also share its
+    // pool cache line and its brick occupancy word.
+    let slot = wg.x * VL_WG_BRICKS + li / rpb;
+    let ri = li % rpb;
+    let brick = vl_work(slot);
     if (brick == VL_NONE) { return; }
     let block = vl_block_of_brick[brick];
     if (block == VL_NONE) { return; }
 
-    // local_invocation_index IS the brick voxel index; invert
-    // brick_voxel_idx (lx + lz*4 + ly*16).
-    let lx = i32(li % 4u);
-    let lz = i32((li / 4u) % 4u);
-    let ly = i32(li / 16u);
-    let wv = vl_brick_world_base(brick) + vec3<i32>(lx, ly, lz);
-    let word = block * VL_BLOCK_WORDS + li * VL_RECORD_WORDS;
+    // Invert light_record_idx (rx + rz*D + ry*D^2) to the record's cell, then
+    // scale to its LOW VOXEL - which is the point the sampler interpolates
+    // through (see `voxlight_sample`).
+    let d = u32(LIGHT_RECORD_DIM);
+    let rx = i32(ri % d);
+    let rz = i32((ri / d) % d);
+    let ry = i32(ri / (d * d));
+    let r = vec3<i32>(rx, ry, rz);
+    let wv = vl_brick_world_base(brick) + r * VL_STEP;
+    let word = block * VL_BLOCK_WORDS + ri * VL_RECORD_WORDS;
 
-    // WHO CARRIES A RECORD: air, and FOLIAGE.
+    // WHO CARRIES A RECORD: a cell with NO opaque voxel in it. Air, and FOLIAGE.
     //
-    // An OPAQUE voxel keeps epoch 0 so the sampler's validity check drops it
-    // even before the opacity gate does. Foliage is not opaque - a canopy is a
-    // semi-transparent volume, and a volume wants a value AT the sample point,
-    // not at some adjacent air cell that on canopy is usually another leaf. That
-    // conflation is what left `voxlight_sample` with nothing to return for 54%
-    // of a canopy view; see `vl_tap`.
+    // A cell holding any opaque voxel keeps epoch 0, so the sampler's validity
+    // check drops it even before `vl_group_blocks` does - and the two agree by
+    // construction, which is what stops a half-solid cell from lighting the
+    // inside of a wall. Foliage is not opaque: a canopy is a semi-transparent
+    // volume, and a volume wants a value AT the sample point, not at some
+    // adjacent air cell that on canopy is usually another leaf. That conflation
+    // is what left `voxlight_sample` with nothing to return for 54% of a canopy
+    // view; see `vl_tap`.
     //
     // Read straight out of the brick rather than through `is_voxel_solid`: this
-    // invocation already knows its storage brick and its in-brick voxel index
-    // (`li` IS the brick voxel index), so the whole hierarchy descent the old
-    // gate paid - bounds, toroidal fold, chunk mask, tile mask, brick index -
-    // was re-deriving what it was handed. The masks are not needed here either:
-    // only a brick that currently holds a light block is ever dispatched, and a
-    // recycled slot releases its block before the next upload.
+    // invocation already knows its storage brick and its in-brick record coord,
+    // so the whole hierarchy descent the old gate paid - bounds, toroidal fold,
+    // chunk mask, tile mask, brick index - was re-deriving what it was handed.
+    // The masks are not needed here either: only a brick that currently holds a
+    // light block is ever dispatched, and a recycled slot releases its block
+    // before the next upload.
     let bi = i32(brick);
-    let vi = i32(li);
     var is_foliage = false;
-    if (brick_voxel_solid(bi, vi)) {
-        if (!is_foliage_mat(brick_voxel_material(bi, vi))) {
+    var occ = vl_group_occ(bi, r);
+    if (occ != 0u) {
+        if (vl_group_blocks(bi, r)) {
             vl_pool[word] = 0u;
             vl_pool[word + 1u] = 0u;
             return;
         }
+        // Occupied but nothing opaque: the cell is all foliage.
         is_foliage = true;
     }
 
+    // The sample point is the LOW voxel's centre, not the cell's geometric
+    // centre: a voxel centre is a safe shadow-ray origin and it is exactly what
+    // the per-voxel field used, so the shadow term means the same thing.
     let p = vec3<f32>(wv) + vec3<f32>(0.5);
-    // A foliage cell gathers at its own centre, so its own tuft must not be
-    // allowed to shadow it. See `shadow_skip_active` in raymarch.wgsl.
+    // A foliage cell gathers inside its own tufts, so the WHOLE cell must be
+    // excluded from occluding itself. See `shadow_skip_active` in raymarch.wgsl.
     if (is_foliage) {
         shadow_skip_active = true;
         shadow_skip_voxel = wv;

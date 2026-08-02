@@ -1,6 +1,14 @@
-# Cap test parallelism: the GPU render tests each allocate a full World
-# (~80 MB) plus a wgpu device and world-sized buffers; at the default
-# one-thread-per-core parallelism the suite spikes to multiple GB of RAM.
-# Four workers keep the peak bounded with negligible wall-time cost.
+# Repo-local cargo settings.
+
 [env]
-RUST_TEST_THREADS = "4"
+# A `World` is a DENSE brick array: 25,600,000 bricks x 72 B = 1.84 GB of RAM
+# each, since docs/SCALE_TO_10CM.md landed. `cargo test --lib` otherwise runs one
+# test per logical core, several of which build a full world, and the suite dies
+# with "memory allocation of 1843200000 bytes failed" rather than with a test
+# failure - which reads as a broken build, not as a memory budget.
+#
+# Two is what 32 GB holds alongside the two shared fixture worlds the player
+# tests keep in statics. Raise it when brick storage goes sparse (the one
+# remaining item on the scale plan); until then this is a real constraint, not a
+# workaround for flaky tests.
+RUST_TEST_THREADS = "2"

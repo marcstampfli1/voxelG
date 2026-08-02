@@ -21,17 +21,33 @@
 // the per-voxel reflected-radiance cache, which is why the capacity is
 // per-instance; that field is gone, the reason to keep the invariant is not.)
 
-use crate::world_dims::{BRICK_VOXELS, WORLD_BRICKS_TOTAL};
+use crate::world_dims::WORLD_BRICKS_TOTAL;
 
 pub use crate::world_dims::LIGHT_URGENT_BUDGET;
 
-/// Light records per block. One per voxel of a brick.
-pub const LIGHT_RECORDS_PER_BLOCK: u32 = BRICK_VOXELS;
+/// Light records per block, and the voxel edge of one record's cell.
+///
+/// A record covers a LIGHT_RECORD_STEP^3 group of voxels, not a single voxel:
+/// at 10 cm that is a 20 cm light field, FINER than the 25 cm one the per-voxel
+/// version shipped, for 1/8 the storage and 1/8 the sun rays per sweep. The
+/// values live in `world_dims.rs` because `build.rs` has to emit them into the
+/// shader prelude - the update pass and the sampler both address the pool with
+/// them, so a second copy could drift.
+pub use crate::world_dims::{
+    LIGHT_BLOCK_WORDS, LIGHT_RECORDS_PER_BLOCK, LIGHT_RECORD_DIM, LIGHT_RECORD_STEP,
+    LIGHT_RECORD_WORDS,
+};
 
-/// A record is two u32 words:
-///   word0: sun_vis u8 | ao u8 | epoch u8 | flags u8
-///   word1: point-light radiance, packed RGB9E5
-pub const LIGHT_RECORD_WORDS: u32 = 2;
+/// Index of the record covering in-brick voxel (lx, ly, lz).
+///
+/// Mirrors `brick_voxel_idx`'s x + z*D + y*D^2 ordering one level up, so the
+/// shader's inverse (`cs_voxel_light_update`) and this stay readable as the same
+/// linearisation. FORBIDDEN: open-coding this at a call site.
+#[inline(always)]
+pub const fn light_record_idx(lx: u32, ly: u32, lz: u32) -> u32 {
+    let d = LIGHT_RECORD_DIM;
+    (lx / LIGHT_RECORD_STEP) + (lz / LIGHT_RECORD_STEP) * d + (ly / LIGHT_RECORD_STEP) * d * d
+}
 
 /// Resident light blocks.
 ///
@@ -64,8 +80,8 @@ pub const LIGHT_RECORD_WORDS: u32 = 2;
 /// rest of the engine uses and where the reasoning lives.
 pub use crate::world_dims::LIGHT_BLOCKS_MAX;
 
-/// u32 words of GPU storage backing the whole pool (64 MiB).
-pub const LIGHT_POOL_WORDS: u32 = LIGHT_BLOCKS_MAX * LIGHT_RECORDS_PER_BLOCK * LIGHT_RECORD_WORDS;
+/// u32 words of GPU storage backing the whole pool (128 MiB).
+pub const LIGHT_POOL_WORDS: u32 = LIGHT_BLOCKS_MAX * LIGHT_BLOCK_WORDS;
 
 /// `block_of_brick` entry meaning "this brick has no light block".
 pub const LIGHT_BLOCK_NONE: u32 = u32::MAX;
@@ -533,7 +549,7 @@ impl LightField {
     /// Word offset of `block`'s records within the light pool buffer.
     #[inline]
     pub fn block_word_offset(block: u32) -> u32 {
-        block * LIGHT_RECORDS_PER_BLOCK * LIGHT_RECORD_WORDS
+        block * LIGHT_BLOCK_WORDS
     }
 
     #[cfg(test)]
@@ -771,9 +787,76 @@ mod tests {
 
     #[test]
     fn pool_sizing_matches_the_documented_budget() {
-        // 131072 blocks * 64 records * 2 words * 4 bytes = 64 MiB.
-        assert_eq!(LIGHT_RECORDS_PER_BLOCK, 64);
-        assert_eq!(LIGHT_POOL_WORDS as u64 * 4, 64 * 1024 * 1024);
+        // WAS: 131,072 blocks x 64 records (one per voxel) x 2 words = 64 MiB.
+        // NOW: 2,097,152 blocks x 8 records (one per 2x2x2 voxels) x 2 words
+        // = 128 MiB. The PREMISE changed, not the invariant: at 10 cm the lit
+        // shell is ~10x the blocks (it is a surface, and the resolution doubled
+        // and a half twice over), and the pool pays for that with a 16x cheaper
+        // block rather than with 16x the memory. See LIGHT_RECORD_STEP.
+        assert_eq!(LIGHT_RECORDS_PER_BLOCK, 8);
+        assert_eq!(LIGHT_BLOCK_WORDS * 4, 64, "a block is 64 bytes");
+        assert_eq!(LIGHT_POOL_WORDS as u64 * 4, 128 * 1024 * 1024);
+    }
+
+    #[test]
+    fn the_group_mask_matches_the_record_step() {
+        // `vl_group_occ` in raymarch.wgsl answers "is any voxel of this record's
+        // cell solid" with ONE shift of the constant 0x00330033 over one half of
+        // the brick's 64-bit occupancy word. That identity is specific to a 2^3
+        // group inside a 4^3 brick laid out x + z*4 + y*16: it is what keeps the
+        // coarser gate as cheap per tap as the per-voxel one it replaced.
+        //
+        // If LIGHT_RECORD_STEP ever moves, the shader mask has to be rederived -
+        // it will NOT simply be wrong at the edges, it will address the wrong
+        // half of the brick. Rather than let that be silent, fail here.
+        assert_eq!(
+            LIGHT_RECORD_STEP, 2,
+            "raymarch.wgsl::vl_group_occ hardcodes the 2^3 group pattern 0x00330033;              rederive it before changing the step"
+        );
+        assert_eq!(LIGHT_RECORD_DIM, 2);
+        // The pattern, rebuilt here from the brick linearisation, must be the
+        // literal the shader uses.
+        let mut pat: u64 = 0;
+        for dy in 0..2u32 {
+            for dz in 0..2u32 {
+                for dx in 0..2u32 {
+                    pat |= 1u64 << crate::voxel::brick_voxel_idx(dx, dy, dz);
+                }
+            }
+        }
+        assert_eq!(pat, 0x0033_0033, "the 2^3 group bit pattern");
+        // ...and every group is that pattern shifted by 2*rx + 8*rz within one
+        // 32-bit half, chosen by ry. Verified exhaustively.
+        for ry in 0..2u32 {
+            for rz in 0..2u32 {
+                for rx in 0..2u32 {
+                    let mut want: u64 = 0;
+                    for dy in 0..2u32 {
+                        for dz in 0..2u32 {
+                            for dx in 0..2u32 {
+                                want |= 1u64
+                                    << crate::voxel::brick_voxel_idx(
+                                        rx * 2 + dx,
+                                        ry * 2 + dy,
+                                        rz * 2 + dz,
+                                    );
+                            }
+                        }
+                    }
+                    let half = (want >> (32 * ry as u64)) as u32;
+                    assert_eq!(
+                        u64::from(half) << (32 * ry as u64),
+                        want,
+                        "group ({rx},{ry},{rz}) straddles the 32-bit halves"
+                    );
+                    assert_eq!(
+                        half,
+                        0x0033_0033u32 << (2 * rx + 8 * rz),
+                        "group ({rx},{ry},{rz}) is not the shifted pattern"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -895,8 +978,10 @@ mod tests {
     fn block_offsets_are_distinct_and_in_range() {
         let last = LIGHT_BLOCKS_MAX - 1;
         assert_eq!(LightField::block_word_offset(0), 0);
-        assert_eq!(LightField::block_word_offset(1), 128);
-        let end = LightField::block_word_offset(last) + LIGHT_RECORDS_PER_BLOCK * LIGHT_RECORD_WORDS;
+        // 8 records x 2 words. Was 128 when a record was one voxel.
+        assert_eq!(LightField::block_word_offset(1), LIGHT_BLOCK_WORDS);
+        assert_eq!(LIGHT_BLOCK_WORDS, 16);
+        let end = LightField::block_word_offset(last) + LIGHT_BLOCK_WORDS;
         assert_eq!(end, LIGHT_POOL_WORDS, "the last block must end exactly at the pool end");
     }
 

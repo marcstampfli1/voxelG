@@ -717,15 +717,7 @@ impl Renderer {
         }))
         .map_err(|e| format!("no compatible GPU adapter found: {e}"))?;
 
-        let base_limits = wgpu::Limits {
-            max_storage_buffer_binding_size: 256 << 20, // 256 MB headroom
-            // Group 0 binds 14 storage buffers (default cap is 8): the world
-            // pyramid and the deferred-transparent records took it past the
-            // default, and the per-voxel light field adds four more (pool,
-            // brick table, work list, point lights).
-            max_storage_buffers_per_shader_stage: COMPUTE_STORAGE_BUFFERS,
-            ..wgpu::Limits::default()
-        };
+        let base_limits = world_limits();
         // Hardware ray tracing is OPT-IN via VOXELG_RT and only when the adapter
         // supports it. When off, the device is byte-identical to the pre-RT one,
         // so the software renderer (the default) is entirely unaffected. When on,
@@ -863,11 +855,26 @@ impl Renderer {
             contents: bricks_bytes,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
+        // Opt-in (default off): GPU sand physics replaces the CPU CA. When on, the
+        // CPU world.bricks is not kept in sync (raycast picking sees the pre-physics
+        // state) - that CPU<->GPU sync is the next migration stage in the design doc.
+        //
+        // Read HERE and not at the bind group below because the ping-pong buffer is
+        // a second full copy of the brick array. At 25 cm that was 75 MB and nobody
+        // noticed it was allocated unconditionally; at 10 cm it is 1.8 GB of VRAM
+        // handed to a pass the default build never dispatches.
+        let gpu_physics_enabled = std::env::var("VOXELG_GPU_PHYSICS").is_ok();
         // Second brick buffer for the GPU-compute physics ping-pong (#25). The CA
         // reads bricks_buf and writes bricks_buf_b, which is then copied back.
+        // Sized to one brick when the path is off: the bind group still has to be
+        // satisfiable, but nothing ever reads it.
         let bricks_buf_b = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("bricks_b (gpu physics)"),
-            size: bricks_bytes.len() as u64,
+            size: if gpu_physics_enabled {
+                bricks_bytes.len() as u64
+            } else {
+                std::mem::size_of::<crate::voxel::Brick>() as u64
+            },
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
@@ -1261,10 +1268,6 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 1, resource: bricks_buf_b.as_entire_binding() },
             ],
         });
-        // Opt-in (default off): GPU sand physics replaces the CPU CA. When on, the
-        // CPU world.bricks is not kept in sync (raycast picking sees the pre-physics
-        // state) â€” that CPU<->GPU sync is the next migration stage in the design doc.
-        let gpu_physics_enabled = std::env::var("VOXELG_GPU_PHYSICS").is_ok();
 
         // -- beam pipeline (1/8-res coarse pre-pass) --
         let beam_bgl = create_beam_bgl(&device);
@@ -2012,9 +2015,9 @@ impl Renderer {
                     cp.set_pipeline(&self.voxlight_pipeline);
                     cp.set_bind_group(0, &self.compute_bg, &[]);
                 }
-                // One workgroup per block due this dispatch, one invocation per
-                // voxel.
-                cp.dispatch_workgroups(wgs, 1, 1);
+                // `wgs` counts BRICKS due this dispatch; one workgroup gathers
+                // VOXLIGHT_WG_BRICKS of them, one invocation per record.
+                cp.dispatch_workgroups(voxlight_wgs(wgs), 1, 1);
             }
             // The round counter picks which SLICE of the work list the sweep
             // takes, so it advances with the SWEEP and not with the frame: a
@@ -3471,6 +3474,25 @@ pub(crate) fn voxlight_dispatch_blocks(live: u32, near: u32) -> u32 {
     near.div_ceil(VOXLIGHT_UPDATE_DIV) + far.div_ceil(VOXLIGHT_UPDATE_DIV * VOXLIGHT_FAR_DIV)
 }
 
+/// Bricks one `cs_voxel_light_update` workgroup covers.
+///
+/// A record is a LIGHT_RECORD_STEP^3 group, so a brick holds only 8 of them at
+/// the shipping step. A workgroup of 8 would leave three quarters of every warp
+/// idle, so 64 lanes gather 8 bricks. MUST match `VL_WG_BRICKS` in
+/// voxlight_update.wgsl, which derives it from the same emitted constant.
+pub(crate) const VOXLIGHT_WG_BRICKS: u32 = 64 / crate::voxlight::LIGHT_RECORDS_PER_BLOCK;
+
+/// Work-list slots (bricks) -> workgroups to dispatch.
+///
+/// Every counter in the engine and in the harnesses talks in BRICKS, because
+/// that is what the near/far partition slices and what the urgent budget counts.
+/// The dispatch is the only place that needs workgroups, so the conversion lives
+/// here and nowhere else.
+#[inline]
+pub(crate) fn voxlight_wgs(slots: u32) -> u32 {
+    slots.div_ceil(VOXLIGHT_WG_BRICKS)
+}
+
 pub(crate) fn voxlight_params(
     live_count: u32, round: u32, light_count: u32, near_count: u32,
 ) -> VoxLightParamsUniform {
@@ -3730,6 +3752,35 @@ pub(crate) fn make_rt_bg_pair(
 /// 3x SH radiance + 2x SH visibility moments + info). Zeroed
 /// info.w = 0 marks every slot "never gathered", so the update pass fills them
 /// fresh on the first frames instead of blending against garbage.
+/// The device limits the LOADED WORLD needs, derived from `world_dims` instead
+/// of from a round number that happened to be big enough once.
+///
+/// The brick array is a SINGLE storage binding, and it is the one buffer that
+/// scales with the cube of the resolution: 75 MB at 25 cm / 512^3-ish, 1.84 GB
+/// at 10 cm / 1600x640x1600. wgpu's defaults are 128 MB per binding and 256 MB
+/// per buffer, so both have to be raised or `create_buffer` fails at startup
+/// with a limit error - which reads as "the game will not launch", not as a
+/// rendering bug. Asking for exactly what the world needs (plus a little for the
+/// light pool and the block table) also means a GPU that cannot serve it fails
+/// loudly here rather than mis-rendering later.
+pub(crate) fn world_limits() -> wgpu::Limits {
+    let bricks = crate::voxel::WORLD_BRICKS_TOTAL as u64
+        * std::mem::size_of::<crate::voxel::Brick>() as u64;
+    // The biggest single binding, rounded up to 64 MB so a small dims change does
+    // not silently re-request a different limit on every build.
+    let want = bricks.max(crate::voxlight::LIGHT_POOL_WORDS as u64 * 4).div_ceil(64 << 20) * (64 << 20);
+    wgpu::Limits {
+        max_storage_buffer_binding_size: want,
+        max_buffer_size: want,
+        // Group 0 binds 14 storage buffers (default cap is 8): the world
+        // pyramid and the deferred-transparent records took it past the
+        // default, and the per-voxel light field adds four more (pool,
+        // brick table, work list, point lights).
+        max_storage_buffers_per_shader_stage: COMPUTE_STORAGE_BUFFERS,
+        ..wgpu::Limits::default()
+    }
+}
+
 pub(crate) fn create_probe_buf(device: &wgpu::Device) -> wgpu::Buffer {
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("gi probes"),
@@ -3898,11 +3949,7 @@ mod gpu_render_tests {
             &wgpu::DeviceDescriptor {
                 label: Some("headless test device"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits {
-                    max_storage_buffer_binding_size: 256 << 20,
-                    max_storage_buffers_per_shader_stage: COMPUTE_STORAGE_BUFFERS,
-                    ..wgpu::Limits::default()
-                },
+                required_limits: world_limits(),
                 memory_hints: wgpu::MemoryHints::Performance,
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
                 trace: wgpu::Trace::Off,
@@ -3937,10 +3984,13 @@ mod gpu_render_tests {
         // horizon so the frame contains terrain (lower) and sky (upper) â€” never
         // inside a voxel.
         let mut cam = Camera::new();
-        cam.pos.x = wo.x as f32 + 256.0;
-        cam.pos.z = wo.z as f32 + 256.0;
+        // Window centre, and 7.5 m above the ground there. Both were voxel
+        // literals (256 = half of 512, 30 voxels), so both moved with the grid
+        // instead of staying put in the world.
+        cam.pos.x = wo.x as f32 + crate::voxel::WORLD_VOXELS_X as f32 * 0.5;
+        cam.pos.z = wo.z as f32 + crate::voxel::WORLD_VOXELS_Z as f32 * 0.5;
         let s = crate::voxel::sample_terrain(cam.pos.x, cam.pos.z, world.seed);
-        cam.pos.y = s.h as f32 + 30.0;
+        cam.pos.y = s.h as f32 + crate::voxel::m_to_vox(7.5);
         cam.pitch = -0.35;
 
         sync_voxlight_shells(&mut world);
@@ -4418,10 +4468,13 @@ mod gpu_render_tests {
     fn ab_camera(world: &World) -> Camera {
         let wo = world.world_origin_voxel();
         let mut cam = Camera::new();
-        cam.pos.x = wo.x as f32 + 256.0;
-        cam.pos.z = wo.z as f32 + 256.0;
+        // Window centre, and 7.5 m above the ground there. Both were voxel
+        // literals (256 = half of 512, 30 voxels), so both moved with the grid
+        // instead of staying put in the world.
+        cam.pos.x = wo.x as f32 + crate::voxel::WORLD_VOXELS_X as f32 * 0.5;
+        cam.pos.z = wo.z as f32 + crate::voxel::WORLD_VOXELS_Z as f32 * 0.5;
         let s = crate::voxel::sample_terrain(cam.pos.x, cam.pos.z, world.seed);
-        cam.pos.y = s.h as f32 + 30.0;
+        cam.pos.y = s.h as f32 + crate::voxel::m_to_vox(7.5);
         cam.pitch = -0.35;
         cam
     }
@@ -5733,36 +5786,46 @@ mod gpu_render_tests {
     /// deterministic camera anchors shared by the water/foliage content test
     /// and the timing benchmark.
     fn find_scene_anchors(world: &World) -> (glam::IVec2, glam::IVec2, i32) {
-        use crate::voxel::{is_water_mat, is_leaf_mat};
-        let cells = 512 / 32;
+        use crate::voxel::{is_water_mat, is_leaf_mat, m_to_vox_i};
+        // The scan is in METRES: an 8 m cell sampled every metre, over the whole
+        // window, looking for water at the surface and leaves between 5 m and
+        // 35 m up. Written in voxels (a 32-voxel cell every 4 voxels, y 1..200)
+        // it silently became a 3.2 m cell at 10 cm - eight times the cells, each
+        // too small to hold a lake, and a y window that stopped below the trees.
+        let cell = m_to_vox_i(8.0);
+        let step = m_to_vox_i(1.0).max(1);
+        let cells_x = crate::voxel::WORLD_VOXELS_X as i32 / cell;
+        let cells_z = crate::voxel::WORLD_VOXELS_Z as i32 / cell;
+        let y_top = m_to_vox_i(50.0).min(crate::voxel::WORLD_VOXELS_Y as i32 - 1);
+        let (leaf_lo, leaf_hi) = (m_to_vox_i(5.0), m_to_vox_i(35.0).min(y_top));
         let mut best_water = (0usize, glam::IVec2::ZERO);
         let mut best_leaf = (0usize, glam::IVec2::ZERO);
-        for cz in 0..cells {
-            for cx in 0..cells {
+        for cz in 0..cells_z {
+            for cx in 0..cells_x {
                 let (mut water_n, mut leaf_n) = (0usize, 0usize);
-                for dz in (0..32).step_by(4) {
-                    for dx in (0..32).step_by(4) {
-                        let (x, z) = (cx * 32 + dx, cz * 32 + dz);
-                        for y in (1..200).rev() {
+                for dz in (0..cell).step_by(step as usize) {
+                    for dx in (0..cell).step_by(step as usize) {
+                        let (x, z) = (cx * cell + dx, cz * cell + dz);
+                        for y in (1..y_top).rev() {
                             let m = world.material_at_world(x, y, z);
                             if m == MAT_AIR { continue; }
                             if is_water_mat(m) { water_n += 1; }
                             break;
                         }
-                        for y in 60..140 {
+                        for y in (leaf_lo..leaf_hi).step_by(step as usize) {
                             if is_leaf_mat(world.material_at_world(x, y, z)) { leaf_n += 1; }
                         }
                     }
                 }
-                let c = glam::IVec2::new(cx * 32 + 16, cz * 32 + 16);
+                let c = glam::IVec2::new(cx * cell + cell / 2, cz * cell + cell / 2);
                 if water_n > best_water.0 { best_water = (water_n, c); }
                 if leaf_n > best_leaf.0 { best_leaf = (leaf_n, c); }
             }
         }
-        let leaf_ground = (1..200)
+        let leaf_ground = (1..y_top)
             .rev()
             .find(|&y| world.material_at_world(best_leaf.1.x, y, best_leaf.1.y) != MAT_AIR)
-            .unwrap_or(80);
+            .unwrap_or(m_to_vox_i(20.0));
         eprintln!(
             "scenario anchors: water cell {:?} ({} cols), leaf cell {:?} ({} voxels, ground y={})",
             best_water.1, best_water.0, best_leaf.1, best_leaf.0, leaf_ground
@@ -5771,14 +5834,18 @@ mod gpu_render_tests {
     }
 
     fn clamp_anchor(v: i32) -> f32 {
-        v.max(48).min(464) as f32
+        // Keep a 12 m margin off the window edge so a camera placed at an anchor
+        // still has world in front of it. WAS 48..464 of 512, i.e. the same 12 m
+        // written as voxels.
+        let m = crate::voxel::m_to_vox_i(12.0);
+        v.max(m).min(crate::voxel::WORLD_VOXELS_X as i32 - m) as f32
     }
 
     /// Densest 32x32 column-cell in one specific material, for per-species
     /// views. None when the demo seed grew no such trees in the slot window
     /// (callers skip loudly instead of asserting on an absent species).
     fn find_species_anchor(world: &World, mat: u8) -> Option<(glam::IVec2, i32)> {
-        let cells = 512 / 32;
+        let cells = crate::voxel::WORLD_VOXELS_X as i32 / crate::voxel::m_to_vox_i(8.0);
         let mut best = (0usize, glam::IVec2::ZERO);
         for cz in 0..cells {
             for cx in 0..cells {
@@ -9398,9 +9465,10 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
                     if let Some(rt) = self.rt_bg {
                         cp.set_bind_group(1, rt, &[]);
                     }
-                    // One workgroup per block in this round's slice, one
-                    // invocation per voxel.
-                    cp.dispatch_workgroups(voxlight_dispatch_blocks(self.count, self.near), 1, 1);
+                    // One invocation per record; VOXLIGHT_WG_BRICKS bricks per
+                    // workgroup.
+                    cp.dispatch_workgroups(
+                        voxlight_wgs(voxlight_dispatch_blocks(self.count, self.near)), 1, 1);
                 }
                 self.queue.submit(std::iter::once(enc.finish()));
             }
@@ -9880,7 +9948,7 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
                     if let Some(rt) = &self.rt_bg {
                         cp.set_bind_group(1, rt, &[]);
                     }
-                    cp.dispatch_workgroups(vl_wgs, 1, 1);
+                    cp.dispatch_workgroups(voxlight_wgs(vl_wgs), 1, 1);
                 }
                 _ => {
                     let (pipe, bind) = match pass {
@@ -9952,19 +10020,27 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
             c.pitch = 1.15; // ~66 degrees up: sky fills the frame
             c
         };
+        // Camera OFFSETS are metres. Left as voxels these four views would each
+        // have moved 2.5x closer to their subject at 10 cm, so a before/after
+        // timing comparison would have been between two different shots.
+        use crate::voxel::{m_to_vox, SEA_LEVEL};
         let foliage = {
             let mut c = Camera::new();
             c.pos = glam::Vec3::new(
                 clamp_anchor(leaf_anchor.x),
-                leaf_ground as f32 + 14.0,
-                clamp_anchor(leaf_anchor.y) - 30.0,
+                leaf_ground as f32 + m_to_vox(3.5),
+                clamp_anchor(leaf_anchor.y) - m_to_vox(7.5),
             );
             c.pitch = -0.35;
             c
         };
         let water = {
             let mut c = Camera::new();
-            c.pos = glam::Vec3::new(clamp_anchor(water_anchor.x), 71.0, clamp_anchor(water_anchor.y) - 8.0);
+            c.pos = glam::Vec3::new(
+                clamp_anchor(water_anchor.x),
+                SEA_LEVEL as f32 + m_to_vox(1.75),
+                clamp_anchor(water_anchor.y) - m_to_vox(2.0),
+            );
             c.pitch = -0.22;
             c
         };
@@ -10665,11 +10741,18 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
     /// so storage coords and world coords coincide and no toroidal fold is
     /// involved.
     fn vl_record_word(world: &World, v: glam::IVec3) -> Option<u32> {
-        use crate::voxel::{brick_idx, brick_voxel_idx, BRICK_DIM};
+        use crate::voxel::BRICK_DIM;
+        use crate::voxlight::light_record_idx;
         let (x, y, z) = (v.x as u32, v.y as u32, v.z as u32);
-        let block = world.light.block_of(brick_idx(x / BRICK_DIM, y / BRICK_DIM, z / BRICK_DIM))?;
-        let vi = brick_voxel_idx(x % BRICK_DIM, y % BRICK_DIM, z % BRICK_DIM);
-        Some(LightField::block_word_offset(block) + vi * LIGHT_RECORD_WORDS)
+        let block = world
+            .light
+            .block_of(crate::voxel::brick_idx(x / BRICK_DIM, y / BRICK_DIM, z / BRICK_DIM))?;
+        // A record covers a LIGHT_RECORD_STEP^3 group, so several voxels share
+        // one. Indexing by the VOXEL here read past the end of the block and
+        // into the next tenant's records, which showed up as a sun-visibility
+        // row alternating 0 / 255 down a straight shadow edge.
+        let ri = light_record_idx(x % BRICK_DIM, y % BRICK_DIM, z % BRICK_DIM);
+        Some(LightField::block_word_offset(block) + ri * LIGHT_RECORD_WORDS)
     }
 
     /// Stored sun visibility of a world voxel, 0..255. Panics rather than

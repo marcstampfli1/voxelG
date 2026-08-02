@@ -9,7 +9,7 @@
 // sun_color, ambient_color, brick_voxel_material, sky_color).
 
 const GI_RAYS: i32 = 1;      // one fresh sample/frame; reprojection accumulates it
-const GI_DIST: f32 = 40.0;   // bounce ray reach (voxels); near light dominates
+const GI_DIST: f32 = 10.0 * VOXELS_PER_METRE;  // bounce ray reach (10 m); near light dominates
 const GI_STRENGTH: f32 = 1.0;
 const GI_SKY: f32 = 0.32;    // soft skylight fill (NOT a hard overhead emitter)
 

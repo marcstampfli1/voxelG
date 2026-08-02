@@ -15,19 +15,32 @@ use crate::voxel::{
     is_leaf_mat, is_water_mat, World, MAT_AIR, MAT_FLOWER, MAT_LEAF_FRINGE, MAT_LEAVES_AUTUMN,
     MAT_LEAVES_BIRCH, MAT_LEAVES_PINE, MAT_TALL_GRASS, MAT_TALL_GRASS_DRY,
 };
-use crate::world_dims::WORLD_VOXELS_Y;
+use crate::world_dims::{m_to_vox, WORLD_VOXELS_Y};
 use glam::{Vec2, Vec3};
 
 pub const MAX_LEAVES: usize = 256;
 
 const SPAWN_RATE_PER_S: f32 = 10.0;
-const SPAWN_RADIUS: f32 = 60.0;
-const SPAWN_MIN_RADIUS: f32 = 4.0;
+// Spawn annulus around the camera. How far away a falling leaf is still
+// worth simulating is a property of the METRE - the leaf is the same leaf
+// and the eye is the same eye - so these are the 15 m / 1 m they always
+// were, not the 60 / 4 voxels they happened to be at 25 cm. Left bare, the
+// whole effect would have collapsed into a 6 m bubble around the camera.
+const SPAWN_RADIUS: f32 = m_to_vox(15.0);
+const SPAWN_MIN_RADIUS: f32 = m_to_vox(1.0);
 const COLUMN_PROBES: u32 = 4;
-const WIND_DRIFT: f32 = 0.45;
+/// Sideways drift the frame wind adds while falling: 0.1125 m/s.
+const WIND_DRIFT: f32 = m_to_vox(0.1125);
 const LEAF_TTL: f32 = 20.0;
 const REST_S: f32 = 2.0;
 const SHRINK_S: f32 = 0.35;
+/// Sun-visibility probe length, in 1-voxel steps. The STEP stays at one
+/// voxel deliberately - it is a sampling rate against the grid, and a
+/// coarser one walks straight through a one-voxel-thick canopy - so the
+/// real-world 12 m reach has to be spent as a step COUNT that follows the
+/// voxel. Written as 48 it would have probed 4.8 m and called every leaf
+/// under a tall tree "lit".
+const SHADOW_PROBE_STEPS: u32 = m_to_vox(12.0) as u32;
 
 /// GPU instance layout; WGSL mirror in shaders/leaves.wgsl. 32 bytes: the
 /// vec3 pos + size share a 16-byte row, so Rust and WGSL strides match
@@ -175,7 +188,8 @@ impl LeafSim {
         });
 
         // Amortized lighting: coarse-march up to 16 leaves per frame toward
-        // the sun (1-voxel steps, 48 max) and smooth the visibility factor.
+        // the sun (1-voxel steps out to SHADOW_PROBE_STEPS = 12 m) and smooth
+        // the visibility factor.
         // Leaves/solids occlude, the invisible fringe and decoration do not.
         if !self.leaves.is_empty() {
             for _ in 0..16.min(self.leaves.len()) {
@@ -184,7 +198,7 @@ impl LeafSim {
                 let mut lit = 1.0f32;
                 if sun.y > 0.0 {
                     let mut p = leaf.pos + sun * 0.75;
-                    for _ in 0..48 {
+                    for _ in 0..SHADOW_PROBE_STEPS {
                         let m = world.material_at_world(
                             p.x.floor() as i32, p.y.floor() as i32, p.z.floor() as i32,
                         );
@@ -276,13 +290,22 @@ impl LeafSim {
             ];
             let ang = self.rng.next_f32() * std::f32::consts::TAU;
             self.leaves.push(Leaf {
+                // pos: cell centre, just clear of the canopy cell's top face -
+                // a placement RELATIVE to the cell it left, so it stays in
+                // cell units.
                 pos: Vec3::new(x as f32 + 0.5, hit_y as f32 + 1.3, z as f32 + 0.5),
-                base_size: 0.16 + 0.20 * self.rng.next_f32(),
+                // A leaf is 4..9 cm across, a leaf swings +-9..22 cm, and a
+                // leaf falls at 0.35..0.60 m/s. All three are properties of
+                // the LEAF, so they are written in SI: as bare voxel numbers
+                // they would have shrunk to thumbnail sprites drifting down at
+                // walking-pace-divided-by-seven the moment the voxel did.
+                // (sway_freq/spin_rate are per-second, hence untouched.)
+                base_size: m_to_vox(0.04) + m_to_vox(0.05) * self.rng.next_f32(),
                 sway_axis: Vec2::new(ang.cos(), ang.sin()),
-                sway_amp: 0.35 + 0.55 * self.rng.next_f32(),
+                sway_amp: m_to_vox(0.0875) + m_to_vox(0.1375) * self.rng.next_f32(),
                 sway_freq: 1.2 + 1.0 * self.rng.next_f32(),
                 phase: self.rng.next_f32() * std::f32::consts::TAU,
-                fall_speed: 1.4 + 1.0 * self.rng.next_f32(),
+                fall_speed: m_to_vox(0.35) + m_to_vox(0.25) * self.rng.next_f32(),
                 spin: self.rng.next_f32() * std::f32::consts::TAU,
                 spin_rate: -2.5 + 5.0 * self.rng.next_f32(),
                 sprite,
@@ -439,8 +462,10 @@ mod tests {
                 }
             }
         }
-        // Fall from y~74 to y61 takes ~13/1.4 = 9.3 s max, + rest + shrink
-        // stays comfortably under TTL; nothing may outlive TTL.
+        // The lab world is built in VOXEL coordinates, so the drop is 13
+        // voxels however big a voxel is: 13 / m_to_vox(0.35) s at the slowest
+        // fall speed (9.3 s at 25 cm, 3.7 s at 10 cm), + rest + shrink, both
+        // comfortably under TTL. Nothing may outlive TTL either way.
         assert!(max_alive_age <= LEAF_TTL + DT, "leaf outlived TTL: {max_alive_age}");
         assert!(!sim.is_empty());
     }

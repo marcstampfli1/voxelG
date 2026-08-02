@@ -1,3 +1,4 @@
+use crate::world_dims::m_to_vox;
 use glam::Vec3;
 
 #[derive(Clone)]
@@ -13,11 +14,20 @@ pub struct Camera {
 impl Camera {
     pub fn new() -> Self {
         Self {
-            pos: Vec3::new(256.0, 80.0, 256.0),
+            // Default spawn: 64 m in along each horizontal axis, 20 m up (the
+            // centre of the 128 m world the 25 cm build shipped). A spawn is a
+            // PLACE, not a voxel index: left as the bare 256/80 it silently
+            // moved to 25.6 m in and 8 m up - inside the terrain - the moment
+            // the voxel shrank. app.rs still lifts y clear of the surface.
+            pos: Vec3::new(m_to_vox(64.0), m_to_vox(20.0), m_to_vox(64.0)),
             yaw: 0.0,
             pitch: -0.5,
             fov_y: 70.0_f32.to_radians(),
-            move_speed: 80.0,
+            // 20 m/s free-cam (app.rs scales it by --speed). Written as the
+            // bare 80 voxels/s it would have become 8 m/s at 10 cm: the same
+            // camera crawling across a world that got 1.25x wider.
+            move_speed: m_to_vox(20.0),
+            // Radians per pixel of mouse motion: an ANGLE, so scale-free.
             look_sensitivity: 0.0025,
         }
     }

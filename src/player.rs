@@ -259,10 +259,15 @@ pub struct Player {
     prev_jump: bool,
 }
 
-/// A body counts as standing on ground within this many voxels of its feet.
-/// Small enough that it cannot bridge a real gap, large enough to survive the
-/// contact skin a resting sweep leaves behind.
-const GROUND_TOL: f32 = 0.05;
+/// A body counts as standing on ground within this far of its feet.
+///
+/// 12.5 mm: small enough that it cannot bridge a real gap (the smallest gap the
+/// world can make is one voxel), large enough to survive the contact skin a
+/// resting sweep leaves behind (`voxquery::CONTACT_SKIN`, 1e-3 voxel).
+/// In METRES because it is a property of the BODY's contact with the floor, not
+/// of the lattice: written as 0.05 voxels it was 12.5 mm at 25 cm and would have
+/// become 5 mm at 10 cm, tightening ground contact by 2.5x for no reason.
+const GROUND_TOL: f32 = m_to_vox(0.0125);
 
 impl Player {
     pub fn new(feet: Vec3) -> Self {
@@ -570,8 +575,13 @@ impl Player {
         }
         // Up first (where the free space usually is when something was placed
         // underfoot), then sideways, nearest distance first.
-        let reach = self.dims.height(self.crouching).max(self.dims.half_width * 2.0) + 1.0;
-        let mut d = 0.25;
+        // A body's own size plus 25 cm of slack, searched in 6.25 cm steps.
+        // Both were voxel literals, so the slack and the search resolution both
+        // shrank with the grid.
+        let reach =
+            self.dims.height(self.crouching).max(self.dims.half_width * 2.0) + m_to_vox(0.25);
+        let step = m_to_vox(0.0625);
+        let mut d = step;
         while d <= reach {
             for dir in [Vec3::Y, Vec3::X, Vec3::NEG_X, Vec3::Z, Vec3::NEG_Z, Vec3::NEG_Y] {
                 let candidate = self.pos + dir * d;
@@ -582,7 +592,7 @@ impl Player {
                     return;
                 }
             }
-            d += 0.25;
+            d += step;
         }
         // Nothing within a body's reach is clear (buried in solid rock). Leave
         // it where it is rather than teleporting it somewhere arbitrary.
@@ -595,7 +605,7 @@ impl Player {
         // Start every probe just above the feet: a resting body sits one contact
         // skin above its floor, and a probe starting exactly at the feet would
         // read that skin as a gap.
-        let eps = 0.05;
+        let eps = GROUND_TOL;
         let depth = self.tuning.ground_probe_depth;
 
         // Contact and material come from the BODY's own box, because that is
@@ -615,7 +625,17 @@ impl Player {
         // staircase and a 63-degree face land in the same bucket (measured: both
         // could read tan 1.04). Snapped to columns, a 1:1 face measures exactly
         // 1.0 and a 2:1 face exactly 2.0, on any terrain the worldgen makes.
-        const SPAN: f32 = 2.0;
+        // ~50 cm apart, rounded to an EVEN number of voxels so `+- SPAN/2` from
+        // a column centre lands on another column centre. Both halves still
+        // matter, and the rounding is why this is not simply `m_to_vox(0.5)`:
+        // an odd or fractional span would put the samples between columns again.
+        const SPAN: f32 = 2.0 * SPAN_HALF;
+        const SPAN_HALF: f32 = {
+            let v = m_to_vox(0.25);
+            // round-to-nearest, at least one voxel.
+            let r = (v + 0.5) as i32;
+            if r < 1 { 1.0 } else { r as f32 }
+        };
         const CORNERS: [(f32, f32); 4] = [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)];
         let cx = self.pos.x.floor() + 0.5;
         let cz = self.pos.z.floor() + 0.5;
@@ -623,6 +643,11 @@ impl Player {
         for (i, (sx, sz)) in CORNERS.iter().enumerate() {
             let px = cx + sx * (SPAN * 0.5);
             let pz = cz + sz * (SPAN * 0.5);
+            // HALF A VOXEL wide, deliberately in LATTICE units and not metres:
+            // the probe exists to read ONE column, and a box sized in metres
+            // would straddle two of them at a small enough voxel and silently
+            // report the taller of the pair. The thickness is a sliver for the
+            // same reason - it is a degenerate box, not a distance.
             let probe = Aabb::new(
                 Vec3::new(px - 0.25, self.pos.y + eps, pz - 0.25),
                 Vec3::new(px + 0.25, self.pos.y + eps + 0.02, pz + 0.25),
@@ -657,13 +682,17 @@ impl Player {
     fn wall_ahead(&self, world: &World, dir: Vec3) -> bool {
         let hw = self.dims.half_width;
         let h = self.dims.height(self.crouching);
-        let c = self.pos + dir * (hw + 0.25);
-        let lo = self.pos.y + self.tuning.step_max + 0.1;
-        let hi = self.pos.y + h - 0.1;
+        // 6 cm ahead of the body's face, a 15 cm probe column, with 2.5 cm of
+        // clearance top and bottom. Metres: these describe where a body's shin
+        // meets a wall, which does not change when the grid does.
+        let c = self.pos + dir * (hw + m_to_vox(0.0625));
+        let lo = self.pos.y + self.tuning.step_max + m_to_vox(0.025);
+        let hi = self.pos.y + h - m_to_vox(0.025);
+        let r = m_to_vox(0.075);
         lo < hi
             && voxquery::overlaps(
                 world,
-                Aabb::new(Vec3::new(c.x - 0.3, lo, c.z - 0.3), Vec3::new(c.x + 0.3, hi, c.z + 0.3)),
+                Aabb::new(Vec3::new(c.x - r, lo, c.z - r), Vec3::new(c.x + r, hi, c.z + r)),
                 MatSet::SOLID,
             )
     }
@@ -687,15 +716,16 @@ impl Player {
         let t = &self.tuning;
         // One body-width ahead: far enough to end up standing ON the ledge
         // rather than balanced on its lip.
-        let ahead = self.pos + dir * (hw * 2.0 + 0.5);
+        let ahead = self.pos + dir * (hw * 2.0 + m_to_vox(0.125));
         // A vault is a mantle, not a leap: the body must be AT the obstacle. A
         // ledge detected from a body-width away lands the body balanced on the
         // lip with its centre over the void, because the destination is measured
         // forward from wherever the vault happened to trigger.
-        let face = self.pos + dir * (hw + 0.3);
+        let face = self.pos + dir * (hw + m_to_vox(0.075));
+        let cr = m_to_vox(0.0625);
         let contact = Aabb::new(
-            Vec3::new(face.x - 0.25, self.pos.y + 0.05, face.z - 0.25),
-            Vec3::new(face.x + 0.25, self.pos.y + t.vault_max, face.z + 0.25),
+            Vec3::new(face.x - cr, self.pos.y + GROUND_TOL, face.z - cr),
+            Vec3::new(face.x + cr, self.pos.y + t.vault_max, face.z + cr),
         );
         if !voxquery::overlaps(world, contact, MatSet::SOLID) {
             return None;
@@ -920,10 +950,53 @@ pub fn to_m(voxels: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::voxel::MAT_STONE;
+    use crate::voxel::{m_to_vox_i, MAT_STONE};
     use std::sync::OnceLock;
 
     const DT: f32 = PlayerSim::TICK_DT;
+
+    // ---------------------------------------------------------------------
+    // THE FIXTURES ARE MEASURED IN METRES
+    //
+    // Every extent, obstacle height, ledge, ramp, ceiling gap and pool below is
+    // a REAL-WORLD size, converted to voxels only where it is used. They used to
+    // be bare voxel counts, and the day `world_dims::VOXEL_METRES` went
+    // 0.25 -> 0.10 (docs/SCALE_TO_10CM.md) every one of them silently shrank
+    // 2.5x: the 1 m vault ledge became a 40 cm kerb, the 1.5 m crouch gap became
+    // 60 cm, the 16 m ground patch became 6.4 m and the body walked straight off
+    // the end of it. Seven feel tests failed for a reason that had nothing to do
+    // with the feel - the controller's own tuning went through the same change
+    // without a single number moving, because it goes through `m_to_vox`.
+    //
+    // So the rule for this module is the rule for `Tuning`: an integer voxel
+    // count written directly is FORBIDDEN. `m_to_vox(0.35)` reads as 35 cm; 3.5
+    // does not. The values here are the SAME obstacle course the 25 cm build
+    // described, restated in the unit it was always measured in.
+    // ---------------------------------------------------------------------
+
+    /// Surface of every flat floor in both fixtures.
+    ///
+    /// This is the height the worldgen calls sea level (`voxel::SEA_LEVEL_M`,
+    /// i.e. `voxel::SEA_LEVEL` as a voxel row), which is exactly where the old
+    /// bare `GROUND_Y = 64.0` came from: at 25 cm, voxel row 64 WAS 16 m. Tying
+    /// the two together keeps a body dropped on a fixture and a body dropped on
+    /// generated terrain in the same part of the world's vertical range, and it
+    /// means the fixture floor moves with sea level instead of drifting off it.
+    const GROUND_M: f32 = crate::voxel::SEA_LEVEL_M;
+    const GROUND_Y: f32 = m_to_vox(GROUND_M);
+    /// Both fixture floors are a metre of stone. Only the top face is ever
+    /// touched; the thickness is there so nothing can fall through.
+    const FLOOR_THICK_M: f32 = 1.0;
+
+    /// "The body ended a manoeuvre resting on that surface", in metres.
+    ///
+    /// NUMERICAL slop, not a physical size: a sweep leaves a `CONTACT_SKIN` gap
+    /// (1e-3 voxel) and a settle loop stops a fraction of a tick short of
+    /// equilibrium. It is stated in metres anyway so it cannot silently tighten
+    /// or loosen by 2.5x with the voxel - 1.25 cm is what the old bare
+    /// `0.05` voxels meant at 25 cm, and 2.5 mm what the old `0.01` did.
+    const SETTLE_TOL_M: f32 = 0.0125;
+    const REST_TOL_M: f32 = 0.0025;
 
     /// Half-open box fill through the world's own edit path, so masks and
     /// uniform hints stay consistent with the bricks.
@@ -937,28 +1010,92 @@ mod tests {
         }
     }
 
-    const GROUND_Y: f32 = 64.0;
+    /// A world position from METRES.
+    fn at_m(x: f32, y: f32, z: f32) -> Vec3 {
+        Vec3::new(m_to_vox(x), m_to_vox(y), m_to_vox(z))
+    }
 
-    /// Ground plane with its surface at y = 64, spanning 64 x 64 voxels from the
-    /// origin. `World::new` allocates ~90 MB and spawns worker threads, so every
-    /// flat-ground feel test shares this one immutable world.
+    /// A box FACE at `metres`, as a voxel plane.
+    ///
+    /// ROUNDS, where `voxel::m_to_vox_i` truncates. A face is a position, and
+    /// the nearest plane is the honest answer when the grid cannot land on it:
+    /// a 0.25 m wall is 2.5 voxels at 10 cm, and truncating builds a 0.20 m one
+    /// while claiming 0.25. Rounding also makes the conversion immune to a
+    /// metre value that lands a float epsilon under an exact plane.
+    fn plane(metres: f32) -> i32 {
+        m_to_vox(metres).round() as i32
+    }
+
+    /// The height the grid actually builds for a requested one. A fixture states
+    /// intent in metres; the lattice quantises it, and a test must measure
+    /// against what is THERE, because that is all the body can climb.
+    fn built_height_m(want_m: f32) -> f32 {
+        to_m((plane(GROUND_M + want_m) - plane(GROUND_M)) as f32)
+    }
+
+    /// [`fill`], in METRES. Every fixture goes through this so the size of the
+    /// thing being built is visible at the call site.
+    fn fill_m(w: &mut World, x: (f32, f32), y: (f32, f32), z: (f32, f32), mat: u8) {
+        fill(
+            w,
+            (plane(x.0), plane(x.1)),
+            (plane(y.0), plane(y.1)),
+            (plane(z.0), plane(z.1)),
+            mat,
+        );
+    }
+
+    /// Side of `flat_world`'s square patch.
+    const FLAT_SIDE_M: f32 = 16.0;
+    /// Where every flat-ground test starts: the middle of the patch. A sprint
+    /// held for 1.5 s and then released covers about 8 m, and half the patch is
+    /// exactly that, so the body never measures a stopping distance against thin
+    /// air. (It did once the patch was read as voxels: 6.4 m of ground, and
+    /// `stopping_distance_from_walk_and_sprint` reported 30 m of "coasting"
+    /// that was really a fall.)
+    const FLAT_CENTRE_M: f32 = FLAT_SIDE_M / 2.0;
+    /// Clearance a fixture body is dropped from. 12.5 cm was the old half a
+    /// voxel at 25 cm: far enough that the first tick is a real settle, close
+    /// enough that nothing accelerates on the way down.
+    const DROP_M: f32 = 0.125;
+
+    /// Ground plane 16 m square with its surface at [`GROUND_M`]. `World::new`
+    /// allocates 1.84 GB and spawns worker threads, so every flat-ground feel
+    /// test shares this one immutable world - which is also why
+    /// `.cargo/config.toml` pins RUST_TEST_THREADS. Do not add a third static.
     fn flat_world() -> &'static World {
         static W: OnceLock<World> = OnceLock::new();
         W.get_or_init(|| {
             let mut w = World::new();
-            fill(&mut w, (0, 64), (60, 64), (0, 64), MAT_STONE);
+            fill_m(
+                &mut w,
+                (0.0, FLAT_SIDE_M),
+                (GROUND_M - FLOOR_THICK_M, GROUND_M),
+                (0.0, FLAT_SIDE_M),
+                MAT_STONE,
+            );
             w
         })
     }
 
-    /// A body standing still on the ground, settled (grounded, zero velocity).
-    fn standing(world: &World, x: f32, z: f32) -> Player {
-        let mut p = Player::new(Vec3::new(x, GROUND_Y + 0.5, z));
+    /// Feet position every flat-ground test spawns at.
+    fn flat_spawn() -> Vec3 {
+        at_m(FLAT_CENTRE_M, GROUND_M + DROP_M, FLAT_CENTRE_M)
+    }
+
+    /// A body standing still at the centre of `flat_world`'s patch, settled
+    /// (grounded, zero velocity).
+    fn standing(world: &World) -> Player {
+        let mut p = Player::new(flat_spawn());
         for _ in 0..30 {
             p.step(world, Input::default(), DT);
         }
         assert!(p.grounded, "test body failed to settle on the ground");
-        assert!((p.pos.y - GROUND_Y).abs() < 0.01, "settled at {} not {GROUND_Y}", p.pos.y);
+        assert!(
+            (to_m(p.pos.y) - GROUND_M).abs() < REST_TOL_M,
+            "settled at {:.4} m not {GROUND_M} m",
+            to_m(p.pos.y),
+        );
         p
     }
 
@@ -1004,7 +1141,7 @@ mod tests {
         let w = flat_world();
         for (sprint, target, lo, hi) in [(false, 3.0f32, 0.10f32, 0.50f32), (true, 5.5, 0.15, 0.80)]
         {
-            let mut p = standing(w, 32.0, 32.0);
+            let mut p = standing(w);
             let mut t = 0.0;
             for _ in 0..600 {
                 p.step(w, forward(sprint), DT);
@@ -1030,7 +1167,7 @@ mod tests {
     fn stopping_distance_from_walk_and_sprint() {
         let w = flat_world();
         for (sprint, lo, hi) in [(false, 0.15f32, 0.60f32), (true, 0.40, 1.60)] {
-            let mut p = standing(w, 32.0, 32.0);
+            let mut p = standing(w);
             hold(&mut p, w, forward(sprint), 1.5);
             let from = p.pos;
             for _ in 0..600 {
@@ -1056,7 +1193,7 @@ mod tests {
     #[test]
     fn jump_apex_and_airtime() {
         let w = flat_world();
-        let mut p = standing(w, 32.0, 32.0);
+        let mut p = standing(w);
         let start = p.pos.y;
         let ev = p.step(w, Input { jump: true, ..Default::default() }, DT);
         assert!(ev.jumped, "a tap of jump on flat ground must jump");
@@ -1087,7 +1224,10 @@ mod tests {
             "s",
             "Minecraft is airborne ~0.75 s per jump, a real standing jump ~0.6 s",
         );
-        assert!(p.grounded && (p.pos.y - GROUND_Y).abs() < 0.01, "must land back on the floor");
+        assert!(
+            p.grounded && (to_m(p.pos.y) - GROUND_M).abs() < REST_TOL_M,
+            "must land back on the floor",
+        );
     }
 
     #[test]
@@ -1096,7 +1236,9 @@ mod tests {
         // falling, which is the only way to see terminal velocity in a world
         // that is 64 m tall.
         let empty = World::new();
-        let mut p = Player::new(Vec3::new(32.0, 100.0, 32.0));
+        // 25 m up in an empty world. Nothing here depends on the height (there
+        // is no floor to hit), but it is still a place, so it is still metres.
+        let mut p = Player::new(at_m(FLAT_CENTRE_M, 25.0, FLAT_CENTRE_M));
         for _ in 0..(6.0 / DT) as i32 {
             p.step(&empty, Input::default(), DT);
         }
@@ -1123,7 +1265,7 @@ mod tests {
         // speed in the air: air accel is a third of ground accel, and a body
         // that accelerates freely in mid-air is a flying body.
         let w = flat_world();
-        let mut p = standing(w, 32.0, 32.0);
+        let mut p = standing(w);
         p.step(w, Input { jump: true, ..Default::default() }, DT);
         let mut peak: f32 = 0.0;
         for _ in 0..600 {
@@ -1157,7 +1299,7 @@ mod tests {
         // rather than pretending an accumulator can do the impossible.
         let w = flat_world();
         let run = |fps: f32| {
-            let mut sim = PlayerSim::new(Vec3::new(32.0, GROUND_Y + 0.5, 32.0));
+            let mut sim = PlayerSim::new(flat_spawn());
             let frame = 1.0 / fps;
             let frames = (2.0 * fps).round() as i32;
             let mut input = Input::default();
@@ -1187,7 +1329,9 @@ mod tests {
                 (v - v0).length() < 1.0e-3,
                 "run {i} carries velocity {v:?} against {v0:?}",
             );
-            // One tick of walking is walk_speed * TICK_DT = 0.2 voxels.
+            // One tick of walking is walk_speed * TICK_DT = 5 cm, which is half
+            // a voxel at 10 cm and was a fifth of one at 25 cm - the slack is
+            // derived from the tuning, so it follows the scale on its own.
             let slack = (dticks as f32 + 1.0) * Tuning::default().walk_speed * DT;
             assert!(
                 (p - p0).length() <= slack,
@@ -1201,7 +1345,7 @@ mod tests {
         // A five-second stall must not replay five seconds of walking in one
         // frame; the catch-up cap drops the backlog instead.
         let w = flat_world();
-        let mut sim = PlayerSim::new(Vec3::new(32.0, GROUND_Y + 0.5, 32.0));
+        let mut sim = PlayerSim::new(flat_spawn());
         sim.advance(w, Input::default(), 0.5);
         let before = sim.player.pos;
         sim.advance(w, forward(true), 5.0);
@@ -1211,45 +1355,190 @@ mod tests {
 
     // ------------------------------------------------- feel: terrain contact
 
-    /// One shared obstacle course, laid out in separate sites so every geometry
-    /// test can use the same 90 MB world. Ground surface is y = 64 throughout.
+    // ---- the obstacle course, in metres ----
+    //
+    // A 44 x 36 m yard with every geometry test's site in its own patch of z, so
+    // one shared world serves them all. The numbers are the 25 cm fixture's
+    // voxel counts x 0.25, i.e. the sizes it always meant.
+
+    const COURSE_X_M: f32 = 44.0;
+    const COURSE_Z_M: f32 = 36.0;
+
+    /// The step-assist ladder: six walls, each 25 cm taller than the last.
     ///
-    ///   x 30..36, z 10..68  six walls, 1..6 voxels tall (the step-assist ladder)
-    ///   x 60..90, z 10..20  a 1:1 staircase - 45 degrees
-    ///   x 100..130, z 20..30 a 2:1 staircase - 63 degrees
-    ///   x 60..90, z 30..40  a 1:2 staircase - 26.6 degrees
-    ///   x 20..30, z 80..90  a slab at y 70..74: 1.5 m of headroom (crouch only)
-    ///   x 130..140, z 10..20 a 1.0 m ledge (vault band)
-    ///   x 130..140, z 30..40 a 5 m wall (climb band)
-    ///   x 150, z 50..60     a ONE voxel thick wall (tunnelling)
-    ///   x 20..30, z 120..130 water and leaves floating at y 80..84 and 88..92
+    /// The point of the ladder is that it BRACKETS `Tuning::step_max` (0.35 m)
+    /// from both sides - it has to prove what a stride takes and what it
+    /// refuses, and one wall on each side of the limit does that. The grid
+    /// quantises the request (0.25 m is 2.5 voxels at 10 cm, so the first wall
+    /// is really 0.30 m; it was exactly 0.25 m at 25 cm), which is why the test
+    /// measures `built_height_m` rather than the request. The bracket survives
+    /// the quantisation at both scales: 0.30 under, 0.50 over.
+    const STEP_LADDER_M: [f32; 6] = [0.25, 0.50, 0.75, 1.00, 1.25, 1.50];
+    /// Each wall gets its own 2 m band of z, 2.5 m apart, so a body walking at
+    /// one can never see another.
+    const STEP_WALL_PITCH_M: f32 = 2.5;
+    const STEP_WALL_DEPTH_M: f32 = 2.0;
+    const STEP_WALL_X_M: (f32, f32) = (7.5, 9.0);
+    /// Bodies start 1 m short of the wall. At 12 m/s^2 the body needs 0.375 m to
+    /// reach walk speed, so it arrives at the wall at full pace.
+    const STEP_APPROACH_X_M: f32 = 6.5;
+
+    fn step_wall_z0_m(n: usize) -> f32 {
+        STEP_WALL_PITCH_M * (n + 1) as f32
+    }
+
+    /// Three ramps over the same 7.5 m of run, written as RISE OVER RUN.
+    ///
+    /// A slope is a ratio, so it is stored as one: 1.0 is 45 degrees at any
+    /// voxel size, where the old `64 + i` was 45 degrees only while a voxel was
+    /// as wide as it was tall in that particular loop. Each ramp is a staircase
+    /// of ONE-VOXEL treads whose riser follows the ratio, which is what the 25 cm
+    /// fixture built too, and it is also what keeps `Player::probe_ground`
+    /// honest: that samples four column centres exactly two voxels apart, so a
+    /// tread wider than two voxels would read as flat on the tread and as a
+    /// cliff at the riser, and `steep` would flicker instead of measuring the
+    /// slope.
+    ///
+    /// WHAT CHANGED AT 10 CM: the risers are now 0.1 / 0.2 / 0.1 m where they
+    /// were 0.25 / 0.5 / 0.25 m. On the 2:1 face that used to put the riser over
+    /// `step_max` (0.5 > 0.35) as well as the face over `slope_limit_tan`, so
+    /// two independent mechanisms refused it; now only the slope limit does.
+    /// That is the mechanism the test is named after, so the test got stricter,
+    /// not weaker - it can no longer pass by accident.
+    const RAMP_RUN_M: f32 = 7.5;
+    const RAMP_45: f32 = 1.0; // 45.0 degrees
+    const RAMP_63: f32 = 2.0; // 63.4 degrees
+    const RAMP_26: f32 = 0.5; // 26.6 degrees
+    const RAMP_45_X0_M: f32 = 15.0;
+    const RAMP_63_X0_M: f32 = 25.0;
+    const RAMP_26_X0_M: f32 = 15.0;
+    const RAMP_45_Z_M: (f32, f32) = (2.5, 5.0);
+    const RAMP_63_Z_M: (f32, f32) = (5.0, 7.5);
+    const RAMP_26_Z_M: (f32, f32) = (7.5, 10.0);
+
+    /// A staircase ramp rising `slope` metres per metre of run, one voxel column
+    /// per tread.
+    fn ramp(w: &mut World, x0_m: f32, slope: f32, z_m: (f32, f32)) {
+        let x0 = plane(x0_m);
+        let base = GROUND_Y as i32;
+        let (z0, z1) = (plane(z_m.0), plane(z_m.1));
+        for i in 0..m_to_vox_i(RAMP_RUN_M) {
+            let rise = (i as f32 * slope) as i32;
+            fill(w, (x0 + i, x0 + i + 1), (base, base + rise), (z0, z1), MAT_STONE);
+        }
+    }
+
+    /// Feet height, in metres, of a body standing at world x `x_m` on the ramp
+    /// starting at `x0_m`. The body rests on the highest voxel column its
+    /// footprint covers, which walking uphill in +x is the one at its leading
+    /// face; the continuous surface there is at most one riser above the
+    /// staircase, so a body dropped at this height lands ON the ramp, never in
+    /// it. (This is what the old hand-computed `86.5` was, and it is derived now
+    /// so it moves with the ramp instead of having to be re-derived.)
+    fn ramp_stand_m(x0_m: f32, slope: f32, x_m: f32) -> f32 {
+        GROUND_M + (x_m + to_m(Dims::default().half_width) - x0_m).max(0.0) * slope
+    }
+
+    /// A slab leaving 1.5 m of headroom: under the 1.8 m standing body, over the
+    /// 1.2 m crouched one.
+    const CEIL_GAP_M: f32 = 1.5;
+    const SLAB_THICK_M: f32 = 1.0;
+    const SLAB_X_M: (f32, f32) = (5.0, 7.5);
+    const SLAB_Z_M: (f32, f32) = (20.0, 22.5);
+    /// 1.25 m clear of the slab: enough run-up to be crouch-walking at speed.
+    const SLAB_APPROACH_Z_M: f32 = 23.75;
+    const SLAB_X_MID_M: f32 = 6.25;
+
+    /// A 1 m ledge - over `step_max` (0.35 m), under `vault_max` (1.30 m).
+    const LEDGE_H_M: f32 = 1.0;
+    const LEDGE_X_M: (f32, f32) = (32.5, 35.0);
+    const LEDGE_Z_M: (f32, f32) = (2.5, 5.0);
+    /// A 5 m wall - far past `vault_max`, so it can only be climbed.
+    const WALL_H_M: f32 = 5.0;
+    const WALL_X_M: (f32, f32) = (32.5, 35.0);
+    const WALL_Z_M: (f32, f32) = (7.5, 10.0);
+    /// Bodies start 1 m short of both.
+    const FACE_APPROACH_X_M: f32 = 31.5;
+
+    /// A wall exactly ONE VOXEL thick, whatever a voxel is - the thinnest thing
+    /// the world can express, and therefore the hardest thing not to tunnel
+    /// through. This is the one extent in the course that is deliberately NOT a
+    /// real-world size: at 10 cm it is 10 cm of stone against a body crossing
+    /// 12.5 m in one tick, which is a strictly harder test than the 25 cm it was.
+    const THIN_X0_M: f32 = 37.5;
+    const THIN_H_M: f32 = 3.0;
+    const THIN_Z_M: (f32, f32) = (12.5, 15.0);
+    const THIN_APPROACH_X_M: f32 = 27.5;
+    const THIN_BEHIND_X_M: f32 = 42.5;
+    const THIN_Z_MID_M: f32 = 13.75;
+
+    /// Water and leaves floating over open floor: neither is a floor.
+    const POOL_X_M: (f32, f32) = (5.0, 7.5);
+    const POOL_Z_M: (f32, f32) = (30.0, 32.5);
+    const WATER_Y_M: (f32, f32) = (20.0, 21.0);
+    const LEAVES_Y_M: (f32, f32) = (22.0, 23.0);
+    const POOL_MID_M: (f32, f32) = (6.25, 31.25);
+
+    /// One shared obstacle course, laid out in separate sites so every geometry
+    /// test can use the same 1.84 GB world. Floor surface is [`GROUND_M`]
+    /// throughout. Second and last static world in this module: see
+    /// `.cargo/config.toml` for why there must not be a third.
+    ///
+    ///   x  7.5.. 9.0, z  2.5..17.0  six walls 0.25..1.50 m (step-assist ladder)
+    ///   x 15.0..22.5, z  2.5.. 5.0  a 1:1 staircase - 45 degrees
+    ///   x 25.0..32.5, z  5.0.. 7.5  a 2:1 staircase - 63.4 degrees
+    ///   x 15.0..22.5, z  7.5..10.0  a 1:2 staircase - 26.6 degrees
+    ///   x  5.0.. 7.5, z 20.0..22.5  a slab 1.5 m up: crouch-only headroom
+    ///   x 32.5..35.0, z  2.5.. 5.0  a 1.0 m ledge (vault band)
+    ///   x 32.5..35.0, z  7.5..10.0  a 5 m wall (climb band)
+    ///   x 37.5,       z 12.5..15.0  a ONE VOXEL thick wall (tunnelling)
+    ///   x  5.0.. 7.5, z 30.0..32.5  water at 20 m, leaves at 22 m
     fn course() -> &'static World {
         static W: OnceLock<World> = OnceLock::new();
         W.get_or_init(|| {
             let mut w = World::new();
-            fill(&mut w, (0, 176), (60, 64), (0, 144), MAT_STONE);
-            for h in 1..=6i32 {
-                let z0 = 10 * h;
-                fill(&mut w, (30, 36), (64, 64 + h), (z0, z0 + 8), MAT_STONE);
+            let floor = (GROUND_M - FLOOR_THICK_M, GROUND_M);
+            fill_m(&mut w, (0.0, COURSE_X_M), floor, (0.0, COURSE_Z_M), MAT_STONE);
+            for (n, h) in STEP_LADDER_M.iter().copied().enumerate() {
+                let z0 = step_wall_z0_m(n);
+                fill_m(
+                    &mut w,
+                    STEP_WALL_X_M,
+                    (GROUND_M, GROUND_M + h),
+                    (z0, z0 + STEP_WALL_DEPTH_M),
+                    MAT_STONE,
+                );
             }
-            for i in 0..30i32 {
-                fill(&mut w, (60 + i, 61 + i), (64, 64 + i), (10, 20), MAT_STONE);
-                fill(&mut w, (100 + i, 101 + i), (64, 64 + 2 * i), (20, 30), MAT_STONE);
-                fill(&mut w, (60 + i, 61 + i), (64, 64 + i / 2), (30, 40), MAT_STONE);
-            }
-            fill(&mut w, (20, 30), (70, 74), (80, 90), MAT_STONE);
-            fill(&mut w, (130, 140), (64, 68), (10, 20), MAT_STONE);
-            fill(&mut w, (130, 140), (64, 84), (30, 40), MAT_STONE);
-            fill(&mut w, (150, 151), (64, 76), (50, 60), MAT_STONE);
-            fill(&mut w, (20, 30), (80, 84), (120, 130), crate::voxel::MAT_WATER_L8);
-            fill(&mut w, (20, 30), (88, 92), (120, 130), crate::voxel::MAT_LEAVES);
+            ramp(&mut w, RAMP_45_X0_M, RAMP_45, RAMP_45_Z_M);
+            ramp(&mut w, RAMP_63_X0_M, RAMP_63, RAMP_63_Z_M);
+            ramp(&mut w, RAMP_26_X0_M, RAMP_26, RAMP_26_Z_M);
+            fill_m(
+                &mut w,
+                SLAB_X_M,
+                (GROUND_M + CEIL_GAP_M, GROUND_M + CEIL_GAP_M + SLAB_THICK_M),
+                SLAB_Z_M,
+                MAT_STONE,
+            );
+            fill_m(&mut w, LEDGE_X_M, (GROUND_M, GROUND_M + LEDGE_H_M), LEDGE_Z_M, MAT_STONE);
+            fill_m(&mut w, WALL_X_M, (GROUND_M, GROUND_M + WALL_H_M), WALL_Z_M, MAT_STONE);
+            let thin_x0 = plane(THIN_X0_M);
+            fill(
+                &mut w,
+                (thin_x0, thin_x0 + 1),
+                (GROUND_Y as i32, plane(GROUND_M + THIN_H_M)),
+                (plane(THIN_Z_M.0), plane(THIN_Z_M.1)),
+                MAT_STONE,
+            );
+            fill_m(&mut w, POOL_X_M, WATER_Y_M, POOL_Z_M, crate::voxel::MAT_WATER_L8);
+            fill_m(&mut w, POOL_X_M, LEAVES_Y_M, POOL_Z_M, crate::voxel::MAT_LEAVES);
             w
         })
     }
 
-    /// Drop a body at (x, z) from just above `y` and let it settle.
-    fn settle(world: &World, x: f32, y: f32, z: f32) -> Player {
-        let mut p = Player::new(Vec3::new(x, y + 0.5, z));
+    /// Drop a body at (x, z) from [`DROP_M`] above `y`, all in METRES, and let
+    /// it settle onto whatever is there.
+    fn settle_m(world: &World, x: f32, y: f32, z: f32) -> Player {
+        let mut p = Player::new(at_m(x, y + DROP_M, z));
         for _ in 0..40 {
             p.step(world, Input::default(), DT);
         }
@@ -1264,39 +1553,43 @@ mod tests {
         // for a full second with no jump.
         let w = course();
         let t = Tuning::default();
-        let mut highest_climbed = 0.0f32;
-        for h in 1..=6i32 {
-            let z = 10.0 * h as f32 + 4.0;
-            let mut p = settle(w, 26.0, 64.0, z);
-            assert!(p.grounded, "wall {h}: body did not settle");
+        // The comparison is in METRES on both sides: a wall's height and
+        // step_max are both real-world lengths, and comparing raw voxel counts
+        // was only ever right by coincidence of the scale they were written at.
+        let step_max_m = to_m(t.step_max);
+        let wall_face_x = m_to_vox(STEP_WALL_X_M.0);
+        let mut highest_climbed_m = 0.0f32;
+        for (n, want_m) in STEP_LADDER_M.iter().copied().enumerate() {
+            // What the lattice built, not what was asked for: 0.25 m is 2.5
+            // voxels at 10 cm, so the wall the body meets is 0.30 m. The ladder
+            // still brackets step_max, which is the property that matters.
+            let wall_m = built_height_m(want_m);
+            let z = step_wall_z0_m(n) + STEP_WALL_DEPTH_M * 0.5;
+            let mut p = settle_m(w, STEP_APPROACH_X_M, GROUND_M, z);
+            assert!(p.grounded, "the {wall_m} m wall: body did not settle");
             let start_y = p.pos.y;
             hold(&mut p, w, walk_x(false, false), 1.0);
-            let climbed = p.pos.y - start_y;
-            let expected = (h as f32) <= t.step_max;
-            if expected {
+            let climbed_m = to_m(p.pos.y - start_y);
+            if wall_m <= step_max_m {
                 assert!(
-                    (climbed - h as f32).abs() < 0.05 && p.pos.x > 30.0,
-                    "a {h}-voxel step ({:.2} m, under the {:.2} m step height) must be walked up; \
-                     climbed {climbed:.2} voxels, ended at x {:.1}",
-                    to_m(h as f32),
-                    to_m(t.step_max),
-                    p.pos.x,
+                    (climbed_m - wall_m).abs() < SETTLE_TOL_M && p.pos.x > wall_face_x,
+                    "a {wall_m:.2} m step (under the {step_max_m:.2} m step height) must be walked \
+                     up; climbed {climbed_m:.3} m, ended at x {:.2} m",
+                    to_m(p.pos.x),
                 );
-                highest_climbed = highest_climbed.max(h as f32);
+                highest_climbed_m = highest_climbed_m.max(wall_m);
             } else {
                 assert!(
-                    climbed < 0.05 && p.pos.x < 30.0,
-                    "a {h}-voxel step ({:.2} m, over the {:.2} m step height) must NOT be walked \
-                     up; climbed {climbed:.2} voxels, ended at x {:.1}",
-                    to_m(h as f32),
-                    to_m(t.step_max),
-                    p.pos.x,
+                    climbed_m < SETTLE_TOL_M && p.pos.x < wall_face_x,
+                    "a {wall_m:.2} m step (over the {step_max_m:.2} m step height) must NOT be \
+                     walked up; climbed {climbed_m:.3} m, ended at x {:.2} m",
+                    to_m(p.pos.x),
                 );
             }
         }
         band(
             "tallest step walked up without a vault",
-            to_m(highest_climbed),
+            highest_climbed_m,
             0.20,
             0.50,
             "m",
@@ -1308,17 +1601,25 @@ mod tests {
     #[test]
     fn slopes_are_walkable_up_to_the_limit_and_slide_beyond_it() {
         let w = course();
-        // 26.6 degrees (1 voxel up per 2 across) and 45 degrees (1:1) are both
+        // 26.6 degrees (1 up per 2 across) and 45 degrees (1:1) are both
         // ascended: 45 is where Unreal (44.8) and Source (45.6) put their
         // walkable floor, and on a voxel lattice it is also the steepest thing
         // step assist can reach.
-        for (name, x0, z, expect_gain) in
-            [("26.6 degree", 58.0f32, 35.0f32, 8.0f32), ("45 degree", 58.0, 15.0, 16.0)]
-        {
-            let mut p = settle(w, x0, 64.0, z);
+        //
+        // Each body starts 0.5 m short of its ramp's toe, on flat floor, in the
+        // middle of the ramp's z band. The expected gains are the metres the
+        // ramp actually offers inside the time budget (2 m of the 3.75 m the 1:2
+        // climbs, 4 m of the 7.5 m the 1:1 does), not a voxel count that meant
+        // those metres once.
+        for (name, x0_m, ramp_z, expect_gain_m) in [
+            ("26.6 degree", RAMP_26_X0_M, RAMP_26_Z_M, 2.0f32),
+            ("45 degree", RAMP_45_X0_M, RAMP_45_Z_M, 4.0),
+        ] {
+            let z_m = (ramp_z.0 + ramp_z.1) * 0.5;
+            let mut p = settle_m(w, x0_m - 0.5, GROUND_M, z_m);
             let y0 = p.pos.y;
-            // Peak, not final: these ramps are 30 voxels long and a body at
-            // 12 voxels/s crests them and walks off the far end within 4 s.
+            // Peak, not final: these ramps are 7.5 m long and a body at 3 m/s
+            // crests them and walks off the far end within 4 s.
             let mut peak = y0;
             let mut ever_steep = false;
             for _ in 0..(4.0 / DT) as i32 {
@@ -1326,16 +1627,40 @@ mod tests {
                 peak = peak.max(p.pos.y);
                 ever_steep |= p.steep;
             }
-            let gained = peak - y0;
+            let gained_m = to_m(peak - y0);
             assert!(
-                gained >= expect_gain && !ever_steep,
-                "{name} slope: climbed {gained:.1} voxels (wanted >= {expect_gain}), ever steep: {ever_steep}",
+                gained_m >= expect_gain_m && !ever_steep,
+                "{name} slope: climbed {gained_m:.2} m (wanted >= {expect_gain_m} m), \
+                 ever steep: {ever_steep}",
             );
         }
-        // 63.4 degrees (2:1) is past the limit: no footing. The body rests on
-        // the highest column under its footprint, which on this face is one
-        // column ahead of its centre - hence the 86.5 rather than 84.5.
-        let mut p = settle(w, 110.0, 86.5, 25.0);
+        // 63.4 degrees (2:1) is past the limit: no footing.
+        //
+        // These three runs are dropped onto the face and measured FROM FIRST
+        // CONTACT, where they used to be pre-settled for 40 ticks. A body cannot
+        // settle on a face it slides off, and `settle_m`'s 40 ticks are only the
+        // right preparation for ground it can stand on. At 25 cm the body was
+        // still stepping down the 0.5 m risers after 40 ticks and happened to be
+        // in contact; the same physical face at 10 cm is a 0.2 m riser
+        // staircase, smooth enough that a body sliding at ~1 m/s skips down it
+        // ballistically instead - which IS what losing your footing on a cliff
+        // looks like, but it means `steep` is only observable while the body is
+        // actually touching. So the observation now starts where the contact
+        // does, and asserts the same three things about the same face.
+        let face_x_m = RAMP_63_X0_M + 2.5;
+        let face_z_m = 6.25;
+        let face_y_m = ramp_stand_m(RAMP_63_X0_M, RAMP_63, face_x_m);
+        let on_face = |w: &World| {
+            let mut p = Player::new(at_m(face_x_m, face_y_m + DROP_M, face_z_m));
+            for _ in 0..40 {
+                p.step(w, Input::default(), DT);
+                if p.grounded {
+                    return p;
+                }
+            }
+            panic!("the body never reached the 2:1 face it was dropped on");
+        };
+        let mut p = on_face(w);
         let mut ever_steep = false;
         for _ in 0..30 {
             p.step(w, Input::default(), DT);
@@ -1343,7 +1668,7 @@ mod tests {
         }
         assert!(ever_steep, "the 2:1 face must read as steep while the body is on it");
         // Walking at it gains nothing: no grip, and step assist is off.
-        let mut p = settle(w, 110.0, 86.5, 25.0);
+        let mut p = on_face(w);
         let y0 = p.pos.y;
         let mut peak = y0;
         for _ in 0..(2.0 / DT) as i32 {
@@ -1351,19 +1676,19 @@ mod tests {
             peak = peak.max(p.pos.y);
         }
         assert!(
-            peak <= y0 + 0.05,
-            "a 63-degree face must not be climbable, gained {:.2} voxels",
-            peak - y0,
+            to_m(peak - y0) <= SETTLE_TOL_M,
+            "a 63-degree face must not be climbable, gained {:.3} m",
+            to_m(peak - y0),
         );
         // ... and released, the body slides DOWN it (downhill is -x here).
-        let mut p = settle(w, 110.0, 86.5, 25.0);
+        let mut p = on_face(w);
         let (x0, y0) = (p.pos.x, p.pos.y);
         hold(&mut p, w, Input::default(), 1.5);
         assert!(
-            p.pos.x < x0 - 1.0 && p.pos.y < y0 - 1.0,
-            "a body must slide off a 63-degree face: moved ({:.2}, {:.2}) voxels",
-            p.pos.x - x0,
-            p.pos.y - y0,
+            to_m(x0 - p.pos.x) > 0.25 && to_m(y0 - p.pos.y) > 0.25,
+            "a body must slide off a 63-degree face: moved ({:.2}, {:.2}) m",
+            to_m(p.pos.x - x0),
+            to_m(p.pos.y - y0),
         );
         band(
             "slide threshold",
@@ -1380,7 +1705,8 @@ mod tests {
     fn crouching_shrinks_the_body_slows_it_and_traps_it_under_a_ceiling() {
         let w = course();
         let dims = Dims::default();
-        let mut p = settle(w, 25.0, 64.0, 95.0);
+        let start = |w: &World| settle_m(w, SLAB_X_MID_M, GROUND_M, SLAB_APPROACH_Z_M);
+        let mut p = start(w);
         let crouch = Input { crouch: true, ..Default::default() };
 
         // The box really shrinks.
@@ -1394,7 +1720,7 @@ mod tests {
         );
 
         // ... and the speed drops with it.
-        let mut moving = settle(w, 25.0, 64.0, 95.0);
+        let mut moving = start(w);
         hold(&mut moving, w, Input { move_axis: Vec2::new(0.0, -1.0), crouch: true, ..Default::default() }, 1.5);
         band(
             "crouched speed",
@@ -1407,9 +1733,13 @@ mod tests {
 
         // Under the 1.5 m slab, releasing crouch must NOT stand the body up
         // through the ceiling.
-        let mut under = settle(w, 25.0, 64.0, 95.0);
+        let mut under = start(w);
         hold(&mut under, w, Input { move_axis: Vec2::new(0.0, -1.0), crouch: true, ..Default::default() }, 2.0);
-        assert!(under.pos.z < 90.0, "the body should have crouch-walked under the slab, z={}", under.pos.z);
+        assert!(
+            to_m(under.pos.z) < SLAB_Z_M.1,
+            "the body should have crouch-walked under the slab, z={:.2} m",
+            to_m(under.pos.z),
+        );
         hold(&mut under, w, Input::default(), 0.5);
         assert!(under.crouching, "stood up into a ceiling");
         assert!(
@@ -1418,29 +1748,36 @@ mod tests {
         );
         // Walking back out, it stands up again on its own.
         hold(&mut under, w, Input { move_axis: Vec2::new(0.0, 1.0), ..Default::default() }, 2.0);
-        assert!(!under.crouching, "never stood back up in the open, z={}", under.pos.z);
+        assert!(!under.crouching, "never stood back up in the open, z={:.2} m", to_m(under.pos.z));
     }
 
     #[test]
     fn vaulting_is_deliberate_and_clears_what_a_stride_cannot() {
         let w = course();
         let t = Tuning::default();
-        // A 1.0 m ledge: over step_max (0.35 m), under vault_max (1.30 m).
-        let ledge_top = 68.0;
-        assert!(4.0 > t.step_max && 4.0 <= t.vault_max, "the test ledge must sit in the vault band");
+        // The ledge must sit in the vault band: over step_max (0.35 m), under
+        // vault_max (1.30 m). Both sides of that comparison are METRES now - the
+        // old `4.0` was 1 m of ledge only because a voxel happened to be 25 cm.
+        let ledge_top_m = GROUND_M + LEDGE_H_M;
+        let ledge_face_x = m_to_vox(LEDGE_X_M.0);
+        let ledge_z_m = (LEDGE_Z_M.0 + LEDGE_Z_M.1) * 0.5;
+        assert!(
+            LEDGE_H_M > to_m(t.step_max) && LEDGE_H_M <= to_m(t.vault_max),
+            "the test ledge must sit in the vault band",
+        );
 
         // Walking into it without the deliberate press gets nowhere.
-        let mut p = settle(w, 126.0, 64.0, 15.0);
+        let mut p = settle_m(w, FACE_APPROACH_X_M, GROUND_M, ledge_z_m);
         hold(&mut p, w, walk_x(false, false), 2.0);
         assert!(
-            p.pos.y < 65.0 && p.pos.x < 130.0,
-            "a 1 m ledge must not be walked up: ended at ({}, {})",
-            p.pos.x,
-            p.pos.y,
+            to_m(p.pos.y) < GROUND_M + 0.25 && p.pos.x < ledge_face_x,
+            "a {LEDGE_H_M} m ledge must not be walked up: ended at ({:.2}, {:.2}) m",
+            to_m(p.pos.x),
+            to_m(p.pos.y),
         );
 
         // Pressed into it with jump, it is mantled.
-        let mut p = settle(w, 126.0, 64.0, 15.0);
+        let mut p = settle_m(w, FACE_APPROACH_X_M, GROUND_M, ledge_z_m);
         let ev = {
             let mut acc = Events::default();
             for _ in 0..(2.0 / DT) as i32 {
@@ -1448,15 +1785,21 @@ mod tests {
             }
             acc
         };
-        assert!(ev.vault_started, "a deliberate press into a 1 m ledge must start a vault");
+        assert!(ev.vault_started, "a deliberate press into a {LEDGE_H_M} m ledge must start a vault");
         assert!(
-            (p.pos.y - ledge_top).abs() < 0.05 && p.pos.x > 130.0,
-            "the vault must end standing on the ledge: ({}, {})",
-            p.pos.x,
-            p.pos.y,
+            (to_m(p.pos.y) - ledge_top_m).abs() < SETTLE_TOL_M && p.pos.x > ledge_face_x,
+            "the vault must end standing on the ledge: ({:.2}, {:.2}) m",
+            to_m(p.pos.x),
+            to_m(p.pos.y),
         );
         assert!(p.grounded && !voxquery::overlaps(w, p.body(), MatSet::SOLID));
-        assert!(ev.climbed > 3.0, "the vault should report the height it gained, got {}", ev.climbed);
+        // The mantle must report most of the ledge it gained (the same
+        // three-quarters the old bare `3.0` voxels meant against a 4-voxel ledge).
+        assert!(
+            to_m(ev.climbed) > LEDGE_H_M * 0.75,
+            "the vault should report the height it gained, got {:.2} m",
+            to_m(ev.climbed),
+        );
     }
 
     #[test]
@@ -1464,7 +1807,14 @@ mod tests {
         let w = course();
         // The 5 m wall is far past vault_max, so it can only be climbed.
         let into_wall = walk_x(false, true);
-        let mut p = settle(w, 126.0, 64.0, 35.0);
+        let wall_top_m = GROUND_M + WALL_H_M;
+        let wall_face_x = m_to_vox(WALL_X_M.0);
+        let wall_z_m = (WALL_Z_M.0 + WALL_Z_M.1) * 0.5;
+        assert!(
+            WALL_H_M > to_m(Tuning::default().vault_max),
+            "the test wall must be past the vault band",
+        );
+        let mut p = settle_m(w, FACE_APPROACH_X_M, GROUND_M, wall_z_m);
         let y0 = p.pos.y;
         hold(&mut p, w, into_wall, 2.0);
         let gained = to_m(p.pos.y - y0);
@@ -1480,46 +1830,64 @@ mod tests {
         // Letting go drops you.
         let y1 = p.pos.y;
         hold(&mut p, w, Input::default(), 0.5);
-        assert!(p.pos.y < y1 - 0.5, "releasing the climb must let the body fall");
+        assert!(
+            to_m(y1 - p.pos.y) > 0.125,
+            "releasing the climb must let the body fall, dropped {:.3} m",
+            to_m(y1 - p.pos.y),
+        );
 
         // Held all the way, it tops out onto the wall rather than sticking to it.
-        let mut p = settle(w, 126.0, 64.0, 35.0);
+        let mut p = settle_m(w, FACE_APPROACH_X_M, GROUND_M, wall_z_m);
         let mut topped = false;
         for _ in 0..(8.0 / DT) as i32 {
             p.step(w, into_wall, DT);
-            if p.grounded && p.pos.y > 80.0 {
+            // Grounded within a metre of the top is "on the wall", not "back on
+            // the floor 5 m below".
+            if p.grounded && to_m(p.pos.y) > wall_top_m - 1.0 {
                 topped = true;
                 break;
             }
         }
         assert!(topped, "the climb never reached the top of the wall, stalled at {:?}", p.pos);
         assert!(
-            (p.pos.y - 84.0).abs() < 0.2 && p.pos.x > 130.0,
-            "a sustained climb must top out onto the ledge, ended at ({}, {})",
-            p.pos.x,
-            p.pos.y,
+            (to_m(p.pos.y) - wall_top_m).abs() < 0.05 && p.pos.x > wall_face_x,
+            "a sustained climb must top out onto the ledge, ended at ({:.2}, {:.2}) m",
+            to_m(p.pos.x),
+            to_m(p.pos.y),
         );
     }
 
     #[test]
     fn the_body_cannot_tunnel_through_a_one_voxel_wall() {
-        // 750 m/s in a single tick - 50 voxels of travel against a wall one
-        // voxel thick. A move-then-test controller teleports straight through.
+        // 750 m/s in a single tick - 12.5 m of travel against a wall ONE VOXEL
+        // thick. A move-then-test controller teleports straight through. The
+        // speed is a real-world one, so the tick still covers 12.5 m at 10 cm
+        // (125 voxels) as it did at 25 cm (50), while the wall it has to notice
+        // is now 2.5x thinner: strictly the harder test.
         let w = course();
-        let mut p = settle(w, 110.0, 64.0, 55.0);
-        p.vel.x = 3000.0;
+        let bullet = m_to_vox(750.0);
+        let near_face = m_to_vox(THIN_X0_M);
+        // The far face of a ONE VOXEL wall, which is the one quantity here that
+        // is honestly a voxel count rather than a length.
+        let far_face = (plane(THIN_X0_M) + 1) as f32;
+        let mut p = settle_m(w, THIN_APPROACH_X_M, GROUND_M, THIN_Z_MID_M);
+        p.vel.x = bullet;
         p.step(w, Input::default(), DT);
         assert!(
-            p.pos.x + p.dims.half_width <= 150.0,
-            "tunnelled to x {} through the wall at x 150",
-            p.pos.x,
+            p.pos.x + p.dims.half_width <= near_face,
+            "tunnelled to x {:.2} m through the wall at x {THIN_X0_M} m",
+            to_m(p.pos.x),
         );
         assert!(!voxquery::overlaps(w, p.body(), MatSet::SOLID));
         // And the same from the far side.
-        let mut p = settle(w, 170.0, 64.0, 55.0);
-        p.vel.x = -3000.0;
+        let mut p = settle_m(w, THIN_BEHIND_X_M, GROUND_M, THIN_Z_MID_M);
+        p.vel.x = -bullet;
         p.step(w, Input::default(), DT);
-        assert!(p.pos.x - p.dims.half_width >= 151.0, "tunnelled backwards to x {}", p.pos.x);
+        assert!(
+            p.pos.x - p.dims.half_width >= far_face,
+            "tunnelled backwards to x {:.2} m",
+            to_m(p.pos.x),
+        );
     }
 
     #[test]
@@ -1528,7 +1896,9 @@ mod tests {
         // just the query: a body falls through water and through leaves, and
         // lands on the stone below.
         let w = course();
-        let mut p = Player::new(Vec3::new(25.0, 95.0, 125.0));
+        // Dropped from 0.75 m above the leaf layer, so the fall crosses leaves
+        // then water then 4 m of open air before the floor.
+        let mut p = Player::new(at_m(POOL_MID_M.0, LEAVES_Y_M.1 + 0.75, POOL_MID_M.1));
         for _ in 0..(4.0 / DT) as i32 {
             p.step(w, Input::default(), DT);
             if p.grounded {
@@ -1536,9 +1906,10 @@ mod tests {
             }
         }
         assert!(
-            p.grounded && (p.pos.y - 64.0).abs() < 0.05,
-            "the body should have fallen through leaves and water to the ground, stopped at {}",
-            p.pos.y,
+            p.grounded && (to_m(p.pos.y) - GROUND_M).abs() < SETTLE_TOL_M,
+            "the body should have fallen through leaves and water to the ground, stopped at \
+             {:.2} m",
+            to_m(p.pos.y),
         );
     }
 
@@ -1547,7 +1918,13 @@ mod tests {
         // Placing a block on your own feet, sand falling into you, or a chunk
         // streaming in around you: the body must not be stuck forever.
         let w = course();
-        let mut p = Player::new(Vec3::new(135.0, 65.0, 15.0)); // inside the ledge
+        // A quarter of the way into the 1 m ledge, horizontally in the middle of
+        // it: buried on every side except up.
+        let mut p = Player::new(at_m(
+            (LEDGE_X_M.0 + LEDGE_X_M.1) * 0.5,
+            GROUND_M + LEDGE_H_M * 0.25,
+            (LEDGE_Z_M.0 + LEDGE_Z_M.1) * 0.5,
+        ));
         assert!(voxquery::overlaps(w, p.body(), MatSet::SOLID), "test setup must start buried");
         for _ in 0..30 {
             p.step(w, Input::default(), DT);
@@ -1569,10 +1946,18 @@ mod tests {
         w.fill_demo_terrain();
         let seed = w.seed;
         let mut ever_grounded = false;
+        // 64 m in from the corner of the window. Worldgen is a function of
+        // METRES (see `voxel::climate_at`, which multiplies by VOXEL_METRES), so
+        // this is literally the same landscape the 25 cm build sampled at voxel
+        // 256 - the terrain the body is asked to survive did not change, only
+        // how finely it is stored. Terrain height comes back as a voxel row and
+        // is already sea-level-relative through `voxel::SEA_LEVEL`, so it is
+        // used as it comes; only the spawn clearance above it is a length.
         for (i, yaw) in (0..8).map(|i| (i, i as f32 * std::f32::consts::FRAC_PI_4)) {
-            let (x, z) = (256.0, 256.0);
+            let (x, z) = (m_to_vox(64.0), m_to_vox(64.0));
             let s = crate::voxel::sample_terrain(x, z, seed);
-            let mut p = Player::new(Vec3::new(x, s.h.max(s.water_top) as f32 + 2.0, z));
+            let ground = s.h.max(s.water_top) as f32;
+            let mut p = Player::new(Vec3::new(x, ground + m_to_vox(0.5), z));
             let input = Input { move_axis: Vec2::new(0.0, 1.0), yaw, sprint: true, ..Default::default() };
             for tick in 0..(4.0 / DT) as i32 {
                 p.step(&w, input, DT);
@@ -1596,12 +1981,15 @@ mod tests {
     #[test]
     fn a_resting_body_neither_sinks_nor_jitters() {
         let w = flat_world();
-        let mut p = standing(w, 32.0, 32.0);
+        let mut p = standing(w);
         let y = p.pos.y;
         for i in 0..600 {
             p.step(w, Input::default(), DT);
-            assert!(p.grounded, "lost the ground on tick {i}");
+            // A voxel tolerance on purpose: a body at rest must not move AT ALL,
+            // so this is float noise on a subtraction, not a physical distance
+            // that should scale with the world.
             assert!((p.pos.y - y).abs() < 1.0e-4, "drifted to {} from {y} by tick {i}", p.pos.y);
+            assert!(p.grounded, "lost the ground on tick {i}");
         }
     }
 }

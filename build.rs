@@ -33,5 +33,17 @@ fn main() {
         PROBE_SPACING,
         PROBE_DIM_X, PROBE_DIM_Y, PROBE_DIM_Z, PROBE_TOTAL,
         LIGHT_BLOCKS_MAX, LIGHT_URGENT_BUDGET,
+        LIGHT_RECORD_STEP, LIGHT_RECORD_DIM, LIGHT_RECORDS_PER_BLOCK,
+        LIGHT_RECORD_WORDS, LIGHT_BLOCK_WORDS,
     );
+
+    // PHYSICAL SCALE. Every distance budget in the shaders (view distance, LOD
+    // switch, shadow reach, AO radius, cloud slab, water detail range) is a
+    // real-world length that only happens to be expressed in voxels because the
+    // DDA counts voxels. They are written as `<metres> * VOXELS_PER_METRE`, so
+    // shrinking the voxel moves all of them together instead of silently
+    // shortening the draw distance by the same factor the grid got finer.
+    // See docs/SCALE_TO_10CM.md.
+    writeln!(f, "const VOXEL_METRES: f32 = {VOXEL_METRES:?};").unwrap();
+    writeln!(f, "const VOXELS_PER_METRE: f32 = {VOXELS_PER_METRE:?};").unwrap();
 }
