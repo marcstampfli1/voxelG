@@ -950,6 +950,20 @@ impl World {
         for &bi in &touched {
             self.eval_light_shell(bi);
         }
+        // NOTE ON THE NEIGHBOURS, because it was tried and measured and taken out
+        // again. A brick edit also changes the light stored one brick away (AO
+        // reads 18 neighbouring voxels) and a placed block's SHADOW can land
+        // arbitrarily far away, so both need re-gathering. Marking the whole
+        // closed neighbourhood urgent looks like the precise answer and is not:
+        // measured on `live_session_profile`, it queued 91,752 bricks over 600
+        // frames against 25,755 blocks actually invalidated - 3.6x - and pushed
+        // the mean dispatch from 913 to 1,105 workgroups, i.e. WORSE than the
+        // schedule it replaced. It also cannot cover the distant-shadow case at
+        // all. The complete answer is one thing, not two: any dirty brick arms a
+        // full sweep of the shell (`VoxLightSchedule::mark_dirty`), which reaches
+        // every neighbour and every shadow within one sweep period, exactly as
+        // this pass always did. The neighbours keep a valid record until then, so
+        // nothing changes shading path meanwhile.
         // Clear only the bits that were set, so the next call starts from an
         // all-zero bitset without touching 128 KB of it.
         for &b in &touched {
@@ -971,19 +985,24 @@ impl World {
         for bi in 0..WORLD_BRICKS_TOTAL {
             self.eval_light_shell(bi);
         }
+        // Every block here is new, so `allocate` queued the entire shell as
+        // urgent. Drop it: this path also arms a full sweep, and with no camera
+        // focus yet the whole shell is near, so that sweep covers all of it on
+        // the near cadence - eight frames, exactly as it always did. Draining
+        // 60,000 bricks through the per-dispatch urgent budget instead would take
+        // a hundred frames to redo work the sweep had already done.
+        self.light.clear_urgent();
     }
 
-    /// Radius, in WORLD VOXELS, inside which lit shell is refreshed at the full
-    /// rate. Beyond it the update pass visits a block `VOXLIGHT_FAR_DIV` times
-    /// more rarely (see `LightField::near_count`).
+    /// Radius, in WORLD VOXELS, inside which lit shell is swept at the full rate.
+    /// Beyond it the sweep visits a block `VOXLIGHT_FAR_DIV` times more rarely
+    /// (see `LightField::near_count`).
     ///
-    /// It can be this small because the near group is not "what the camera can
-    /// see" - it is "where a lighting CHANGE has to be picked up quickly". Both
-    /// ways a record becomes unreadable promote themselves into the near group
-    /// regardless of distance (`LightField::promote_near`): a newly bound block,
-    /// and an invalidated one. What is left for the radius to cover is the SUN,
-    /// and the sun crosses the sky in minutes, so eight times slower tracking is
-    /// worth a fraction of a degree of lag on surfaces fog is already eating.
+    /// It can be this small because the near tier is not "what the camera can
+    /// see" - it is "where the SUN has to be tracked quickly". Everything that
+    /// makes a record unreadable goes on the urgent list instead
+    /// (`LightField::urgent`) and is serviced on the next dispatch regardless of
+    /// tier, so the radius carries only tracking latency.
     ///
     /// 128 was measured first and was far too generous: on the shipped benchmark
     /// it classified 48-77% of a 60,000-block shell as near, because lit shell is
@@ -993,6 +1012,35 @@ impl World {
     /// camera stands on with a wide margin.
     pub const LIGHT_NEAR_RADIUS: f32 = 64.0;
 
+    /// THE VIEW FRUSTUM WAS TRIED HERE AND IT DID NOT SURVIVE MEASUREMENT.
+    ///
+    /// The idea is obvious and the original comment on `near_count` argued
+    /// against it, so it was built and measured rather than argued about again:
+    /// scope the near tier by a padded view cone (55 degree frustum half-diagonal
+    /// plus 17 degrees of padding) as well as by radius, with a 24-voxel sphere
+    /// that stays near whatever the camera faces. `voxlight_turnaround_artifact`
+    /// runs the whole thing end to end - stand facing away for 4.3 s of sun
+    /// motion, turn 180 degrees, and diff every recovery frame against a
+    /// converged field:
+    ///
+    ///     rule            near   sweep   error at the turn (mean/p99/max, /255)
+    ///     radius only     2692   1236    0.204   6.5   54.3
+    ///     frustum+radius  1337   1089    0.411  13.9   68.8
+    ///
+    /// So it works: 1,215 of 1,351 near blocks are newly promoted by the turn, so
+    /// the cone really is culling. It buys 12% off a sweep round (8% on the
+    /// streamed world) and costs DOUBLE the peak error on the frame you turn,
+    /// decaying to parity over about a second.
+    ///
+    /// That is a bad trade and the arithmetic says why. The near tier is only
+    /// about 18% of a sweep round - the far remainder is 920 of 1,236 workgroups
+    /// - so no amount of frustum culling can make a sky-facing camera "do almost
+    /// no work"; the thing that does that is pacing the sweep by the SUN
+    /// (`VoxLightSchedule`), which takes it to zero outright when the sun is
+    /// still. Paying a doubled transient for 8% of one pass is not worth it, and
+    /// the tier stays VIEW-INDEPENDENT: turning on the spot changes nothing at
+    /// all.
+
     /// How far the focus may drift before the partition is rebuilt, in world
     /// voxels. A deadband for the same reason streaming has one: repartitioning
     /// walks the whole work list and re-uploads it, and doing that every frame
@@ -1001,35 +1049,22 @@ impl World {
     /// past the boundary before it is reclassified.
     const LIGHT_FOCUS_DEADBAND: f32 = 16.0;
 
-    /// Point the light field's refresh priority at `pos` (world voxels).
+    /// Point the light field's sweep priority at `pos` (world voxels).
     ///
     /// Rebuilds the near/far partition only when the focus has drifted past the
     /// deadband, so a still camera pays nothing. Returns true if the partition
     /// was rebuilt.
     pub fn set_light_focus(&mut self, pos: glam::Vec3) -> bool {
-        // Two triggers, and BOTH are needed.
-        //
-        // The camera moving is the obvious one. The other is the near group
-        // filling up with PROMOTIONS: every newly bound or invalidated block
-        // joins it regardless of distance and nothing takes it out again except
-        // a repartition, so a still camera watching a lake settle drags the
-        // whole shell into the near group one block at a time. Measured with the
-        // camera trigger alone, the near fraction sat at 43-66% of a 60,000
-        // block shell however far the radius was tightened.
-        //
-        // Threshold is a QUARTER of the near group (with a floor, so it still
-        // fires when the group is small), which makes the rebuild frequency
-        // track how much churn there actually is instead of being a fixed
-        // period: a quiet world never pays it, and a busy one pays a full walk
-        // once per few thousand promotions.
-        let crowded = self.light.promotions() > (self.light.near_count() / 4).max(1024);
-        if !crowded {
-            if let Some(prev) = self.light_focus {
-                if prev.distance_squared(pos)
-                    < Self::LIGHT_FOCUS_DEADBAND * Self::LIGHT_FOCUS_DEADBAND
-                {
-                    return false;
-                }
+        // ONE trigger. It used to need a second - "the near group has filled up
+        // with promotions" - because every newly bound or invalidated block was
+        // pushed into the tier and nothing took it out again, so a still camera
+        // watching physics dragged the whole shell in one block at a time.
+        // Those blocks go on the urgent list now (`LightField::urgent`), which
+        // drains, so the tier is a pure function of camera POSITION again.
+        if let Some(prev) = self.light_focus {
+            if prev.distance_squared(pos) < Self::LIGHT_FOCUS_DEADBAND * Self::LIGHT_FOCUS_DEADBAND
+            {
+                return false;
             }
         }
         self.light_focus = Some(pos);
@@ -1043,8 +1078,7 @@ impl World {
             pos.y,
             pos.z.rem_euclid(WORLD_VOXELS_Z as f32),
         );
-        let r = Self::LIGHT_NEAR_RADIUS;
-        let r2 = r * r;
+        let r2 = Self::LIGHT_NEAR_RADIUS * Self::LIGHT_NEAR_RADIUS;
         let (ex, ez) = (WORLD_VOXELS_X as f32, WORLD_VOXELS_Z as f32);
         self.light.repartition(|bi| {
             let (bx, by, bz) = brick_coords(bi);

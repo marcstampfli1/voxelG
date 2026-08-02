@@ -65,24 +65,42 @@ struct PlayersBuf {
 @group(0) @binding(13) var cloud_samp: sampler;
 @group(0) @binding(14) var cloud_out: texture_storage_2d<rgba16float, write>;
 
-// Reprojected shadow/AO cache (#12). light_in = previous frame's G-buffer
-// (xyz = hit pos relative to world_origin, w = packed shadow/ao/sun-altitude);
-// light_out = this frame's. cs_main reprojects each hit into last frame's screen
-// and reuses the cached shadow/AO when the stored position matches (else traces).
-@group(0) @binding(15) var light_in: texture_2d<f32>;
+// Lighting G-buffer (binding 16): per pixel, the hit position relative to
+// world_origin plus a packed shadow/AO word. TWO consumers, both of which need
+// it and neither of which is lighting reuse:
+//   - cs_taa reprojects a terrain pixel into last frame by its stored world
+//     position, which is what lets TAA accumulate across camera motion;
+//   - the grass pass lights each blade from the ground pixel at its root, so a
+//     blade sits in the same shadow the turf under it does.
+//
+// IT USED TO BE A PAIR. Binding 15 held the PREVIOUS frame's copy, cs_main
+// reprojected each hit into it and reused the stored shadow/AO on a position
+// match, and the frame ended with a full-resolution Rgba32Float copy from one to
+// the other. That whole mechanism is gone, for two measured reasons:
+//
+//   - IT WAS A SECOND LIGHTING PATH, and it WON. `reuse_shadow` was tested
+//     before `vlf.valid`, so wherever reprojection hit - i.e. on a still camera,
+//     which is the only state it engages in - a smooth world-space gradient was
+//     overridden by a value some earlier frame had traced from ONE binary ray.
+//     Shadows visibly changed character when the camera stopped moving.
+//   - IT COST MORE THAN IT SAVED. The per-voxel field now answers 96.6% of
+//     shaded pixels on terrain and 99.9% on water (`LiveFrameRig::coverage`), so
+//     the reprojection was re-deriving what the field had already given away.
+//     Timed on a still camera with it compiled out, cs_main went 4.73 -> 4.30 ms
+//     on terrain (the cache COST 9.9%) and moved within noise on foliage and
+//     water. Removing it also drops 33 MB of VRAM and the 66 MB/frame of copy
+//     traffic that ping-pong needed - fixed cost that a sky-facing frame paid in
+//     full for nothing.
 @group(0) @binding(16) var light_out: texture_storage_2d<rgba32float, write>;
 
-// Light-cache word: 8-bit shadow + 8-bit AO + f16 sun altitude. The altitude
-// records which sun the SHADOW was traced against: AO is geometric (always
-// reusable on a position match), but a cached shadow goes stale as the sun
-// moves - each pixel re-traces its shadow when the sun has drifted past its own
-// jittered threshold, so refreshes scatter as fine dither instead of frame-wide
-// re-traces (or worse, shadows frozen until the camera moves).
-fn pack_light_cache(shadow: f32, ao: f32, sun_y: f32) -> u32 {
+// G-buffer word: 8-bit shadow + 8-bit AO + a spare 16 bits. The spare used to
+// hold the sun altitude the shadow was traced at, which drove the staleness
+// dither that decided when to re-trace; there is nothing to re-trace now.
+// SYNC: grass.wgsl unpacks these bits.
+fn pack_light_cache(shadow: f32, ao: f32) -> u32 {
     let s8 = u32(round(clamp(shadow, 0.0, 1.0) * 255.0));
     let a8 = u32(round(clamp(ao, 0.0, 1.0) * 255.0));
-    let sy = pack2x16float(vec2<f32>(sun_y, 0.0)) & 0xFFFFu;
-    return (s8 << 24u) | (a8 << 16u) | sy;
+    return (s8 << 24u) | (a8 << 16u) | 1u;
 }
 
 // Deferred transparent pass (#16). cs_main records each transparent (water-top /
@@ -363,13 +381,22 @@ struct VoxLightParams {
     light_count: u32,
     fold: f32,
     ao_strength: f32,
-    // Length of the NEAR prefix of `vl_live_bricks`. The update pass walks that
-    // prefix on the `update_div` cadence and the remainder `far_div` times more
-    // rarely - the whole camera-awareness policy is these two numbers.
+    // Length of the NEAR prefix of `vl_live_bricks`. The SWEEP walks that prefix
+    // on the `update_div` cadence and the remainder `far_div` times more rarely -
+    // the whole camera-awareness policy is these two numbers.
     near_count: u32,
     // Extra division applied to the FAR remainder, on top of `update_div`.
     far_div: u32,
-    _pad: vec2<u32>,
+    // Bricks in the URGENT list, which lives at VL_URGENT_BASE in
+    // `vl_live_bricks`. These are dispatched IN FULL and before anything else:
+    // they are the blocks whose record is unreadable or whose geometry just
+    // changed, so they cannot wait for a sweep slice to come round.
+    urgent_count: u32,
+    // 1 when this dispatch also advances the periodic sweep, 0 when it is urgent
+    // work only. The sweep is paced by SUN MOTION, not by frames, so most frames
+    // of a fast-rendering session carry no sweep at all - and a frozen sun with
+    // nothing dirty means the pass is not dispatched at all.
+    sweep: u32,
 };
 
 struct VlPointLight {
@@ -578,12 +605,14 @@ override JIT_PHASE_FREEZE: f32 = 0.0;
 override PROF_TRANSP_NO_REFR: f32 = 0.0;
 override PROF_TRANSP_REFR_FLATSHADE: f32 = 0.0;
 
-// Reprojected shadow/AO cache (#12). Set false to fall back to tracing shadow+AO
-// every frame (e.g. if reprojection ghosting is ever observed). REPROJ_EPS2 is
-// the squared world-space distance (voxels²) within which a reprojected sample
-// is accepted as the same surface.
-const REPROJECT_LIGHTING: bool = true;
-const REPROJ_EPS2: f32 = 0.5;
+// COVERAGE PROBE for the per-voxel light field (timing/diagnostic only). Every
+// shaded surface returns GREEN when `voxlight_sample` answered for it and RED
+// when it fell through to the per-pixel path, so a readback counts the exact
+// fraction of shaded pixels the field actually serves. That fraction is the
+// precondition for deleting the fallback: the plan has called for removing the
+// per-pixel shadow cone and AO since the beginning, and doing it without first
+// knowing what the field does NOT cover would render those surfaces black.
+override PROF_VLF_COVERAGE: f32 = 0.0;
 
 // Primary ray direction for a normalized screen uv (0..1). Shared by cs_main
 // (full-res, jittered) and cs_clouds (half-res). aspect uses the full-res
@@ -789,7 +818,8 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         textureStore(output_tex, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(col, 1.0));
         return;
     }
-    // G-buffer for the shadow/AO reprojection cache; sentinel pos = never reused.
+    // Lighting G-buffer for cs_taa's reprojection and the grass pass's blade
+    // lighting; sentinel position = "not a terrain pixel, do not reproject".
     var gbuf = vec4<f32>(1e9, 1e9, 1e9, 0.0);
     // Deferred transparent record (kind TR_NONE = opaque/none).
     var transp = vec4<u32>(0u);
@@ -811,71 +841,20 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                                encode_face_normal(hit.normal), 0u);
             col = sky(dir);
         } else {
-            // Solid terrain faces have stable (view-independent) shadow + AO, so
-            // reproject them from last frame's G-buffer and reuse on a position
-            // match. Leaf cutout faces are stable cube faces too (axis >= 0);
-            // only oblique sub-voxel hits (grass/flower cross-quads) re-trace.
-            let hitpos_rel = (camera.origin - vec3<f32>(camera.world_origin)) + dir * hit.t_hit;
-            let cacheable = hit.last_axis >= 0;
-            let sun_y_now = sun_dir().y;
-            var light = vec2<f32>(0.0);
-            var reuse_ao = false;
-            var reuse_shadow = false;
-            // Sun altitude the cached shadow was traced at (kept on reuse so
-            // staleness accumulates to the refresh threshold; a fresh trace
-            // stores the current sun).
-            var shadow_sun_y = sun_y_now;
-            if (REPROJECT_LIGHTING && cacheable && camera.reproject_lighting > 0.5) {
-                let abs_pos = hitpos_rel + vec3<f32>(camera.world_origin);
-                let d = abs_pos - camera.prev_origin;
-                let pz = dot(d, camera.prev_forward);
-                if (pz > 0.01) {
-                    let aspect = camera.resolution.x / camera.resolution.y;
-                    let px = dot(d, camera.prev_right);
-                    let py = dot(d, camera.prev_up);
-                    let ndc = vec2<f32>(px / (pz * camera.tan_half_fov * aspect),
-                                        py / (pz * camera.tan_half_fov));
-                    let uvp = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-                    if (uvp.x >= 0.0 && uvp.x < 1.0 && uvp.y >= 0.0 && uvp.y < 1.0) {
-                        let pc = vec2<i32>(uvp * camera.resolution);
-                        let g = textureLoad(light_in, pc, 0);
-                        let dpos = g.xyz - hitpos_rel;
-                        if (dot(dpos, dpos) < REPROJ_EPS2) {
-                            let bits = bitcast<u32>(g.w);
-                            light = vec2<f32>(f32(bits >> 24u) / 255.0,
-                                              f32((bits >> 16u) & 0xFFu) / 255.0);
-                            // AO is geometric: always reusable on a position
-                            // match. The shadow was traced against the sun
-                            // recorded in the cache word - reuse it only while
-                            // the sun hasn't drifted past this pixel's own
-                            // (stable, hash-jittered) threshold, so a moving
-                            // sun refreshes shadows as scattered per-pixel
-                            // dither, a few % of pixels per frame.
-                            reuse_ao = true;
-                            let cached_sy = unpack2x16float(bits & 0xFFFFu).x;
-                            // Tight thresholds: at sun speed ~0.025/s this is a
-                            // 0.03-0.10 s refresh lag, so a standing-still shadow
-                            // tracks the sun near-continuously and a camera move
-                            // has no accumulated error to flush (no edge "jump"),
-                            // and the per-pixel spread stays small enough that
-                            // neighbouring pixels agree (no wide dither band at
-                            // moving shadow edges). ~10-20% of pixels re-trace
-                            // per frame while the sun moves; 0% when it is still.
-                            let thr = 0.0008 + 0.0017 * ign(f32(gid.x), f32(gid.y), 0.0);
-                            reuse_shadow = abs(sun_y_now - cached_sy) < thr;
-                            if (reuse_shadow) { shadow_sun_y = cached_sy; }
-                        }
-                    }
-                }
-            }
             let gi_p = camera.origin + dir * hit.t_hit;
             let indirect = indirect_light(gi_p, hit.normal, pix_jitter,
                                           vec2<i32>(i32(gid.x), i32(gid.y)), hit.t_hit, dir);
-            let blend_shadow = reuse_ao && !reuse_shadow;
-            col = shade(hit, camera.origin, dir, pix_jitter, reuse_shadow, reuse_ao, blend_shadow, &light, indirect);
-            if (cacheable) {
+            var out_light = vec2<f32>(0.0);
+            col = shade(hit, camera.origin, dir, pix_jitter, vl_unknown(), indirect,
+                        &out_light);
+            // Only stable cube faces go in the G-buffer. An oblique sub-voxel hit
+            // (grass or flower cross-quad) has no well-defined face position to
+            // reproject by.
+            if (hit.last_axis >= 0) {
+                let hitpos_rel =
+                    (camera.origin - vec3<f32>(camera.world_origin)) + dir * hit.t_hit;
                 gbuf = vec4<f32>(hitpos_rel,
-                                 bitcast<f32>(pack_light_cache(light.x, light.y, shadow_sun_y)));
+                                 bitcast<f32>(pack_light_cache(out_light.x, out_light.y)));
             }
         }
     } else {
@@ -3568,9 +3547,7 @@ fn trace_no_water(origin: vec3<f32>, dir: vec3<f32>, t_cap: f32) -> Hit {
 // Rec.709-ish luma weights for the foam highlight ramp. Named because two
 // separate places below want "how bright is this" and a second spelling of the
 // weights is a second thing to keep in step.
-const WATER_SHADOW_TONE: f32 = 0.42;   // multiplier on water sitting in shadow
-const WATER_SHADOW_EDGE: f32 = 0.50;   // sun-visibility at the light/shadow line
-const WATER_SHADOW_SOFT: f32 = 0.09;   // half-width of that line: HARD-ish, not photoreal
+const WATER_SHADOW_TONE: f32 = 0.42;   // multiplier on water sitting in full shadow
 const WATER_FACET_CONTRAST: f32 = 0.22; // tone spread from trough band to crest band
 const WATER_SKY_MAX: f32 = 0.45;       // ceiling on the grazing Fresnel blend toward sky
 const WATER_FOAM_SHORE_SUB: i32 = 2;   // shore-foam band width, in quarter-voxel texels
@@ -3633,14 +3610,16 @@ fn foam_texel(sprite: u32, local: vec2<f32>, h: u32) -> u32 {
 // solid-neighbour mask, packed by `water_pack_facet`.
 fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>, facet_code: u32) -> vec3<f32> {
     let p_hit = origin + dir * hit.t_hit;
+    // Secondary hits report their shadow/AO into this and nothing reads it: the
+    // G-buffer describes the PRIMARY surface, so a refracted hit under the water
+    // must not overwrite it.
+    var scratch_light = vec2<f32>(0.0);
     // ONE flat normal for the whole cell (water_facet_normal of the quantized
     // slope), or an axis face on a riser. Nothing here perturbs it per pixel.
     let n = hit.normal;
     let s = sun_dir();
     let sc = sun_color(s);
     let s_int = sun_intensity(s);
-    // Secondary rays don't use the reprojection cache.
-    var no_cache = vec2<f32>(0.0);
     // The water cell this surface belongs to. Stepping down off the plate
     // rather than using floor(p_hit) directly: a plate can sit flush with its
     // cell's top face, where floor() names the air voxel in front.
@@ -3659,6 +3638,9 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>, facet_code: u32)
     // every crafted test scene - therefore still get a correct shadow, and the
     // glint below reuses this instead of tracing a second ray.
     let vlf = voxlight_sample(p_hit, vec3<f32>(0.0, 1.0, 0.0));
+    if (PROF_VLF_COVERAGE > 0.5) {
+        return select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), vlf.valid);
+    }
     var sun_vis: f32;
     if (vlf.valid) {
         sun_vis = vlf.sun;
@@ -3668,13 +3650,25 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>, facet_code: u32)
     } else {
         sun_vis = 0.0;
     }
-    // HARD-ish, deliberately. A photoreal penumbra over a faceted surface reads
-    // as a smudge across geometry that has no smooth features anywhere else;
-    // this is narrow enough to look like a drawn edge and wide enough that the
-    // edge itself is still antialiased instead of stair-stepping per pixel.
-    // Folded together with the day/night curve so night water is not "lit".
-    let lit = smoothstep(WATER_SHADOW_EDGE - WATER_SHADOW_SOFT,
-                         WATER_SHADOW_EDGE + WATER_SHADOW_SOFT, sun_vis) * s_int;
+    // USED DIRECTLY, exactly as terrain uses it, and that is the fix.
+    //
+    // `sun_vis` is a CONTINUOUS fraction of the sun disc. Terrain multiplies its
+    // direct term by it and comes out smooth; water pushed it through
+    // `smoothstep(0.41, 0.59, sun_vis)` first - a band 45/255 wide - which
+    // re-quantized the very gradient the light field exists to produce. Two
+    // voxels either side of a shadow edge landed on opposite ends of that band,
+    // so water read STEPPED where terrain right beside it read smooth, and any
+    // wobble in the stored value became a full lit/shadowed flip (round G of
+    // docs/rt/BASELINE-per-voxel-lighting.md traced the water flicker report to
+    // exactly this narrowness).
+    //
+    // The STYLIZATION is not in this term and never was: the faceted look comes
+    // from the quantized plate height, the quantized per-cell normal, the
+    // per-cell tone ladder and the hard-edged foam - all untouched. Only the
+    // shadow ramp changes, which is what was asked for.
+    //
+    // Multiplied by the day/night curve so night water is not "lit".
+    let lit = sun_vis * s_int;
 
     // ---- refraction: primary ray bent into the water, trace through it ----
     // Snell's law via WGSL `refract`. eta = n_air / n_water ~ 1/1.33.
@@ -3713,9 +3707,9 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>, facet_code: u32)
                 // the surface: mean 1.3/255, 0.018% of pixels > 10/255;
                 // identical below. Look signed off 2026-07-23). The shadow
                 // term stays the proven constant 0.
-                var known_dark = vec2<f32>(0.0, 0.4);
                 let jit = fract(p_hit.x * 17.0 + p_hit.z * 23.0);
-                under_col = shade(under, refr_origin, refr_dir, jit, true, true, false, &known_dark, vec3<f32>(0.0));
+                under_col = shade(under, refr_origin, refr_dir, jit,
+                                  KnownLight(0.0, 0.4, true), vec3<f32>(0.0), &scratch_light);
             }
         } else {
             under_col = sky(refr_dir) * 0.6;
@@ -3844,10 +3838,6 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>, facet_code: u32)
     return mix(col, fog_atmospheric(dir), fog_t);
 }
 
-// Thin wrapper: full shade with no lighting reuse (used by reflection/refraction
-// secondary rays, which aren't cached).
-// `reuse_light`: when true, the shadow + AO terms are taken from *light (the
-// reprojected cache) instead of being traced. When false they are computed and
 // Terrain materials whose TOP faces cross-fade into each other at shared
 // edges (sand beaches into grass, snow lines into stone, ...).
 fn is_blend_mat(m: u32) -> bool {
@@ -3898,7 +3888,6 @@ fn blended_palette(p_hit: vec3<f32>, voxel: vec3<i32>, m: u32) -> vec3<f32> {
          + cd * ax * az;
 }
 
-// written back into *light so the caller can store them for next frame.// written back into *light so the caller can store them for next frame.
 // Beyond this the one-bounce indirect (RT variant) is faded out: its contribution
 // is small at distance and fog covers it, and it is the priciest per-pixel term.
 // Pulled in from 120 so fewer pixels pay for GI (perf).
@@ -3908,11 +3897,36 @@ const GI_MAX_T: f32 = 90.0;
 // blade-scale detail is sub-pixel long before this).
 const GRASS_SHADE_T: f32 = 96.0;
 
+// A sun-visibility and AO pair a CALLER can prove, so `shade` neither traces nor
+// samples for it.
+//
+// This is what is left of the old four-flag reuse protocol once the screen-space
+// reprojection cache is gone. It has exactly one live user and it is not a
+// cache: the refracted hit under a water surface is PROVEN to be in shadow
+// (water occludes shadow rays, so its sun ray always terminates in the column
+// above) and is given flat AO by a measured decision, so re-deriving either
+// would be paying for a known answer.
+struct KnownLight {
+    sun: f32,
+    ao: f32,
+    known: bool,
+};
 
+fn vl_unknown() -> KnownLight {
+    return KnownLight(0.0, 1.0, false);
+}
+
+/// Shade one opaque hit.
+///
+/// Sun visibility and AO come from ONE place: the per-voxel light field, or - for
+/// the surfaces it cannot answer for, which is 54% of a canopy view and 3% of a
+/// terrain view (`LiveFrameRig::coverage`) - the per-pixel cone and `compute_ao`
+/// underneath it. `known` short-circuits both for callers that can prove the
+/// answer.
 fn shade(
     hit: Hit, origin: vec3<f32>, dir: vec3<f32>, pix_jit: f32,
-    reuse_shadow: bool, reuse_ao: bool, blend_shadow: bool,
-    light: ptr<function, vec2<f32>>, indirect: vec3<f32>,
+    known: KnownLight, indirect: vec3<f32>,
+    out_light: ptr<function, vec2<f32>>,
 ) -> vec3<f32> {
     let p_hit = origin + dir * hit.t_hit;
     // Terrain top faces near the camera cross-fade their palette colour into
@@ -3945,18 +3959,21 @@ fn shade(
     // AO on a fringe cell would re-introduce the invisible-shell darkening.)
     let skip_ao = hit.last_axis < 0 || hit.t_hit > AO_DIST
         || is_leaf_block_mat(hit.mat) || hit.mat == MAT_LEAF_FRINGE;
-    // Per-voxel light field: ONE fetch stands in for the AO evaluation, the
-    // sun-shadow ray and the screen-space reprojection lookup. Sampled off the
-    // GEOMETRIC normal (hit.normal), not the foliage-perturbed shading normal,
-    // because it addresses the air voxel against the real face.
+    // Per-voxel light field: ONE fetch stands in for the AO evaluation and the
+    // sun-shadow ray. Sampled off the GEOMETRIC normal (hit.normal), not the
+    // foliage-perturbed shading normal, because it addresses the air voxel
+    // against the real face.
     //
-    // The explicit reuse_* flags still win: callers that pass them are
-    // asserting a PROVEN constant (the refracted-water hit below the surface
-    // has shadow 0 and flat AO by construction), and honouring the field there
-    // would pay for a lookup to re-derive a known answer.
+    // A `known` answer still wins: that caller is asserting a PROVEN constant
+    // (the refracted-water hit below the surface has shadow 0 and flat AO by
+    // construction), and consulting the field there would pay for a lookup to
+    // re-derive an answer already in hand.
     let vlf = voxlight_sample(p_hit, hit.normal);
+    if (PROF_VLF_COVERAGE > 0.5) {
+        return select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), vlf.valid);
+    }
     var ao: f32;
-    if (reuse_ao) { ao = (*light).y; }
+    if (known.known) { ao = known.ao; }
     else if (vlf.valid && !skip_ao) { ao = vlf.ao; }
     else {
         ao = select(compute_ao(hit, origin, dir), 1.0, skip_ao);
@@ -4059,8 +4076,8 @@ fn shade(
         n_dot_l = mix(n_dot_l, max(0.0, s.y), 0.45);
     }
     var shadow_term = 0.0;
-    if (reuse_shadow) {
-        shadow_term = (*light).x;
+    if (known.known) {
+        shadow_term = known.sun;
     } else if (vlf.valid) {
         // CONTINUOUS sun visibility straight from the field. This is the
         // smooth-shadow fix: no binary occlusion test survives into the pixel,
@@ -4074,13 +4091,19 @@ fn shade(
         // the single sample into a soft penumbra over time — at half the cost.
         // Shadows are the single most expensive per-pixel term, so this is the
         // biggest shading win.
-        let golden = 2.39996323; // 137.5° in radians
-        // One wide penumbra cone in ALL states: with the lighting cache now
-        // reprojecting during motion, a traced sample persists across frames
-        // (only the staleness dither refreshes it), so fresh samples are sparse
-        // and the accumulated soft look stays consistent moving or still. A
-        // state-switched cone made shadows visibly change character on
-        // stop/start.
+        // THE FALLBACK, and it is a fallback now rather than the main path:
+        // it runs only where `voxlight_sample` cannot answer, which is 3.4% of
+        // shaded pixels on terrain, 0.05% on water and 54.4% inside a canopy
+        // (`LiveFrameRig::coverage`). The canopy figure is why it still exists:
+        // the air cell against a leaf face is usually ANOTHER leaf voxel, so the
+        // sampler's solidity gate drops every tap and the field has nothing to
+        // give. Deleting this would render half a canopy black.
+        //
+        // ONE jittered ray, softened by TAA over time. The jitter phase freezes
+        // while the camera moves, so during motion this is a hard binary edge -
+        // which is exactly the choppiness the field exists to remove, and exactly
+        // why the field answering 96.6% of terrain matters.
+        let golden = 2.39996323; // 137.5 degrees in radians
         let cone = 0.07;
         let theta = pix_jit * golden;
         let radius = cone * sqrt(pix_jit * 0.5);
@@ -4095,20 +4118,9 @@ fn shade(
         let ss = normalize(s + off);
         shadow_term = select(0.0, 1.0, !shadow_occluded(p_off, ss, SHADOW_MAX_DIST));
     }
-    // Sun-staleness refresh: the sun moved a hair, so the TRUE change is a
-    // penumbra edge sweeping - fade toward the fresh sample instead of letting
-    // the binary trace flip outright (single-pixel pops read as "little
-    // shadows jumping around"). Converges in 2-3 refreshes (~0.3-0.9 s), the
-    // physical sweep speed.
-    // The staleness cross-fade exists only to stop a BINARY per-pixel trace
-    // flipping outright as the sun drifts. A field sample has no such edge to
-    // hide: every epoch re-samples against the current sun and the stored
-    // value moves continuously, so blending here would only add lag.
-    if (blend_shadow && !vlf.valid) {
-        shadow_term = mix(shadow_term, (*light).x, 0.6);
-    }
-    // Hand the (fresh or reused) terms back so the caller re-caches them.
-    *light = vec2<f32>(shadow_term, ao);
+    // Report the terms so cs_main can put them in the G-buffer the grass pass
+    // reads. PURELY an output now - nothing feeds them back in.
+    *out_light = vec2<f32>(shadow_term, ao);
 
     let direct = sun_color(s) * (n_dot_l * shadow_term);
     let ambient = ambient_color() * ao;
@@ -4150,12 +4162,12 @@ fn shade(
 // tint compounds with travel distance for chunky glass blocks.
 fn shade_glass(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     let p_hit = origin + dir * hit.t_hit;
+    // See `shade_water_top`: secondary hits report into a scratch nothing reads.
+    var scratch_light = vec2<f32>(0.0);
     let n = hit.normal;
     let s = sun_dir();
     let sc = sun_color(s);
     let jit = fract(p_hit.x * 17.0 + p_hit.z * 23.0 + camera.time * 13.0);
-    // Secondary rays don't use the reprojection cache.
-    var no_cache = vec2<f32>(0.0);
 
     // Glass keeps its PER-PIXEL mirror. It predates the per-voxel reflection
     // field and outlived it: a window pane is a small, near-flat, high-Fresnel
@@ -4166,7 +4178,7 @@ fn shade_glass(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     var refl_col: vec3<f32>;
     let refl_hit = trace(refl_origin, refl_dir);
     if (refl_hit.hit) {
-        refl_col = shade(refl_hit, refl_origin, refl_dir, jit, false, false, false, &no_cache, vec3<f32>(0.0));
+        refl_col = shade(refl_hit, refl_origin, refl_dir, jit, vl_unknown(), vec3<f32>(0.0), &scratch_light);
     } else {
         refl_col = sky(refl_dir);
     }
@@ -4199,7 +4211,7 @@ fn shade_glass(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
         // Near head-on: dispersion invisible — single trace, save 2/3 cost.
         let under = trace_secondary(refr_origin, refr_dir_g, SECONDARY_MAX_T);
         var under_col: vec3<f32>;
-        if (under.hit) { under_col = shade(under, refr_origin, refr_dir_g, jit, false, false, false, &no_cache, vec3<f32>(0.0)); }
+        if (under.hit) { under_col = shade(under, refr_origin, refr_dir_g, jit, vl_unknown(), vec3<f32>(0.0), &scratch_light); }
         else { under_col = sky(refr_dir_g); }
         let depth = max(0.0, under.t_hit);
         let tint = vec3<f32>(0.05, 0.02, 0.02) * depth;
@@ -4208,9 +4220,9 @@ fn shade_glass(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
         let ur = trace_secondary(refr_origin, refr_dir_r, SECONDARY_MAX_T);
         let ug = trace_secondary(refr_origin, refr_dir_g, SECONDARY_MAX_T);
         let ub = trace_secondary(refr_origin, refr_dir_b, SECONDARY_MAX_T);
-        var cr = select(sky(refr_dir_r).r, shade(ur, refr_origin, refr_dir_r, jit, false, false, false, &no_cache, vec3<f32>(0.0)).r, ur.hit);
-        var cg = select(sky(refr_dir_g).g, shade(ug, refr_origin, refr_dir_g, jit, false, false, false, &no_cache, vec3<f32>(0.0)).g, ug.hit);
-        var cb = select(sky(refr_dir_b).b, shade(ub, refr_origin, refr_dir_b, jit, false, false, false, &no_cache, vec3<f32>(0.0)).b, ub.hit);
+        var cr = select(sky(refr_dir_r).r, shade(ur, refr_origin, refr_dir_r, jit, vl_unknown(), vec3<f32>(0.0), &scratch_light).r, ur.hit);
+        var cg = select(sky(refr_dir_g).g, shade(ug, refr_origin, refr_dir_g, jit, vl_unknown(), vec3<f32>(0.0), &scratch_light).g, ug.hit);
+        var cb = select(sky(refr_dir_b).b, shade(ub, refr_origin, refr_dir_b, jit, vl_unknown(), vec3<f32>(0.0), &scratch_light).b, ub.hit);
         let depth_g = max(0.0, ug.t_hit);
         let tint = vec3<f32>(0.05, 0.02, 0.02) * depth_g;
         glass_col = vec3<f32>(cr, cg, cb) * exp(-tint);

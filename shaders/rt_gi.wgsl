@@ -104,11 +104,9 @@ fn rt_gather_indirect(p: vec3<f32>, n: vec3<f32>, seed: f32) -> vec3<f32> {
 }
 
 // Temporal GI accumulation buffers (group 1, RT variant only). gi_in = last
-// frame's accumulated indirect; gi_out = this frame's. Reprojected with the same
-// proven position match as the shadow/AO cache (light_in stores the G-buffer
-// position), so a single fresh sample per frame converges to clean, cheap
-// indirect over a few frames - and disocclusion resets to fresh (no ghosting),
-// exactly like the shadow cache.
+// frame's accumulated indirect; gi_out = this frame's. Only the LEGACY
+// per-pixel path (GI_PROBE_MODE = 0) uses them; the shipped probe cache carries
+// its own temporal accumulation in world space and needs neither.
 @group(1) @binding(3) var gi_in: texture_2d<f32>;
 @group(1) @binding(4) var gi_out: texture_storage_2d<rgba32float, write>;
 
@@ -140,26 +138,20 @@ fn indirect_light(p: vec3<f32>, n: vec3<f32>, seed: f32, px: vec2<i32>, t: f32, 
     }
     var acc = rt_gather_indirect(p, n, seed) * fade;
 
-    // Reproject into last frame; reuse the accumulated GI on a position match.
-    if (camera.reproject_lighting > 0.5) {
-        let hitpos_rel = p - vec3<f32>(camera.world_origin);
-        let d = p - camera.prev_origin;
-        let pz = dot(d, camera.prev_forward);
-        if (pz > 0.01) {
-            let aspect = camera.resolution.x / camera.resolution.y;
-            let ndc = vec2<f32>(dot(d, camera.prev_right) / (pz * camera.tan_half_fov * aspect),
-                                dot(d, camera.prev_up) / (pz * camera.tan_half_fov));
-            let uvp = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-            if (uvp.x >= 0.0 && uvp.x < 1.0 && uvp.y >= 0.0 && uvp.y < 1.0) {
-                let pc = vec2<i32>(uvp * camera.resolution);
-                let g = textureLoad(light_in, pc, 0);
-                let dpos = g.xyz - hitpos_rel;
-                if (dot(dpos, dpos) < REPROJ_EPS2) {
-                    let prev = textureLoad(gi_in, pc, 0).rgb;
-                    acc = mix(acc, prev, 0.9); // 90% history: ~10-frame convergence
-                }
-            }
-        }
+    // ITS SCREEN-SPACE REPROJECTION IS GONE, and this path is the legacy
+    // REFERENCE rather than the shipped one, so that is a deliberate narrowing
+    // and not a silent regression. It reprojected a hit into last frame's screen
+    // and accepted the stored GI on a POSITION match - and the positions it
+    // matched against lived in `light_in`, the previous-frame half of the
+    // shadow/AO reprojection cache. That cache is gone (see the binding comment
+    // in raymarch.wgsl), and reinstating a 33 MB full-res position history for a
+    // path `GI_PROBE_MODE` has replaced in the shipped renderer would be paying
+    // the exact cost this rework removed. A static camera still accumulates
+    // through TAA; what is lost is accumulation across MOTION, which is one of
+    // the reasons the probe cache replaced this path in the first place.
+    let prev = textureLoad(gi_in, px, 0);
+    if (camera.reproject_ok > 0.5 && prev.a > 0.5) {
+        acc = mix(acc, prev.rgb, 0.9); // 90% history: ~10-frame convergence
     }
     textureStore(gi_out, px, vec4<f32>(acc, 1.0));
     return acc;

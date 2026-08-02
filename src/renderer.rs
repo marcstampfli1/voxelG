@@ -81,6 +81,153 @@ pub(crate) const VOXLIGHT_SUN_EPOCHS: u32 = 8;
 /// worst exactly where fog has already taken over. See `LightField::near_count`.
 pub(crate) const VOXLIGHT_FAR_DIV: u32 = 8;
 
+/// Sun rotation, in radians, that buys ONE sweep round.
+///
+/// The sweep exists to track the sun and nothing else, so this is the only
+/// honest unit for its cadence. The value reproduces the schedule this pass has
+/// always had at 60 fps and the shipped sun speed, so the LOOK is unchanged; what
+/// changes is that the schedule no longer depends on the FRAME RATE. At 400 fps
+/// it issues a round on one frame in seven instead of on every one, and with the
+/// sun frozen it issues none at all.
+///
+/// The value is one frame's worth of real sun motion at 60 Hz, and the factor
+/// nobody expects is in it. `sun_dir_at(t) = normalize(cos a, sin a, 0.30)` with
+/// `a = 0.025 t`, so the NORMALIZED direction does not turn at 0.025 rad/s: it
+/// traces a cone, a circle of radius `1 / sqrt(1 + 0.30^2)` = 0.95783 on the unit
+/// sphere, and sweeps `0.025 * 0.95783` rad/s of real angle. Using the naive
+/// 0.025 here would over-charge by 4.3% and quietly refresh slightly less often
+/// than the old cadence did.
+///
+/// Measured justification for not going slower than this:
+/// `voxlight_sun_lag_error` on the demo world reports, per sun lag, the fraction
+/// of records whose stored byte moves and by how much -
+///
+///     lag 0.133 s (a near period): 0.75% change, mean 0.21/255, p99 0
+///     lag 1.067 s (a far period):  1.98% change, mean 0.59/255, p99 31
+///     lag 4.267 s:                 3.15% change, mean 2.63/255, p99 95
+///
+/// so the shipped periods sit where the p99 error is still inside a byte or two
+/// and the tail only starts moving well past them. Keeping them exactly as they
+/// were means the LOOK is unchanged by this rework and only the frame-rate
+/// coupling is removed.
+pub(crate) const VOXLIGHT_SUN_RAD_PER_ROUND: f32 = 0.025 * 0.957826 / 60.0;
+
+/// Sweep rounds per SECOND while geometry is still settling, when the sun alone
+/// would ask for fewer.
+///
+/// A brick edit owes one complete sweep (`VOXLIGHT_UPDATE_DIV *
+/// VOXLIGHT_FAR_DIV` = 64 rounds) because a placed block's shadow can land
+/// anywhere along the sun ray and nothing local can know where. 64 rounds per
+/// second is that sweep finishing in one second, which is the same worst-case
+/// latency the far group already had.
+pub(crate) const VOXLIGHT_DIRTY_SWEEP_HZ: f32 = 64.0;
+
+/// Ceiling on banked sweep rounds.
+///
+/// A hitch (a chunk-generation stall, an alt-tab) must not be repaid as a burst
+/// of dispatches on the frame after it: the field would catch up in one frame
+/// what it should have spread over sixty, which is a spike exactly where the
+/// frame is already late. One round of slack absorbs ordinary frame-time jitter;
+/// anything past that is simply forgiven, and the sun is tracked a few
+/// milliseconds behind for one sweep.
+const VOXLIGHT_ROUND_CREDIT_MAX: f32 = 2.0;
+
+/// WHEN the light field's periodic sweep is allowed to run, and how often.
+///
+/// This is the whole of the "do no work when nothing changed" gate, in one place
+/// so the renderer and the live-session harness cannot measure different
+/// policies.
+///
+/// A record's value is a function of (geometry, sun direction, light set), so
+/// re-gathering it when none of the three moved writes bytes that are already
+/// there - measured on the demo world, 99.25% of records come back BIT-IDENTICAL
+/// across a whole near-sweep period of sun motion (`voxlight_sun_lag_error`).
+/// The sweep therefore accrues at a rate set by how fast the sun is actually
+/// turning, plus a floor while geometry is still settling, and a round is issued
+/// only when a whole one has accrued. Consequences, in order of importance:
+///
+///  - a frozen sun over unchanged geometry issues NOTHING, for ever;
+///  - the cost per SECOND is fixed, so a session running at 400 fps pays the
+///    same per second as one at 60 and about a sixth as much per FRAME. The old
+///    frame-counter cadence refreshed the field six times more often at 400 fps
+///    than the design ever asked for, for no benefit at all;
+///  - a sun sped up, slowed or scrubbed is tracked at the rate it needs, because
+///    the accrual measures the real angle between two sun directions rather than
+///    assuming the shipped rate.
+///
+/// Everything that CANNOT wait for a sweep - a block with no record, an edited
+/// brick, its neighbours - goes on `LightField::urgent` instead and is dispatched
+/// on the next frame whatever this says.
+#[derive(Default)]
+pub(crate) struct VoxLightSchedule {
+    /// Sweep rounds owed, fractional.
+    credit: f32,
+    /// The two clocks the accrual is measured against. `None` means no history,
+    /// which is treated as "everything is due".
+    prev_sun_time: Option<f32>,
+    prev_time: Option<f32>,
+    /// Sweep rounds still owed because GEOMETRY changed rather than because the
+    /// sun moved. The urgent list covers the edited bricks and their neighbours
+    /// exactly, but a placed block also moves a SHADOW, and that shadow can land
+    /// anywhere along the sun ray - nothing local can know where, so a geometry
+    /// change owes one complete pass over the shell.
+    dirty_rounds: u32,
+}
+
+impl VoxLightSchedule {
+    /// Geometry changed somewhere: owe one complete sweep.
+    pub(crate) fn mark_dirty(&mut self) {
+        self.dirty_rounds = VOXLIGHT_UPDATE_DIV * VOXLIGHT_FAR_DIV;
+    }
+
+    /// Bank this frame's share of a round from the two clocks.
+    pub(crate) fn accrue(&mut self, time: f32, sun_time: f32) {
+        let (prev_sun, prev_t) = match (self.prev_sun_time, self.prev_time) {
+            (Some(s), Some(t)) => (s, t),
+            _ => {
+                self.prev_sun_time = Some(sun_time);
+                self.prev_time = Some(time);
+                self.credit = VOXLIGHT_ROUND_CREDIT_MAX;
+                return;
+            }
+        };
+        self.prev_sun_time = Some(sun_time);
+        self.prev_time = Some(time);
+        // A real ANGLE between the two sun directions, not a difference of
+        // `sun_time`: a sun that is paused, scrubbed or run backwards is then
+        // accounted correctly instead of by assuming the shipped rate.
+        //
+        // From the CHORD, `theta = 2 asin(|a - b| / 2)`, and NOT from
+        // `acos(dot(a, b))`. The two are the same angle and only one of them is
+        // usable here: `dot` of a unit vector with itself comes back as
+        // 0.99999994 rather than 1.0, and `acos` has infinite slope there, so a
+        // FROZEN sun measured that way reads as 3.4e-4 rad of motion per frame -
+        // 82% of a round - and the gate never closes. Measured: the frozen-sun
+        // case ran 599 sweeps in 600 frames. `asin` near zero is exact.
+        let (a, b) = (crate::camera::sun_dir_at(prev_sun), crate::camera::sun_dir_at(sun_time));
+        let d_sun = 2.0 * ((a - b).length() * 0.5).clamp(-1.0, 1.0).asin();
+        let sun_rounds = d_sun / VOXLIGHT_SUN_RAD_PER_ROUND;
+        // The two rates are a MAX, not a sum: they are two lower bounds on how
+        // fast the same sweep has to run, not two independent pieces of work.
+        let dirty_rounds = if self.dirty_rounds > 0 {
+            (time - prev_t).max(0.0) * VOXLIGHT_DIRTY_SWEEP_HZ
+        } else {
+            0.0
+        };
+        self.credit = (self.credit + sun_rounds.max(dirty_rounds)).min(VOXLIGHT_ROUND_CREDIT_MAX);
+    }
+
+    /// Issue a sweep round if a whole one is owed.
+    pub(crate) fn take_round(&mut self) -> bool {
+        if self.credit < 1.0 {
+            return false;
+        }
+        self.credit -= 1.0;
+        self.dirty_rounds = self.dirty_rounds.saturating_sub(1);
+        true
+    }
+}
+
 /// Update rounds a headless harness must run before the light field is at
 /// steady state, i.e. what a still or a timing sample has to see, or it is
 /// judging the amortization schedule rather than the lighting.
@@ -387,8 +534,13 @@ pub struct Renderer {
     voxlight_live_count: u32,
     /// Length of the near prefix of that work list (`LightField::near_count`).
     voxlight_near_count: u32,
+    /// Bricks the last upload put in the urgent list, i.e. the number of
+    /// workgroups this frame owes to blocks with no readable record.
+    voxlight_urgent_count: u32,
     /// Dynamic point lights currently uploaded (see `set_point_lights`).
     voxlight_light_count: u32,
+    /// When the periodic sweep is allowed to run. See `VoxLightSchedule`.
+    vl_schedule: VoxLightSchedule,
     // Deferred transparent pass (#16): shares compute_bgl/compute_bg.
     transparent_pipeline: wgpu::ComputePipeline,
 
@@ -471,12 +623,12 @@ pub struct Renderer {
     cloud_sampled_view: wgpu::TextureView,
     cloud_storage_view: wgpu::TextureView,
 
-    // Reprojected shadow/AO cache: ping-pong G-buffer (write this frame, read
-    // next). `light_out` is copied into `light_hist` at the end of each frame.
+    // Lighting G-buffer: hit position + packed shadow/AO, consumed by cs_taa's
+    // reprojection and by the grass pass. WRITE-ONLY within a frame - the
+    // ping-pong history it used to feed is gone with the reprojection cache, and
+    // with it 33 MB of VRAM and a full-res Rgba32Float copy every frame.
     light_out_tex: wgpu::Texture,
     light_out_view: wgpu::TextureView,
-    light_hist_tex: wgpu::Texture,
-    light_hist_view: wgpu::TextureView,
 
     blit_bgl: wgpu::BindGroupLayout,
     blit_pipeline: wgpu::RenderPipeline,
@@ -815,7 +967,6 @@ impl Renderer {
             create_cloud_texture(&device, width, height);
         // Ping-pong lighting G-buffer for the reprojection cache.
         let (light_out_tex, light_out_view) = create_lighting_texture(&device, width, height);
-        let (light_hist_tex, light_hist_view) = create_lighting_texture(&device, width, height);
         // Deferred transparent records (#16).
         let transp_buf = create_transp_buf(&device, width, height);
         // Primary-hit depth for the falling-leaf pass and cs_compose.
@@ -886,14 +1037,14 @@ impl Renderer {
             &device, &compute_bgl, &camera_buf, &bricks_buf,
             &tile_mask_buf, &chunk_mask_buf, &palette_buf, &geom_view, &beam_view,
             &tile_dirty_buf, &players_buf, &brick_uniform_buf, &tile_uniform_buf, &l4_mask_buf,
-            &cloud_sampled_view, &sampler, &light_hist_view, &light_out_view, &transp_buf,
+            &cloud_sampled_view, &sampler, &light_out_view, &transp_buf,
             &sprites_buf, &depth_view, &history_view, &beam_view, &vl_bufs,
         );
         let compose_bg = make_compute_bg(
             &device, &compute_bgl, &camera_buf, &bricks_buf,
             &tile_mask_buf, &chunk_mask_buf, &palette_buf, &output_view, &beam_view,
             &tile_dirty_buf, &players_buf, &brick_uniform_buf, &tile_uniform_buf, &l4_mask_buf,
-            &cloud_sampled_view, &sampler, &light_hist_view, &light_out_view, &transp_buf,
+            &cloud_sampled_view, &sampler, &light_out_view, &transp_buf,
             &sprites_buf, &dummy_depth_view, &geom_view, &depth_view, &vl_bufs,
         );
 
@@ -1262,6 +1413,8 @@ impl Renderer {
             compute_bgl, compute_pipeline, compute_bg,
             vl: vl_bufs, voxlight_pipeline, voxlight_pipeline_rt,
             voxlight_round: 0, voxlight_live_count: 0, voxlight_near_count: 0,
+            voxlight_urgent_count: 0,
+            vl_schedule: VoxLightSchedule::default(),
             vl_stats: VoxLightUploadStats::default(),
             voxlight_light_count: 0,
             rt_shadows, world_accel,
@@ -1281,7 +1434,7 @@ impl Renderer {
             post_bg_bright, post_bg_blur_h, post_bg_blur_v, post_bg_final,
             bricks_buf_b, physics_pipeline, physics_bg, gpu_physics: gpu_physics_enabled,
             cloud_bgl, cloud_pipeline, cloud_bg, cloud_sampled_view, cloud_storage_view,
-            light_out_tex, light_out_view, light_hist_tex, light_hist_view,
+            light_out_tex, light_out_view,
             blit_bgl, blit_pipeline, blit_bg,
             taa_bgl, taa_pipeline, taa_bg,
             taa_reset: true,
@@ -1349,9 +1502,6 @@ impl Renderer {
         let (lo_tex, lo_view) = create_lighting_texture(&self.device, rw, rh);
         self.light_out_tex = lo_tex;
         self.light_out_view = lo_view;
-        let (lh_tex, lh_view) = create_lighting_texture(&self.device, rw, rh);
-        self.light_hist_tex = lh_tex;
-        self.light_hist_view = lh_view;
         self.transp_buf = create_transp_buf(&self.device, rw, rh);
         let (dt, dv) = create_depth_texture(&self.device, rw, rh);
         self.depth_tex = dt;
@@ -1388,7 +1538,7 @@ impl Renderer {
             &self.tile_mask_buf, &self.chunk_mask_buf, &self.palette_buf, &self.geom_view, &self.beam_view,
             &self.tile_dirty_buf, &self.players_buf, &self.brick_uniform_buf, &self.tile_uniform_buf,
             &self.l4_mask_buf, &self.cloud_sampled_view, &self.sampler,
-            &self.light_hist_view, &self.light_out_view, &self.transp_buf,
+            &self.light_out_view, &self.transp_buf,
             &self.sprites_buf, &self.depth_view, &self.history_view, &self.beam_view, &self.vl,
         );
         self.compose_bg = make_compute_bg(
@@ -1396,7 +1546,7 @@ impl Renderer {
             &self.tile_mask_buf, &self.chunk_mask_buf, &self.palette_buf, &self.output_view, &self.beam_view,
             &self.tile_dirty_buf, &self.players_buf, &self.brick_uniform_buf, &self.tile_uniform_buf,
             &self.l4_mask_buf, &self.cloud_sampled_view, &self.sampler,
-            &self.light_hist_view, &self.light_out_view, &self.transp_buf,
+            &self.light_out_view, &self.transp_buf,
             &self.sprites_buf, &self.dummy_depth_view, &self.geom_view, &self.depth_view, &self.vl,
         );
         self.cloud_bg = make_cloud_bg(
@@ -1541,9 +1691,13 @@ impl Renderer {
             self.queue.write_buffer(&self.tile_uniform_buf, 0, bytemuck::cast_slice(&tu));
             // Every brick is new, so bind the light shell from scratch.
             world.sync_light_shell_all();
-            self.voxlight_live_count =
+            let (live, urgent) =
                 upload_voxlight(&self.queue, &self.vl, world, &mut self.vl_stats);
+            self.voxlight_live_count = live;
+            self.voxlight_urgent_count = urgent;
             self.voxlight_near_count = world.light.near_count();
+            // The whole world is new, so the whole shell owes a sweep.
+            self.vl_schedule.mark_dirty();
             world.all_dirty = false;
             world.dirty_bricks.clear();
             return;
@@ -1558,7 +1712,7 @@ impl Renderer {
         // 1M-entry array) while the upload is DMA, and a single "world+upload"
         // number cannot tell a regression in one from the other.
         let t_shell = std::time::Instant::now();
-        // Point the field's refresh priority at the camera. `prev_cam` is LAST
+        // Point the field's sweep priority at the camera. `prev_cam` is LAST
         // frame's pose, because `update_camera` runs after this in the frame -
         // deliberate and harmless: the policy is deadbanded at 16 voxels, so one
         // frame of lag cannot change its answer by more than one frame of camera
@@ -1567,14 +1721,33 @@ impl Renderer {
         if let Some(cam) = &self.prev_cam {
             world.set_light_focus(cam.pos);
         }
+        // A geometry change owes ONE COMPLETE SWEEP: the urgent list covers the
+        // edited bricks and their neighbours exactly, but a placed or removed
+        // block also moves a SHADOW, and that shadow can land anywhere along the
+        // sun ray. Nothing local can know where, so the periodic pass has to run
+        // through once - and this is the only thing besides the sun that arms it.
+        if !world.dirty_bricks.is_empty() {
+            self.vl_schedule.mark_dirty();
+        }
         world.sync_light_shell_dirty();
         let t_up = std::time::Instant::now();
         self.vl_stats.shell_ns += (t_up - t_shell).as_nanos() as u64;
-        self.voxlight_live_count =
-            upload_voxlight(&self.queue, &self.vl, world, &mut self.vl_stats);
+        let (live, urgent) = upload_voxlight(&self.queue, &self.vl, world, &mut self.vl_stats);
+        self.voxlight_live_count = live;
+        // `upload_world` runs exactly once per frame and `render` dispatches and
+        // clears this, so a non-zero value here would mean a batch was written to
+        // the GPU buffer, drained from the CPU queue, and never launched - blocks
+        // left with no record for ever. The assert is the contract, not a hope.
+        debug_assert_eq!(
+            self.voxlight_urgent_count, 0,
+            "an urgent batch was uploaded and never dispatched: upload_world must be paired \
+             with render()",
+        );
+        self.voxlight_urgent_count = urgent;
         self.voxlight_near_count = world.light.near_count();
         self.vl_stats.live = self.voxlight_live_count;
         self.vl_stats.near = self.voxlight_near_count;
+        self.vl_stats.urgent += urgent as u64;
         self.vl_stats.upload_ns += t_up.elapsed().as_nanos() as u64;
         if world.dirty_bricks.is_empty() { return; }
 
@@ -1688,13 +1861,10 @@ impl Renderer {
         // whole grid over DIV frames.
         u.gi_round = (self.gi_frame % (GI_PROBE_UPDATE_DIV * GI_PROBE_DIR_EPOCHS)) as i32;
         self.gi_frame = self.gi_frame.wrapping_add(1);
-        // Lighting reprojection is STATIC-ONLY, deliberately: a still camera
-        // re-reads its own pixel's entry (no resampling, drift impossible), but
-        // a moving camera resamples the cache nearest-neighbour and the
-        // resample-restore chain random-walks shadow/AO edges - tried once,
-        // seen as lighting "warping" while looking around, reverted. Motion
-        // traces fresh with a FROZEN jitter phase instead (see cs_main), which
-        // is temporally stable at full correctness.
+        // Reprojection is STATIC-ONLY, deliberately: `taa_blend` is non-zero only
+        // while TAA accumulates on a still camera. A chunk cross rebases
+        // `world_origin`, which changes what every stored position means, so it
+        // invalidates the target too.
         let reproject_ok = taa_blend > 0.0 && self.prev_world_origin == world_origin_voxel;
         match &self.prev_cam {
             Some(prev) => u.set_prev_camera(prev, reproject_ok),
@@ -1703,6 +1873,9 @@ impl Renderer {
         self.queue.write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&u));
         self.prev_cam = Some(camera.clone());
         self.prev_world_origin = world_origin_voxel;
+        // Bank this frame's share of a light-field sweep round. Done HERE
+        // because this is the one place that sees both clocks.
+        self.vl_schedule.accrue(time, sun_time);
     }
 
     /// Run one GPU-compute physics step (#25): dispatch the pull-only sand CA
@@ -1788,6 +1961,73 @@ impl Renderer {
         let gi_idx = (self.gi_frame & 1) as usize;
         if let Some(p) = &self.gpu_profiler { p.stamp(&mut encoder, 0); }
 
+        // ---- per-voxel light field update ----
+        //
+        // FIRST in the frame and OUTSIDE the temporal-differential gate, both
+        // deliberately. The field is WORLD state, not screen state: its urgent
+        // queue is drained by `upload_world` on the assumption that this frame
+        // dispatches it, so skipping the pass on a frame with no dirty tile would
+        // silently strand blocks with no record. Ordering is free - the pass
+        // depends on nothing the other passes write, and wgpu inserts the
+        // storage-buffer barrier before cs_main reads the pool.
+        //
+        // THE GATE. A sweep round is issued only when a whole one has accrued
+        // from sun motion (or from the settling floor a geometry change arms);
+        // the urgent list is dispatched whenever it is non-empty. When both are
+        // zero the pass is NOT ENCODED AT ALL - no compute pass, no uniform
+        // write - because its output would be bit-identical to what the pool
+        // already holds. See `VoxLightSchedule`.
+        {
+            let sweep = self.vl_schedule.take_round();
+            let sweep_wgs = if sweep {
+                voxlight_dispatch_blocks(self.voxlight_live_count, self.voxlight_near_count)
+            } else {
+                0
+            };
+            let wgs = self.voxlight_urgent_count + sweep_wgs;
+            if self.voxlight_live_count > 0 && wgs > 0 {
+                self.queue.write_buffer(
+                    &self.vl.params,
+                    0,
+                    bytemuck::bytes_of(&VoxLightParamsUniform {
+                        urgent_count: self.voxlight_urgent_count,
+                        sweep: sweep as u32,
+                        ..voxlight_params(
+                            self.voxlight_live_count,
+                            self.voxlight_round,
+                            self.voxlight_light_count,
+                            self.voxlight_near_count,
+                        )
+                    }),
+                );
+                let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("voxlight update"),
+                    timestamp_writes: None,
+                });
+                if self.rt_shadows {
+                    cp.set_pipeline(self.voxlight_pipeline_rt.as_ref().unwrap());
+                    cp.set_bind_group(0, &self.compute_bg, &[]);
+                    cp.set_bind_group(1, &self.rt_bg.as_ref().unwrap()[gi_idx], &[]);
+                } else {
+                    cp.set_pipeline(&self.voxlight_pipeline);
+                    cp.set_bind_group(0, &self.compute_bg, &[]);
+                }
+                // One workgroup per block due this dispatch, one invocation per
+                // voxel.
+                cp.dispatch_workgroups(wgs, 1, 1);
+            }
+            // The round counter picks which SLICE of the work list the sweep
+            // takes, so it advances with the SWEEP and not with the frame: a
+            // frame that issued no round must not skip a slice.
+            if sweep {
+                self.voxlight_round = self.voxlight_round.wrapping_add(1);
+            }
+            // Consumed. `upload_world` dropped these from the CPU queue when it
+            // wrote them, and this is the dispatch it did that for.
+            self.voxlight_urgent_count = 0;
+        }
+        if let Some(p) = &self.gpu_profiler { p.stamp(&mut encoder, 1); }
+
         // Temporal-differential: if no tile is dirty, we still blit (so the
         // swapchain stays in sync), but skip the beam + raymarch compute
         // passes entirely. The output_tex from the prior frame is preserved.
@@ -1804,7 +2044,7 @@ impl Renderer {
                 let hy = ((self.size.1 + 1) / 2 + 7) / 8;
                 cp.dispatch_workgroups(hx, hy, 1);
             }
-            if let Some(pr) = &self.gpu_profiler { pr.stamp(&mut encoder, 1); }
+            if let Some(pr) = &self.gpu_profiler { pr.stamp(&mut encoder, 2); }
             // ---- beam pre-pass at 1/8 resolution ----
             {
                 let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1817,7 +2057,7 @@ impl Renderer {
                 let by = ((self.size.1 + 7) / 8 + 7) / 8;
                 cp.dispatch_workgroups(bx, by, 1);
             }
-            if let Some(pr) = &self.gpu_profiler { pr.stamp(&mut encoder, 2); }
+            if let Some(pr) = &self.gpu_profiler { pr.stamp(&mut encoder, 3); }
             // ---- world-space GI probe update (RT) ----
             // Amortized irradiance gather: every probe casts a few fresh RT rays,
             // temporally accumulated in the probe SH. Runs before the main pass so
@@ -1837,42 +2077,6 @@ impl Renderer {
                     cp.dispatch_workgroups((threads + 63) / 64, 1, 1);
                 }
             }
-            if let Some(pr) = &self.gpu_profiler { pr.stamp(&mut encoder, 3); }
-            // ---- per-voxel light field update ----
-            // Runs BEFORE the raymarch so this frame shades against a field
-            // that already includes this frame's slice. wgpu inserts the
-            // storage-buffer barrier between the two compute passes.
-            if self.voxlight_live_count > 0 {
-                self.queue.write_buffer(
-                    &self.vl.params,
-                    0,
-                    bytemuck::bytes_of(&voxlight_params(
-                        self.voxlight_live_count,
-                        self.voxlight_round,
-                        self.voxlight_light_count,
-                        self.voxlight_near_count,
-                    )),
-                );
-                let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("voxlight update"),
-                    timestamp_writes: None,
-                });
-                if self.rt_shadows {
-                    cp.set_pipeline(self.voxlight_pipeline_rt.as_ref().unwrap());
-                    cp.set_bind_group(0, &self.compute_bg, &[]);
-                    cp.set_bind_group(1, &self.rt_bg.as_ref().unwrap()[gi_idx], &[]);
-                } else {
-                    cp.set_pipeline(&self.voxlight_pipeline);
-                    cp.set_bind_group(0, &self.compute_bg, &[]);
-                }
-                // One workgroup per block in this round's slice, one
-                // invocation per voxel.
-                let blocks = voxlight_dispatch_blocks(
-                    self.voxlight_live_count, self.voxlight_near_count,
-                );
-                cp.dispatch_workgroups(blocks, 1, 1);
-            }
-            self.voxlight_round = self.voxlight_round.wrapping_add(1);
             if let Some(pr) = &self.gpu_profiler { pr.stamp(&mut encoder, 4); }
             // ---- main raymarch (skips clean tiles in-shader) ----
             {
@@ -2038,23 +2242,6 @@ impl Renderer {
                 },
                 wgpu::TexelCopyTextureInfo {
                     texture: &self.history_tex,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::Extent3d { width: self.size.0, height: self.size.1, depth_or_array_layers: 1 },
-            );
-            // Ping-pong the lighting G-buffer: this frame's output becomes next
-            // frame's reprojection source.
-            encoder.copy_texture_to_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &self.light_out_tex,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyTextureInfo {
-                    texture: &self.light_hist_tex,
                     mip_level: 0,
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
@@ -2793,7 +2980,9 @@ pub(crate) fn create_compute_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout
             bgl_storage(11, true), // l4_mask (coarsest pyramid level)
             bgl_tex(12, true),     // half-res cloud texture (bilinear upsample)
             bgl_sampler(13),       // cloud sampler (filtering)
-            bgl_tex(15, false),    // light_in: previous-frame lighting G-buffer
+            // 15 was `light_in`, the previous frame's lighting G-buffer. The
+            // screen-space reprojection cache that read it is gone; see the
+            // binding comment in raymarch.wgsl.
             bgl_storage_tex(16, wgpu::TextureFormat::Rgba32Float), // light_out
             bgl_storage(17, false), // transp_buf: deferred transparent records (rw)
             bgl_storage(18, true),  // foliage sprites (2bpp authored cutout art)
@@ -2844,7 +3033,12 @@ pub(crate) struct VoxLightParamsUniform {
     pub near_count: u32,
     /// Extra division applied to the far remainder, on top of `update_div`.
     pub far_div: u32,
-    pub _pad: [u32; 2],
+    /// Bricks in the urgent list, which sits at `LIGHT_BLOCKS_MAX` in the work
+    /// list buffer. Dispatched in full and before the sweep.
+    pub urgent_count: u32,
+    /// 1 when this dispatch also advances the periodic sweep. See
+    /// `VoxLightSchedule`.
+    pub sweep: u32,
 }
 
 /// A dynamic point light, matching `VlPointLight` in the shader.
@@ -2893,9 +3087,16 @@ impl VoxLightBuffers {
             buf
         };
         let block_of_brick = none_filled_table("voxlight block_of_brick");
+        // The compact work list, plus a short tail for the URGENT list. One
+        // buffer rather than two because the shader reaches the tail at a fixed
+        // offset (`VL_URGENT_BASE`) and the work list can never grow into it -
+        // `LightField::allocate` refuses past `LIGHT_BLOCKS_MAX`. A second
+        // binding would have cost an 18th storage buffer in a layout that already
+        // asks for 17.
         let live_bricks = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("voxlight live_bricks"),
-            size: crate::voxlight::LIGHT_BLOCKS_MAX as u64 * 4,
+            label: Some("voxlight live_bricks + urgent"),
+            size: (crate::voxlight::LIGHT_BLOCKS_MAX + crate::voxlight::LIGHT_URGENT_BUDGET) as u64
+                * 4,
             usage: U::STORAGE | U::COPY_DST,
             mapped_at_creation: false,
         });
@@ -3021,7 +3222,6 @@ fn make_compute_bg(
     l4_mask_buf: &wgpu::Buffer,
     cloud_sampled_view: &wgpu::TextureView,
     cloud_sampler: &wgpu::Sampler,
-    light_in_view: &wgpu::TextureView,
     light_out_view: &wgpu::TextureView,
     transp_buf: &wgpu::Buffer,
     sprites_buf: &wgpu::Buffer,
@@ -3048,7 +3248,6 @@ fn make_compute_bg(
             wgpu::BindGroupEntry { binding: 11, resource: l4_mask_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(cloud_sampled_view) },
             wgpu::BindGroupEntry { binding: 13, resource: wgpu::BindingResource::Sampler(cloud_sampler) },
-            wgpu::BindGroupEntry { binding: 15, resource: wgpu::BindingResource::TextureView(light_in_view) },
             wgpu::BindGroupEntry { binding: 16, resource: wgpu::BindingResource::TextureView(light_out_view) },
             wgpu::BindGroupEntry { binding: 17, resource: transp_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 18, resource: sprites_buf.as_entire_binding() },
@@ -3093,6 +3292,10 @@ pub(crate) struct VoxLightUploadStats {
     pub shell_ns: u64,
     /// Nanoseconds spent in `upload_voxlight` itself (main thread).
     pub upload_ns: u64,
+    /// Bricks pushed through the URGENT list. This is the work that genuinely
+    /// could not have been skipped, so it is the number that says how much of the
+    /// pass's cost is real change rather than schedule.
+    pub urgent: u64,
     /// Most recent live block count and near-prefix length. Not accumulated:
     /// they are a state, and the ratio is what says whether the camera-aware
     /// cadence is actually finding a small near set in this world.
@@ -3117,27 +3320,31 @@ impl VoxLightUploadStats {
             self.shell_ns as f64 / 1e6 / f,
             self.upload_ns as f64 / 1e6 / f,
         ) + &format!(
-            "; shell {} blocks, {} near ({:.0}%), dispatch {} wgs of {}",
+            "; shell {} blocks, {} near ({:.0}%), sweep round {} wgs of {}, urgent {:.1} wgs/frame",
             self.live, self.near,
             100.0 * self.near as f64 / self.live.max(1) as f64,
             voxlight_dispatch_blocks(self.live, self.near),
             voxlight_dispatch_blocks(self.live, self.live),
+            self.urgent as f64 / f,
         )
     }
 }
 
-/// Push the light field's brick table and work list to the GPU, and report the
-/// live block count (the update pass's dispatch size).
+/// Push the light field's brick table, work list and urgent list to the GPU, and
+/// report `(live block count, urgent bricks written)`.
 ///
-/// Both arrays are re-uploaded WHOLE, but only on frames where a binding
-/// actually changed: the table is 4 MiB, so pushing it unconditionally would
-/// burn ~570 MB/s of PCIe at 144 Hz to move bytes that did not move.
+/// The table and work list are re-uploaded WHOLE, but only on frames where a
+/// binding actually changed: the table is 4 MiB, so pushing it unconditionally
+/// would burn ~570 MB/s of PCIe at 144 Hz to move bytes that did not move.
+///
+/// The urgent list is DRAINED here, on the contract that the caller dispatches
+/// exactly what this wrote (see `Renderer::voxlight_urgent_count`).
 fn upload_voxlight(
     queue: &wgpu::Queue,
     vl: &VoxLightBuffers,
     world: &mut crate::voxel::World,
     stats: &mut VoxLightUploadStats,
-) -> u32 {
+) -> (u32, u32) {
     let field = &mut world.light;
     let (pool, table, work_list) = (&vl.pool, &vl.block_of_brick, &vl.live_bricks);
     let what = "voxlight";
@@ -3225,7 +3432,25 @@ fn upload_voxlight(
         });
     }
     field.clear_pending_reset();
-    field.allocated() as u32
+    // The URGENT list, at its fixed offset past the work list. Whole, because it
+    // is at most `LIGHT_URGENT_BUDGET` entries (2 KiB) and it changes completely
+    // every frame it is non-empty; a delta scheme over 2 KiB would cost more
+    // bookkeeping than the DMA it saves.
+    let urgent_n = field.urgent().len().min(crate::voxlight::LIGHT_URGENT_BUDGET as usize);
+    if urgent_n > 0 {
+        queue.write_buffer(
+            work_list,
+            crate::voxlight::LIGHT_BLOCKS_MAX as u64 * 4,
+            bytemuck::cast_slice(&field.urgent()[..urgent_n]),
+        );
+        stats.table_bytes += urgent_n as u64 * 4;
+        stats.writes += 1;
+    }
+    // Dropped HERE, not after the dispatch: the entries are in the GPU buffer
+    // now, and the caller dispatches them this frame unconditionally. Keeping
+    // them queued would re-gather the same blocks for ever.
+    field.drain_urgent(urgent_n);
+    (field.allocated() as u32, urgent_n as u32)
 }
 
 /// The light-field update parameters for one frame.
@@ -3254,7 +3479,10 @@ pub(crate) fn voxlight_params(
         round,
         near_count,
         far_div: VOXLIGHT_FAR_DIV,
-        _pad: [0; 2],
+        // A plain sweep round with no urgent work: what every harness wants and
+        // what the renderer starts from before it folds in this frame's queue.
+        urgent_count: 0,
+        sweep: 1,
         update_div: VOXLIGHT_UPDATE_DIV,
         // Rays per VISIT, and a visit is now the whole estimate rather than a
         // quarter of it (`vl_sun_visibility`), so this is also the number of
@@ -3398,8 +3626,13 @@ pub(crate) struct GpuProfiler {
 /// GPU cost in the frame unattributable in the only profiler that watches the
 /// REAL renderer - the two are separate features with separate amortization and
 /// they have to be separately readable.
+///
+/// It is FIRST because it now runs outside the temporal-differential gate: its
+/// urgent queue is drained on the assumption that the frame dispatches it, so it
+/// cannot sit inside a branch that a clean-tile frame skips. The order here is
+/// the order `render` encodes them in, and must stay that way.
 pub(crate) const GPU_PROFILE_LABELS: [&str; 10] =
-    ["clouds", "beam", "probe", "vlight", "main", "transp", "compose", "taa", "post", "blit"];
+    ["vlight", "clouds", "beam", "probe", "main", "transp", "compose", "taa", "post", "blit"];
 const GPU_PROFILE_TS: u32 = GPU_PROFILE_LABELS.len() as u32 + 1;
 
 impl GpuProfiler {
@@ -3811,7 +4044,6 @@ mod gpu_render_tests {
         });
 
         let bgl = create_compute_bgl(&device);
-        let (_ltex, light_in_view) = create_lighting_texture(&device, w, h);
         let (_ltex2, light_out_view) = create_lighting_texture(&device, w, h);
         let transp_buf = create_transp_buf(&device, w, h);
         let sprites_buf = storage(&device, "sprites", bytemuck::cast_slice(&crate::sprites::encoded()));
@@ -3823,14 +4055,14 @@ mod gpu_render_tests {
             &device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
             &palette_buf, &geom_view, &beam_view, &tile_dirty_buf, &players_buf,
             &brick_uniform_buf, &tile_uniform_buf, &l4_mask_buf,
-            &cloud_sampled_view, &cloud_sampler, &light_in_view, &light_out_view, &transp_buf,
+            &cloud_sampled_view, &cloud_sampler, &light_out_view, &transp_buf,
             &sprites_buf, &depth_view, &output_view, &beam_view, &vl_bufs,
         );
         let bg_compose = make_compute_bg(
             &device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
             &palette_buf, &output_view, &beam_view, &tile_dirty_buf, &players_buf,
             &brick_uniform_buf, &tile_uniform_buf, &l4_mask_buf,
-            &cloud_sampled_view, &cloud_sampler, &light_in_view, &light_out_view, &transp_buf,
+            &cloud_sampled_view, &cloud_sampler, &light_out_view, &transp_buf,
             &sprites_buf, &dummy_depth_view, &geom_view, &depth_view, &vl_bufs,
         );
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -3932,7 +4164,7 @@ mod gpu_render_tests {
             mapped_at_creation: false,
         });
 
-        // Frame 1: reproject OFF (cu has reproject_lighting=0), builds the
+        // Frame 1: reproject OFF (cu has reproject_ok=0), builds the
         // lighting G-buffer in light_out.
         let mut enc = device.create_command_encoder(&Default::default());
         {
@@ -3947,17 +4179,13 @@ mod gpu_render_tests {
             cp.set_bind_group(0, &bg, &[]);
             cp.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
         }
-        // Ping-pong: frame 1's G-buffer (light_out) becomes frame 2's light_in.
-        enc.copy_texture_to_texture(
-            wgpu::TexelCopyTextureInfo { texture: &_ltex2, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            wgpu::TexelCopyTextureInfo { texture: &_ltex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-        );
         queue.submit(std::iter::once(enc.finish()));
-        // Frame 2: reproject ON with the same camera as prev â†’ every pixel should
-        // reproject to itself, match position, and reuse frame 1's shadow/AO.
-        // A static camera means the result must equal frame 1 (validates the
-        // reuse path: reprojection math, position match, unpack).
+        // Frame 2, with a valid previous camera. It used to exist to exercise the
+        // shadow/AO reprojection cache (frame 1 filled the G-buffer, a ping-pong
+        // copy made it frame 2's history, frame 2 had to reuse it and come out
+        // identical). That cache is gone; the second frame is kept because it is
+        // the state a still image should capture - a camera that has been in
+        // place for at least one frame, with the light-field pass having run.
         let mut cu2 = cu;
         cu2.set_prev_camera(&cam, true);
         queue.write_buffer(&camera_buf, 0, bytemuck::bytes_of(&cu2));
@@ -4286,9 +4514,9 @@ mod gpu_render_tests {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        // The live light-cache ping-pong: two textures, two bind-group flavours.
+        // The lighting G-buffer. ONE texture: it used to be a ping-pong pair for
+        // the shadow/AO reprojection cache, and that cache is gone.
         let (_la, light_a) = create_lighting_texture(&device, w, h);
-        let (_lb, light_b) = create_lighting_texture(&device, w, h);
         let transp_buf = create_transp_buf(&device, w, h);
         let sprites_buf = storage(&device, "spr", bytemuck::cast_slice(&crate::sprites::encoded()));
         let (_dtex, depth_view) = create_depth_texture(&device, w, h);
@@ -4298,26 +4526,26 @@ mod gpu_render_tests {
         // main flavour (writes geom+depth) and compose flavour (writes output,
         // reads geom+depth), each in both light parities.
         let vl_bufs = VoxLightBuffers::new(&device);
-        let mk_main = |lin: &wgpu::TextureView, lout: &wgpu::TextureView| {
+        let mk_main = |lout: &wgpu::TextureView| {
             make_compute_bg(
                 &device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
                 &palette_buf, &geom_view, &beam_view, &tile_dirty_buf, &players_buf,
                 &bu, &tu, &l4_mask_buf, &cloud_sampled_view, &cloud_sampler,
-                lin, lout, &transp_buf, &sprites_buf, &depth_view, &dummy_depth_view, &beam_view,
+                lout, &transp_buf, &sprites_buf, &depth_view, &dummy_depth_view, &beam_view,
                 &vl_bufs,
             )
         };
-        let mk_compose = |lin: &wgpu::TextureView, lout: &wgpu::TextureView| {
+        let mk_compose = |lout: &wgpu::TextureView| {
             make_compute_bg(
                 &device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
                 &palette_buf, &output_view, &beam_view, &tile_dirty_buf, &players_buf,
                 &bu, &tu, &l4_mask_buf, &cloud_sampled_view, &cloud_sampler,
-                lin, lout, &transp_buf, &sprites_buf, &dummy_depth_view, &geom_view, &depth_view,
+                lout, &transp_buf, &sprites_buf, &dummy_depth_view, &geom_view, &depth_view,
                 &vl_bufs,
             )
         };
-        let bg_main = [mk_main(&light_a, &light_b), mk_main(&light_b, &light_a)];
-        let bg_comp = [mk_compose(&light_a, &light_b), mk_compose(&light_b, &light_a)];
+        let bg_main = [mk_main(&light_a), mk_main(&light_a)];
+        let bg_comp = [mk_compose(&light_a), mk_compose(&light_a)];
 
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
@@ -4532,26 +4760,26 @@ mod gpu_render_tests {
         } else {
             0
         };
-        let mk_main = |lin: &wgpu::TextureView, lout: &wgpu::TextureView| {
+        let mk_main = |lout: &wgpu::TextureView| {
             make_compute_bg(
                 device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
                 &palette_buf, &geom_view, &beam_view, &tile_dirty_buf, &players_buf,
                 &bu, &tu, &l4_mask_buf, &cloud_sampled_view, &cloud_sampler,
-                lin, lout, &transp_buf, &sprites_buf, &depth_view, &dummy_depth_view, &beam_view,
+                lout, &transp_buf, &sprites_buf, &depth_view, &dummy_depth_view, &beam_view,
                 &vl_bufs,
             )
         };
-        let mk_compose = |lin: &wgpu::TextureView, lout: &wgpu::TextureView| {
+        let mk_compose = |lout: &wgpu::TextureView| {
             make_compute_bg(
                 device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
                 &palette_buf, &output_view, &beam_view, &tile_dirty_buf, &players_buf,
                 &bu, &tu, &l4_mask_buf, &cloud_sampled_view, &cloud_sampler,
-                lin, lout, &transp_buf, &sprites_buf, &dummy_depth_view, &geom_view, &depth_view,
+                lout, &transp_buf, &sprites_buf, &dummy_depth_view, &geom_view, &depth_view,
                 &vl_bufs,
             )
         };
-        let bg_main = [mk_main(&light_a, &light_b), mk_main(&light_b, &light_a)];
-        let bg_comp = [mk_compose(&light_a, &light_b), mk_compose(&light_b, &light_a)];
+        let bg_main = [mk_main(&light_a), mk_main(&light_a)];
+        let bg_comp = [mk_compose(&light_a), mk_compose(&light_a)];
 
         // RT group 1 with the LIVE gi ping-pong pair.
         let accel = crate::accel::build_world_accel(device, queue, world);
@@ -5161,7 +5389,6 @@ mod gpu_render_tests {
         let (_btex, beam_view) = create_beam_texture(device, w, h);
         let (_ctex, cloud_sampled_view, _cloud_storage_view) = create_cloud_texture(device, w, h);
         let cloud_sampler = device.create_sampler(&wgpu::SamplerDescriptor { label: None, mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
-        let (_ltex, light_in_view) = create_lighting_texture(device, w, h);
         let (_ltex2, light_out_view) = create_lighting_texture(device, w, h);
         let transp_buf = create_transp_buf(device, w, h);
         let sprites_buf = storage(device, "sprites", bytemuck::cast_slice(&crate::sprites::encoded()));
@@ -5174,7 +5401,7 @@ mod gpu_render_tests {
             device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
             &palette_buf, &output_view, &beam_view, &tile_dirty_buf, &players_buf,
             &brick_uniform_buf, &tile_uniform_buf, &l4_mask_buf,
-            &cloud_sampled_view, &cloud_sampler, &light_in_view, &light_out_view, &transp_buf,
+            &cloud_sampled_view, &cloud_sampler, &light_out_view, &transp_buf,
             &sprites_buf, &dummy_depth_view, &geom_view, &depth_view, &vl_bufs,
         );
         let accel = crate::accel::build_world_accel(device, queue, &world);
@@ -5315,7 +5542,6 @@ mod gpu_render_tests {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        let (_ltex, light_in_view) = create_lighting_texture(device, w, h);
         let (_ltex2, light_out_view) = create_lighting_texture(device, w, h);
         let transp_buf = create_transp_buf(device, w, h);
         let sprites_buf = storage(device, "sprites", bytemuck::cast_slice(&crate::sprites::encoded()));
@@ -5328,7 +5554,7 @@ mod gpu_render_tests {
             device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
             &palette_buf, &output_view, &beam_view, &tile_dirty_buf, &players_buf,
             &brick_uniform_buf, &tile_uniform_buf, &l4_mask_buf,
-            &cloud_sampled_view, &cloud_sampler, &light_in_view, &light_out_view, &transp_buf,
+            &cloud_sampled_view, &cloud_sampler, &light_out_view, &transp_buf,
             &sprites_buf, &dummy_depth_view, &geom_view, &depth_view, &vl_bufs,
         );
 
@@ -5757,7 +5983,6 @@ mod gpu_render_tests {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        let (_li, liv) = create_lighting_texture(&device, w, h);
         let (_lo, lov) = create_lighting_texture(&device, w, h);
         let tpb = create_transp_buf(&device, w, h);
         let spr = storage(&device, "sprites", bytemuck::cast_slice(&crate::sprites::encoded()));
@@ -5769,12 +5994,12 @@ mod gpu_render_tests {
         let bg = make_compute_bg(
             &device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
             &palette_buf, &gv, &bv, &td, &players, &brick_uniform_buf, &tile_uniform_buf,
-            &l4_mask_buf, &csv, &csamp, &liv, &lov, &tpb, &spr, &dv, &ov, &bv, &vl_bufs,
+            &l4_mask_buf, &csv, &csamp, &lov, &tpb, &spr, &dv, &ov, &bv, &vl_bufs,
         );
         let bg_compose = make_compute_bg(
             &device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
             &palette_buf, &ov, &bv, &td, &players, &brick_uniform_buf, &tile_uniform_buf,
-            &l4_mask_buf, &csv, &csamp, &liv, &lov, &tpb, &spr, &ddv, &gv, &dv, &vl_bufs,
+            &l4_mask_buf, &csv, &csamp, &lov, &tpb, &spr, &ddv, &gv, &dv, &vl_bufs,
         );
         let pll = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None, bind_group_layouts: &[Some(&bgl)], immediate_size: 0,
@@ -6305,8 +6530,7 @@ mod gpu_render_tests {
                 min_filter: wgpu::FilterMode::Linear,
                 ..Default::default()
             });
-            let (_li, liv) = create_lighting_texture(&device, w, h);
-            let (_lo, lov) = create_lighting_texture(&device, w, h);
+                let (_lo, lov) = create_lighting_texture(&device, w, h);
             let tpb = create_transp_buf(&device, w, h);
             let spr = storage(&device, "spr", bytemuck::cast_slice(&crate::sprites::encoded()));
             let (_d, dv) = create_depth_texture(&device, w, h);
@@ -6315,8 +6539,8 @@ mod gpu_render_tests {
             let (_dd, ddv) = create_depth_texture(&device, 1, 1);
             let bgl = create_compute_bgl(&device);
             let vl_bufs = VoxLightBuffers::new(&device);
-            let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &gv, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &dv, &hv, &bv, &vl_bufs);
-            let bg_compose = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &ov, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &ddv, &gv, &dv, &vl_bufs);
+            let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &gv, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &lov, &tpb, &spr, &dv, &hv, &bv, &vl_bufs);
+            let bg_compose = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &ov, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &lov, &tpb, &spr, &ddv, &gv, &dv, &vl_bufs);
             let accel = crate::accel::build_world_accel(&device, &queue, &world);
             let rt_bgl = create_rt_bgl(&device);
             let (_gi_i, gi_iv) = create_lighting_texture(&device, w, h);
@@ -7704,14 +7928,24 @@ mod gpu_render_tests {
             "shadowed water reads at {shadow_ratio:.3} of its lit brightness; it must be \
              CLEARLY darker (below 0.58) without collapsing to black (above 0.20)"
         );
-        // The 20-90% ratio band is the penumbra. A per-voxel field interpolated
-        // over one cell and pushed through a narrow smoothstep crosses it in
-        // well under a cell; a photoreal falloff would put most of the shaded
-        // pixels in here.
+        // The 0.72-0.90 ratio band is the penumbra, and it must be REAL. The
+        // field stores a continuous fraction of the sun disc and interpolates it
+        // over eight records, so a shadow edge on water should occupy a band of
+        // pixels the same way it does on terrain. A narrow band means something
+        // downstream is re-hardening it - which is exactly what the smoothstep
+        // this assertion used to protect was doing.
+        //
+        // 2.5% is the threshold and the two sides of it are measured, not
+        // guessed: through the old smoothstep this scene read 1.1%, and reading
+        // `sun_vis` directly it reads 4.0%. The physical penumbra here is narrow
+        // by construction - the sun cone is 0.07 rad, so a wall five voxels away
+        // casts a sub-voxel one - which is why the number is small either way and
+        // why the RATIO between them is the signal.
         assert!(
-            (mid as f32) < 0.12 * shaded as f32,
-            "the light/shadow transition on water is {:.1}% of the shaded pixels - that is a \
-             smooth photoreal falloff, not the hard-ish stylized edge this look is built on",
+            (mid as f32) > 0.025 * shaded as f32,
+            "the light/shadow transition on water is only {:.1}% of the shaded pixels: the \
+             field's continuous sun visibility is being re-quantized into a hard edge \
+             somewhere between the record and the pixel",
             100.0 * mid as f32 / shaded.max(1) as f32,
         );
     }
@@ -8020,7 +8254,6 @@ mod gpu_render_tests {
         let (_b, bv) = create_beam_texture(&device, w, h);
         let (_c, csv, _csw) = create_cloud_texture(&device, w, h);
         let csamp = device.create_sampler(&wgpu::SamplerDescriptor { mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
-        let (_li, liv) = create_lighting_texture(&device, w, h);
         let (_lo, lov) = create_lighting_texture(&device, w, h);
         let tpb = create_transp_buf(&device, w, h);
         let spr = storage(&device, "spr", bytemuck::cast_slice(&crate::sprites::encoded()));
@@ -8033,8 +8266,8 @@ mod gpu_render_tests {
         // Main bg: output -> geom_tex; the geom_in/depth_in slots (20/21) point at
         // unrelated textures (history/beam) so cs_main's write target is never
         // also read - matches the live renderer's compute_bg.
-        let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &gv, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &dv, &hv, &bv, &vl_bufs);
-        let bg_compose = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &ov, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &ddv, &gv, &dv, &vl_bufs);
+        let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &gv, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &lov, &tpb, &spr, &dv, &hv, &bv, &vl_bufs);
+        let bg_compose = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &ov, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &lov, &tpb, &spr, &ddv, &gv, &dv, &vl_bufs);
         // A SECOND set of bindings differing in exactly one thing: an untouched
         // `VoxLightBuffers`, i.e. the state every measurement round so far ran
         // in. Same pipelines, same scene, same camera - so timing the shipped
@@ -8042,8 +8275,8 @@ mod gpu_render_tests {
         // been run, and it settles the question without any argument about how
         // much of the world the pool managed to cover.
         let vl_empty = VoxLightBuffers::new(&device);
-        let bg_nofield = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &gv, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &dv, &hv, &bv, &vl_empty);
-        let bg_compose_nofield = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &ov, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &ddv, &gv, &dv, &vl_empty);
+        let bg_nofield = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &gv, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &lov, &tpb, &spr, &dv, &hv, &bv, &vl_empty);
+        let bg_compose_nofield = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &ov, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &lov, &tpb, &spr, &ddv, &gv, &dv, &vl_empty);
 
         // Group-1 (RT).
         let accel = crate::accel::build_world_accel(&device, &queue, &world);
@@ -8107,7 +8340,7 @@ mod gpu_render_tests {
         // composition, same printed columns - so these numbers sit in the same
         // table as round A.
         sync_voxlight_shells(&mut world);
-        let vl_count =
+        let (vl_count, _) =
             upload_voxlight(&queue, &vl_bufs, &mut world, &mut VoxLightUploadStats::default());
         report_voxlight_binding(&world, vl_count);
         let vl_up = VoxLightUpdate {
@@ -8188,8 +8421,8 @@ mod gpu_render_tests {
         // times. The frame columns below are unaffected either way: they time
         // the raymarch, and the update pass does not run inside them.
         {
-            let focus = ab_camera(&world).pos;
-            world.set_light_focus(focus);
+            let focus = ab_camera(&world);
+            world.set_light_focus(focus.pos);
             let near = world.light.near_count();
             upload_voxlight_fresh(&queue, &vl_bufs, &world);
             let params_near = |round| voxlight_params(vl_count, round, 0, near);
@@ -8429,7 +8662,6 @@ mod gpu_render_tests {
         let (_b, bv) = create_beam_texture(&device, w, h);
         let (_c, csv, _csw) = create_cloud_texture(&device, w, h);
         let csamp = device.create_sampler(&wgpu::SamplerDescriptor { mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
-        let (_li, liv) = create_lighting_texture(&device, w, h);
         let (_lo, lov) = create_lighting_texture(&device, w, h);
         let tpb = create_transp_buf(&device, w, h);
         let spr = storage(&device, "spr", bytemuck::cast_slice(&crate::sprites::encoded()));
@@ -8438,7 +8670,7 @@ mod gpu_render_tests {
         let (_hh, hv) = create_output_texture(&device, w, h);
         let bgl = create_compute_bgl(&device);
         let vl_bufs = VoxLightBuffers::new(&device);
-        let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &gv, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &dv, &hv, &bv, &vl_bufs);
+        let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &gv, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &lov, &tpb, &spr, &dv, &hv, &bv, &vl_bufs);
         let accel = crate::accel::build_world_accel(&device, &queue, &world);
         let rt_bgl = create_rt_bgl(&device);
         let (_gi_i, gi_iv) = create_lighting_texture(&device, w, h);
@@ -8585,7 +8817,6 @@ mod gpu_render_tests {
         let (_b, bv) = create_beam_texture(&device, w, h);
         let (_c, csv, _csw) = create_cloud_texture(&device, w, h);
         let csamp = device.create_sampler(&wgpu::SamplerDescriptor { mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
-        let (_li, liv) = create_lighting_texture(&device, w, h);
         let (_lo, lov) = create_lighting_texture(&device, w, h);
         let tpb = create_transp_buf(&device, w, h);
         let spr = storage(&device, "spr", bytemuck::cast_slice(&crate::sprites::encoded()));
@@ -8595,8 +8826,8 @@ mod gpu_render_tests {
         let (_dd, ddv) = create_depth_texture(&device, 1, 1);
         let bgl = create_compute_bgl(&device);
         let vl_bufs = VoxLightBuffers::new(&device);
-        let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &gv, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &dv, &hv, &bv, &vl_bufs);
-        let bg_compose = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &_ov, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &ddv, &gv, &dv, &vl_bufs);
+        let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &gv, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &lov, &tpb, &spr, &dv, &hv, &bv, &vl_bufs);
+        let bg_compose = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &_ov, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &lov, &tpb, &spr, &ddv, &gv, &dv, &vl_bufs);
         let accel = crate::accel::build_world_accel(&device, &queue, &world);
         let rt_bgl = create_rt_bgl(&device);
         let (_gi_i, gi_iv) = create_lighting_texture(&device, w, h);
@@ -8810,7 +9041,6 @@ mod gpu_render_tests {
         let (_b, bv) = create_beam_texture(&device, w, h);
         let (_c, csv, _csw) = create_cloud_texture(&device, w, h);
         let csamp = device.create_sampler(&wgpu::SamplerDescriptor { mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
-        let (_li, liv) = create_lighting_texture(&device, w, h);
         let (_lo, lov) = create_lighting_texture(&device, w, h);
         let tpb = create_transp_buf(&device, w, h);
         let spr = storage(&device, "sprites", bytemuck::cast_slice(&crate::sprites::encoded()));
@@ -8819,8 +9049,8 @@ mod gpu_render_tests {
         let (_gt2, gv2) = create_hdr_texture(&device, w, h);
         let (_dd2, ddv2) = create_depth_texture(&device, 1, 1);
         let vl_bufs = VoxLightBuffers::new(&device);
-        let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &gv2, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &dv, &ov, &bv, &vl_bufs);
-        let bg_compose = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &ov, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr, &ddv2, &gv2, &dv, &vl_bufs);
+        let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &gv2, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &lov, &tpb, &spr, &dv, &ov, &bv, &vl_bufs);
+        let bg_compose = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &ov, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &lov, &tpb, &spr, &ddv2, &gv2, &dv, &vl_bufs);
         let pll = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
         let src = raymarch_source();
         let m = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(src.into()) });
@@ -9227,6 +9457,476 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
         (mean, q(0.5), q(0.99), v[v.len() - 1])
     }
 
+    /// THE SHIPPED FRAME, headless, at a real resolution and on the world a live
+    /// session left behind.
+    ///
+    /// WHY THIS EXISTS. `live_session_profile` used to time exactly one GPU pass
+    /// - the light-field update - in isolation, so it could say what that pass
+    /// cost and nothing about what a FRAME cost. The owner's report is about a
+    /// frame ("400 fps looking at the sky, 180 now"), and a sky-facing frame is
+    /// the one shape where the answer cannot be hidden inside shading: there is
+    /// almost no geometry, so almost nothing scales with what is visible and what
+    /// is left is the FIXED per-frame cost. Nothing measured it.
+    ///
+    /// Every pass the game runs per frame is here, in the shipped order and the
+    /// shipped configuration, so "fixed cost" means the same thing here as it
+    /// does in the game.
+    struct LiveFrameRig {
+        w: u32,
+        h: u32,
+        camera_buf: wgpu::Buffer,
+        /// Group-0 for the world passes (cs_main, cs_transparent, the two
+        /// update passes).
+        bg: wgpu::BindGroup,
+        /// Group-0 with the geometry/depth inputs rotated for cs_compose.
+        bg_compose: wgpu::BindGroup,
+        cloud_bg: wgpu::BindGroup,
+        beam_bg: wgpu::BindGroup,
+        /// Group-1, RT only.
+        rt_bg: Option<wgpu::BindGroup>,
+        clouds: wgpu::ComputePipeline,
+        beam: wgpu::ComputePipeline,
+        probe: Option<wgpu::ComputePipeline>,
+        vlight: wgpu::ComputePipeline,
+        main: wgpu::ComputePipeline,
+        transp: wgpu::ComputePipeline,
+        compose: wgpu::ComputePipeline,
+        /// The same two shading passes compiled with `PROF_VLF_COVERAGE`, which
+        /// paints every shaded surface green (the field answered) or red (it fell
+        /// through to the per-pixel path). See `coverage`.
+        main_cov: wgpu::ComputePipeline,
+        transp_cov: wgpu::ComputePipeline,
+        /// What cs_main and cs_transparent write, so `coverage` can read it back.
+        geom_tex: wgpu::Texture,
+        /// Resources the bind groups reference, held so they outlive them.
+        _keep: Vec<Box<dyn std::any::Any>>,
+    }
+
+    impl LiveFrameRig {
+        /// `rt` selects the SHIPPED configuration (RT primary + probe GI). The
+        /// software variant is built when the adapter has no ray query, so the
+        /// harness still reports something rather than skipping.
+        fn new(
+            device: &wgpu::Device,
+            queue: &wgpu::Queue,
+            world: &World,
+            vl: &VoxLightBuffers,
+            w: u32,
+            h: u32,
+            rt: bool,
+        ) -> Self {
+            let wo = world.world_origin_voxel();
+            let cam = ab_camera(world);
+            let cu = CameraUniform::from_camera(&cam, w, h, 0.0, 0.0, wo, [0.0, 0.0], 0.0);
+            let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("frame camera"),
+                contents: bytemuck::bytes_of(&cu),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+            let bricks = storage(device, "b", bytemuck::cast_slice(&world.bricks));
+            let tm = storage(device, "tm", bytemuck::cast_slice(&world.tile_mask));
+            let cm = storage(device, "cm", bytemuck::cast_slice(&world.chunk_mask));
+            let l4 = storage(device, "l4", bytemuck::cast_slice(&world.l4_mask));
+            let bu = storage(device, "bu", bytemuck::cast_slice(&pack_u8_to_u32(&world.brick_uniform)));
+            let tu = storage(device, "tu", bytemuck::cast_slice(&pack_u8_to_u32(&world.tile_uniform)));
+            let palette = default_palette();
+            let palette_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("palette"),
+                contents: bytemuck::cast_slice(&palette),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+            let (tw, th) = (w.div_ceil(8), h.div_ceil(8));
+            let words = ((tw * th) as usize).div_ceil(32);
+            let td = storage(device, "td", bytemuck::cast_slice(&vec![u32::MAX; words]));
+            let players = storage(device, "pl", &vec![0u8; 16 + MAX_REMOTE_PLAYERS * 16]);
+            let (out_tex, ov) = create_hdr_texture(device, w, h);
+            let (geom_tex, gv) = create_hdr_texture(device, w, h);
+            let (beam_tex, bv) = create_beam_texture(device, w, h);
+            let (cloud_tex, csv, cstore) = create_cloud_texture(device, w, h);
+            let csamp = device.create_sampler(&wgpu::SamplerDescriptor {
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                ..Default::default()
+            });
+            let (lo_tex, lov) = create_lighting_texture(device, w, h);
+            let tpb = create_transp_buf(device, w, h);
+            let spr = storage(device, "spr", bytemuck::cast_slice(&crate::sprites::encoded()));
+            let (d_tex, dv) = create_depth_texture(device, w, h);
+            let (hist_tex, hv) = create_output_texture(device, w, h);
+            let (dd_tex, ddv) = create_depth_texture(device, 1, 1);
+            let bgl = create_compute_bgl(device);
+            let bg = make_compute_bg(
+                device, &bgl, &camera_buf, &bricks, &tm, &cm, &palette_buf, &gv, &bv, &td,
+                &players, &bu, &tu, &l4, &csv, &csamp, &lov, &tpb, &spr, &dv, &hv, &bv, vl,
+            );
+            let bg_compose = make_compute_bg(
+                device, &bgl, &camera_buf, &bricks, &tm, &cm, &palette_buf, &ov, &bv, &td,
+                &players, &bu, &tu, &l4, &csv, &csamp, &lov, &tpb, &spr, &ddv, &gv, &dv, vl,
+            );
+            let cloud_bgl = create_cloud_bgl(device);
+            let cloud_bg = make_cloud_bg(device, &cloud_bgl, &camera_buf, &cstore);
+            let beam_bgl = create_beam_bgl(device);
+            let beam_bg = make_beam_bg(device, &beam_bgl, &camera_buf, &cm, &bv);
+
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("frame rig raymarch"),
+                source: wgpu::ShaderSource::Wgsl(raymarch_source_variant(rt).into()),
+            });
+            let mut layouts: Vec<Option<&wgpu::BindGroupLayout>> = vec![Some(&bgl)];
+            let rt_bgl = create_rt_bgl(device);
+            if rt {
+                layouts.push(Some(&rt_bgl));
+            }
+            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("frame rig pl"),
+                bind_group_layouts: &layouts,
+                immediate_size: 0,
+            });
+            // The SHIPPED overrides. `Renderer::new` compiles the RT pipelines
+            // with exactly these, so a pass timed here is the pass the game runs.
+            let consts: &[(&'static str, f64)] = if rt {
+                &[("GI_ENABLE", 1.0), ("RT_PRIMARY", 1.0), ("GI_PROBE_MODE", 1.0)]
+            } else {
+                &[]
+            };
+            let mk = |entry: &'static str| {
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(entry),
+                    layout: Some(&pl),
+                    module: &module,
+                    entry_point: Some(entry),
+                    compilation_options: wgpu::PipelineCompilationOptions {
+                        constants: consts,
+                        ..Default::default()
+                    },
+                    cache: None,
+                })
+            };
+            // cs_clouds and cs_beam have their own single-group layouts, exactly
+            // as in `Renderer::new`.
+            let cloud_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("cloud pl"),
+                bind_group_layouts: &[Some(&cloud_bgl)],
+                immediate_size: 0,
+            });
+            let beam_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("beam pl"),
+                bind_group_layouts: &[Some(&beam_bgl)],
+                immediate_size: 0,
+            });
+            // cs_beam lives in its own module (shaders/beam.wgsl), exactly as in
+            // `Renderer::new`; cs_clouds is in the raymarch module.
+            let beam_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("beam shader"),
+                source: wgpu::ShaderSource::Wgsl(
+                    format!(
+                        "{}\n{}\n{}",
+                        WORLD_CONSTS_WGSL, COMMON_WGSL, include_str!("../shaders/beam.wgsl")
+                    )
+                    .into(),
+                ),
+            });
+            let mk_small = |layout: &wgpu::PipelineLayout,
+                            m: &wgpu::ShaderModule,
+                            entry: &'static str| {
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(entry),
+                    layout: Some(layout),
+                    module: m,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    cache: None,
+                })
+            };
+
+            // The shipped overrides PLUS one more, for the diagnostic variants.
+            let mk_with = |entry: &'static str, extra: (&'static str, f64)| {
+                let consts: Vec<(&'static str, f64)> =
+                    consts.iter().cloned().chain(std::iter::once(extra)).collect();
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(entry),
+                    layout: Some(&pl),
+                    module: &module,
+                    entry_point: Some(entry),
+                    compilation_options: wgpu::PipelineCompilationOptions {
+                        constants: &consts,
+                        ..Default::default()
+                    },
+                    cache: None,
+                })
+            };
+
+            let mut keep: Vec<Box<dyn std::any::Any>> = vec![
+                Box::new(out_tex), Box::new(beam_tex), Box::new(cloud_tex),
+                Box::new(lo_tex), Box::new(d_tex), Box::new(dd_tex),
+                Box::new(hist_tex), Box::new(bricks), Box::new(tm), Box::new(cm), Box::new(l4),
+                Box::new(bu), Box::new(tu), Box::new(palette_buf), Box::new(td),
+                Box::new(players), Box::new(tpb), Box::new(spr),
+            ];
+            let rt_bg = if rt {
+                let accel = crate::accel::build_world_accel(device, queue, world);
+                let (gi_i, gi_iv) = create_lighting_texture(device, w, h);
+                let (gi_o, gi_ov) = create_lighting_texture(device, w, h);
+                let probe_buf = create_probe_buf(device);
+                let bg = make_rt_bg(device, &rt_bgl, &accel, &gi_iv, &gi_ov, &probe_buf);
+                keep.push(Box::new(accel));
+                keep.push(Box::new(gi_i));
+                keep.push(Box::new(gi_o));
+                keep.push(Box::new(probe_buf));
+                Some(bg)
+            } else {
+                None
+            };
+            Self {
+                w,
+                h,
+                bg,
+                bg_compose,
+                cloud_bg,
+                beam_bg,
+                rt_bg,
+                clouds: mk_small(&cloud_pl, &module, "cs_clouds"),
+                beam: mk_small(&beam_pl, &beam_module, "cs_beam"),
+                probe: rt.then(|| mk("cs_gi_probe_update")),
+                vlight: mk("cs_voxel_light_update"),
+                main: mk("cs_main"),
+                transp: mk("cs_transparent"),
+                compose: mk("cs_compose"),
+                main_cov: mk_with("cs_main", ("PROF_VLF_COVERAGE", 1.0)),
+                transp_cov: mk_with("cs_transparent", ("PROF_VLF_COVERAGE", 1.0)),
+                geom_tex,
+                camera_buf,
+                _keep: keep,
+            }
+        }
+
+        /// What fraction of SHADED pixels the light field actually answers for.
+        ///
+        /// Returns `(field, fallback, unshaded)` pixel counts. Runs cs_main and
+        /// cs_transparent compiled with `PROF_VLF_COVERAGE`, so every opaque and
+        /// water surface writes a flat green or red and the counts are exact
+        /// rather than inferred. Sky, and the few surfaces that never consult the
+        /// field at all (glass), land in `unshaded`.
+        fn coverage(&self, device: &wgpu::Device, queue: &wgpu::Queue, vl_wgs: u32) -> (u64, u64, u64) {
+            let data = self.shade_and_read(device, queue, vl_wgs, true);
+            // The probe writes exactly (0,1,0) or (1,0,0), and both survive f16
+            // losslessly, so the classification is a BIT PATTERN comparison
+            // rather than a threshold: 1.0 is 0x3C00 and 0.0 is 0x0000. Nothing
+            // else in the frame can forge either triple.
+            const ONE: u16 = 0x3C00;
+            let (mut field, mut fallback, mut other) = (0u64, 0u64, 0u64);
+            for px in data.chunks_exact(4) {
+                match (px[0], px[1], px[2]) {
+                    (0, ONE, 0) => field += 1,
+                    (ONE, 0, 0) => fallback += 1,
+                    _ => other += 1,
+                }
+            }
+            (field, fallback, other)
+        }
+
+        /// Run the light update, then cs_main + cs_transparent, and read the
+        /// shaded geometry buffer back as raw f16 RGBA. `probe` swaps in the
+        /// coverage-painting variants.
+        fn shade_and_read(
+            &self,
+            device: &wgpu::Device,
+            queue: &wgpu::Queue,
+            vl_wgs: u32,
+            probe: bool,
+        ) -> Vec<u16> {
+            let (tw, th) = (self.w.div_ceil(8), self.h.div_ceil(8));
+            let mut e = device.create_command_encoder(&Default::default());
+            self.encode_pass(&mut e, "vlight", vl_wgs);
+            let pipes = if probe {
+                [&self.main_cov, &self.transp_cov]
+            } else {
+                [&self.main, &self.transp]
+            };
+            for pipe in pipes {
+                let mut cp = e.begin_compute_pass(&Default::default());
+                cp.set_pipeline(pipe);
+                cp.set_bind_group(0, &self.bg, &[]);
+                if let Some(rt) = &self.rt_bg {
+                    cp.set_bind_group(1, rt, &[]);
+                }
+                cp.dispatch_workgroups(tw, th, 1);
+            }
+            // Rgba16Float, so a row is w*8 bytes; 1920*8 is already a multiple of
+            // the 256-byte copy alignment, but round up so an odd width still
+            // works.
+            let row = (self.w * 8).div_ceil(256) * 256;
+            let staging = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("coverage readback"),
+                size: row as u64 * self.h as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            e.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.geom_tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &staging,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(row),
+                        rows_per_image: Some(self.h),
+                    },
+                },
+                wgpu::Extent3d { width: self.w, height: self.h, depth_or_array_layers: 1 },
+            );
+            queue.submit(std::iter::once(e.finish()));
+            let slice = staging.slice(..);
+            slice.map_async(wgpu::MapMode::Read, |_| {});
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            let data = slice.get_mapped_range().unwrap();
+            let mut out = Vec::with_capacity(self.w as usize * self.h as usize * 4);
+            for y in 0..self.h as usize {
+                let base = y * row as usize;
+                out.extend_from_slice(bytemuck::cast_slice::<u8, u16>(
+                    &data[base..base + self.w as usize * 8],
+                ));
+            }
+            out
+        }
+
+        fn look(&self, queue: &wgpu::Queue, cam: &Camera, wo: glam::IVec3) {
+            let cu = CameraUniform::from_camera(cam, self.w, self.h, 0.0, 0.0, wo, [0.0, 0.0], 0.0);
+            queue.write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&cu));
+        }
+
+
+        /// Encode ONE named pass. `vl_wgs` is the light update's dispatch size;
+        /// 0 means "the frame skips it", which is the whole point of the gate.
+        fn encode_pass(&self, e: &mut wgpu::CommandEncoder, pass: &str, vl_wgs: u32) {
+            let (tw, th) = (self.w.div_ceil(8), self.h.div_ceil(8));
+            match pass {
+                "clouds" => {
+                    let mut cp = e.begin_compute_pass(&Default::default());
+                    cp.set_pipeline(&self.clouds);
+                    cp.set_bind_group(0, &self.cloud_bg, &[]);
+                    cp.dispatch_workgroups(((self.w + 1) / 2).div_ceil(8), ((self.h + 1) / 2).div_ceil(8), 1);
+                }
+                "beam" => {
+                    let mut cp = e.begin_compute_pass(&Default::default());
+                    cp.set_pipeline(&self.beam);
+                    cp.set_bind_group(0, &self.beam_bg, &[]);
+                    cp.dispatch_workgroups(tw.div_ceil(8), th.div_ceil(8), 1);
+                }
+                "probe" => {
+                    let (Some(p), Some(rt)) = (&self.probe, &self.rt_bg) else { return };
+                    let mut cp = e.begin_compute_pass(&Default::default());
+                    cp.set_pipeline(p);
+                    cp.set_bind_group(0, &self.bg, &[]);
+                    cp.set_bind_group(1, rt, &[]);
+                    let threads = crate::voxel::PROBE_TOTAL / GI_PROBE_UPDATE_DIV;
+                    cp.dispatch_workgroups(threads.div_ceil(64), 1, 1);
+                }
+                "vlight" => {
+                    if vl_wgs == 0 {
+                        return;
+                    }
+                    let mut cp = e.begin_compute_pass(&Default::default());
+                    cp.set_pipeline(&self.vlight);
+                    cp.set_bind_group(0, &self.bg, &[]);
+                    if let Some(rt) = &self.rt_bg {
+                        cp.set_bind_group(1, rt, &[]);
+                    }
+                    cp.dispatch_workgroups(vl_wgs, 1, 1);
+                }
+                _ => {
+                    let (pipe, bind) = match pass {
+                        "main" => (&self.main, &self.bg),
+                        "transp" => (&self.transp, &self.bg),
+                        "compose" => (&self.compose, &self.bg_compose),
+                        other => panic!("unknown pass {other}"),
+                    };
+                    let mut cp = e.begin_compute_pass(&Default::default());
+                    cp.set_pipeline(pipe);
+                    cp.set_bind_group(0, bind, &[]);
+                    if let Some(rt) = &self.rt_bg {
+                        cp.set_bind_group(1, rt, &[]);
+                    }
+                    cp.dispatch_workgroups(tw, th, 1);
+                }
+            }
+        }
+
+        /// Milliseconds per submit for the listed passes, submitted together the
+        /// way the frame submits them.
+        ///
+        /// Warm-up is long for the reason `rt_vs_software_timing` documents: these
+        /// dispatches are sub-millisecond and a handful of them never brings the
+        /// GPU off its idle clock.
+        fn time(
+            &self,
+            device: &wgpu::Device,
+            queue: &wgpu::Queue,
+            passes: &[&str],
+            vl_wgs: u32,
+        ) -> f64 {
+            let encode = || {
+                let mut e = device.create_command_encoder(&Default::default());
+                for p in passes {
+                    self.encode_pass(&mut e, p, vl_wgs);
+                }
+                e.finish()
+            };
+            for _ in 0..20 {
+                queue.submit(std::iter::once(encode()));
+            }
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            let n = 60;
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                queue.submit(std::iter::once(encode()));
+            }
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            t.elapsed().as_secs_f64() * 1000.0 / n as f64
+        }
+    }
+
+    /// The world/screen passes a shipped frame runs, in `Renderer::render`'s
+    /// order (see `GPU_PROFILE_LABELS`). TAA, post and blit are left out: they
+    /// are fixed screen-space cost that nothing here changes.
+    const FRAME_PASSES: [&str; 7] =
+        ["vlight", "clouds", "beam", "probe", "main", "transp", "compose"];
+
+    /// Cameras the frame section measures.
+    ///
+    /// `sky` is the one the owner's report is about and the one nothing measured:
+    /// pitched steeply up, so the frame is almost entirely sky and almost nothing
+    /// in it scales with visible geometry. Whatever it costs is the FIXED cost.
+    fn live_frame_segments(world: &World) -> Vec<(&'static str, Camera)> {
+        let (water_anchor, leaf_anchor, leaf_ground) = find_scene_anchors(world);
+        let sky = {
+            let mut c = ab_camera(world);
+            c.pitch = 1.15; // ~66 degrees up: sky fills the frame
+            c
+        };
+        let foliage = {
+            let mut c = Camera::new();
+            c.pos = glam::Vec3::new(
+                clamp_anchor(leaf_anchor.x),
+                leaf_ground as f32 + 14.0,
+                clamp_anchor(leaf_anchor.y) - 30.0,
+            );
+            c.pitch = -0.35;
+            c
+        };
+        let water = {
+            let mut c = Camera::new();
+            c.pos = glam::Vec3::new(clamp_anchor(water_anchor.x), 71.0, clamp_anchor(water_anchor.y) - 8.0);
+            c.pitch = -0.22;
+            c
+        };
+        vec![("sky", sky), ("terrain", ab_camera(world)), ("foliage", foliage), ("water", water)]
+    }
+
     /// A LIVE SESSION, headless: the real world, real physics, real streaming,
     /// the real upload path, and the update dispatch at the block count a
     /// STREAMED world actually binds.
@@ -9258,9 +9958,18 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
     #[test]
     #[ignore]
     fn live_session_profile() {
-        let Some((device, queue, _gpu)) = headless_device() else {
-            eprintln!("live_session_profile: no GPU adapter, skipping");
-            return;
+        // The SHIPPED configuration is RT primary + probe GI, so that is the one
+        // to measure. The software device is a fallback so a non-RT machine still
+        // gets the CPU half rather than nothing at all.
+        let (rt, (device, queue, _gpu)) = match rt_headless_device() {
+            Some(d) => (true, d),
+            None => match headless_device() {
+                Some(d) => (false, d),
+                None => {
+                    eprintln!("live_session_profile: no GPU adapter, skipping");
+                    return;
+                }
+            },
         };
         let frames: u32 = std::env::var("VOXELG_PROFILE_FRAMES")
             .ok()
@@ -9279,7 +9988,7 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
         world.sync_light_shell_all();
         let init_shell = t0.elapsed().as_secs_f64() * 1000.0;
         let t1 = std::time::Instant::now();
-        let init_count = upload_voxlight(&queue, &vl, &mut world, &mut stats);
+        let (init_count, _) = upload_voxlight(&queue, &vl, &mut world, &mut stats);
         let init_upload = t1.elapsed().as_secs_f64() * 1000.0;
         world.all_dirty = false;
         world.dirty_bricks.clear();
@@ -9308,6 +10017,11 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
         let (mut count_min, mut count_max) = (u32::MAX, 0u32);
         let mut shifts = 0u32;
         let (mut near_min, mut near_max) = (u32::MAX, 0u32);
+        // THE GATE, run with the same type the renderer uses, so this counts the
+        // dispatches the game would actually issue rather than a model of them.
+        let mut sched = VoxLightSchedule::default();
+        let (mut sweeps, mut dispatch_frames) = (0u32, 0u32);
+        let (mut wgs_total, mut urgent_total) = (0u64, 0u64);
 
         let session = std::time::Instant::now();
         for frame in 0..frames {
@@ -9343,6 +10057,9 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
             world.dirty_bricks.dedup();
             dirty_total += world.dirty_bricks.len() as u64;
             dirty_max = dirty_max.max(world.dirty_bricks.len());
+            if !world.dirty_bricks.is_empty() {
+                sched.mark_dirty();
+            }
             t = std::time::Instant::now();
             world.set_light_focus(cam.pos);
             focus_ms.push(t.elapsed().as_secs_f64() * 1000.0);
@@ -9351,7 +10068,7 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
             let shell = t.elapsed();
             shell_ms.push(shell.as_secs_f64() * 1000.0);
             t = std::time::Instant::now();
-            let live_count = upload_voxlight(&queue, &vl, &mut world, &mut stats);
+            let (live_count, urgent) = upload_voxlight(&queue, &vl, &mut world, &mut stats);
             upload_ms.push(t.elapsed().as_secs_f64() * 1000.0);
             // Feed the same counters `Renderer::upload_world` feeds, so this
             // harness's summary line and the live game's log line are the same
@@ -9360,11 +10077,25 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
             stats.upload_ns += t.elapsed().as_nanos() as u64;
             stats.live = live_count;
             stats.near = world.light.near_count();
+            stats.urgent += urgent as u64;
             count_min = count_min.min(live_count);
             count_max = count_max.max(live_count);
             let near = world.light.near_count();
             near_min = near_min.min(near);
             near_max = near_max.max(near);
+            // THE GATE, exactly as `Renderer::render` runs it: the sun clock
+            // advances with the session clock, the schedule decides whether a
+            // sweep round is owed, and the dispatch is the urgent list plus that
+            // round or nothing at all.
+            let now = frame as f32 * dt;
+            sched.accrue(now, now);
+            let sweep = sched.take_round();
+            sweeps += sweep as u32;
+            let wgs = urgent
+                + if sweep { voxlight_dispatch_blocks(live_count, near) } else { 0 };
+            dispatch_frames += (wgs > 0) as u32;
+            wgs_total += wgs as u64;
+            urgent_total += urgent as u64;
             world.dirty_bricks.clear();
             // `upload_mask_clears` consumes these in the game; drop them so the
             // list cannot grow without bound and distort the streaming timer.
@@ -9402,54 +10133,129 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
         let near_now = world.light.near_count();
         let live_now = world.light.allocated() as u32;
         eprintln!(
-            "  near prefix {near_min}..{near_max} of the work list; dispatch {} workgroups              against {} if the whole shell were near",
+            "  near prefix {near_min}..{near_max} of the work list; a sweep round is {} workgroups \
+             against {} if the whole shell were near",
             voxlight_dispatch_blocks(live_now, near_now),
             voxlight_dispatch_blocks(live_now, live_now),
         );
+        // THE GATE'S OUTPUT, which is the number Task 1 exists to move. The old
+        // schedule dispatched a full sweep round on EVERY frame; this reports how
+        // many frames actually carried a dispatch and how big it was on average.
+        let sweep_wgs = voxlight_dispatch_blocks(live_now, near_now) as f64;
+        eprintln!(
+            "  DISPATCH GATE: {dispatch_frames} / {frames} frames dispatched ({:.0}%), \
+             {sweeps} sweep rounds, {:.0} wgs/frame mean ({urgent_total} urgent bricks total) \
+             - against {frames} frames x {sweep_wgs:.0} wgs on the frame-counter schedule",
+            100.0 * dispatch_frames as f64 / frames as f64,
+            wgs_total as f64 / frames as f64,
+        );
+        // The point of pacing the sweep by the SUN is that its cost is fixed per
+        // SECOND, so the per-FRAME cost falls as the frame rate rises. This
+        // session runs at 60 Hz because streaming needs wall-clock time to
+        // produce chunks, so the higher rates are derived from the two measured
+        // rates rather than simulated - they are exact, because the schedule is a
+        // pure function of elapsed time and sun angle.
+        let rounds_per_s = sweeps as f64 / secs;
+        let urgent_per_s = urgent_total as f64 / secs;
+        eprint!(
+            "  per second: {rounds_per_s:.1} sweep rounds + {urgent_per_s:.0} urgent bricks \
+             => wgs/frame at"
+        );
+        for fps in [60.0, 144.0, 240.0, 400.0] {
+            eprint!(
+                "  {fps:.0}fps {:.0}",
+                (rounds_per_s * sweep_wgs + urgent_per_s) / fps,
+            );
+        }
+        eprintln!("  (frame-counter schedule: {sweep_wgs:.0} at every rate)");
 
-        // ---- GPU: the update pass at the size a live world actually asks for.
-        // Built from the world the session LEFT BEHIND, so the brick data the
-        // shadow rays traverse is the streamed one rather than the pristine
-        // generated one.
-        let g0 = VoxLightGroup0::new(&device, &world, VL_SUN_TIME, &vl);
+        // ---- GPU: the SHIPPED FRAME, at a real resolution, on the world the
+        // session LEFT BEHIND - so the brick data every ray traverses is the
+        // streamed one rather than the pristine generated one.
+        let (fw, fh) = (1920u32, 1080u32);
+        let rig = LiveFrameRig::new(&device, &queue, &world, &vl, fw, fh, rt);
         let count = upload_voxlight_fresh(&queue, &vl, &world);
         assert_eq!(count, live_now, "the GPU section must time the world the session left");
-        // `near` has to reach BOTH the dispatch size and the uniform: the shader
-        // derives the near/far boundary from the uniform, so a closure that
-        // pinned one value while the dispatch used another would size the launch
-        // for one partition and walk a different one.
-        let time_update = |n: u32, near: u32| -> f64 {
-            let params_at = move |round| voxlight_params(n, round, 0, near);
-            let up = VoxLightUpdate {
-                device: &device, queue: &queue, vl: &vl, bg: &g0.bg, rt_bg: None,
-                light: &g0.update, count: n, near,
-            };
-            // A long warm-up, for the reason `rt_vs_software_timing` documents:
-            // these dispatches are sub-millisecond, so a handful of them never
-            // brings the GPU off its idle clock and the first measurement comes
-            // back at twice the other two.
-            up.converge(200, params_at);
-            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-            let t = std::time::Instant::now();
-            up.converge(60, params_at);
-            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-            t.elapsed().as_secs_f64() * 1000.0 / 60.0
-        };
-        eprintln!("GPU, per frame (cs_voxel_light_update, software variant):");
-        // The camera-blind cost (everything near, i.e. the pre-policy dispatch)
-        // against the cost this session's actual partition asks for. Same world,
-        // same pipeline, same submit-and-wait timing: the only difference is how
-        // much of the shell the pass is told to refresh this frame.
-        eprintln!(
-            "  whole shell near ({count} blocks, {} wgs): {:.2} ms",
-            voxlight_dispatch_blocks(count, count),
-            time_update(count, count),
+
+        // CONVERGE the field before anything is timed. An unconverged field
+        // reports invalid for every tap and shading falls back, so a frame timed
+        // against it is a frame of the path the field exists to replace.
+        let converge_wgs = voxlight_dispatch_blocks(count, count);
+        for round in 0..VOXLIGHT_CONVERGE_ROUNDS {
+            queue.write_buffer(
+                &vl.params, 0,
+                bytemuck::bytes_of(&voxlight_params(count, round, 0, count)),
+            );
+            let mut e = device.create_command_encoder(&Default::default());
+            rig.encode_pass(&mut e, "vlight", converge_wgs);
+            queue.submit(std::iter::once(e.finish()));
+        }
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+
+        let wgs_near = voxlight_dispatch_blocks(count, near_now);
+        let wgs_all = voxlight_dispatch_blocks(count, count);
+        queue.write_buffer(
+            &vl.params, 0,
+            bytemuck::bytes_of(&voxlight_params(count, 0, 0, near_now)),
         );
         eprintln!(
-            "  camera-aware      ({near_now} near, {} wgs): {:.2} ms",
-            voxlight_dispatch_blocks(count, near_now),
-            time_update(count, near_now),
+            "\nGPU, {fw}x{fh}, {} variant, {count} live blocks ({near_now} near => {wgs_near} wgs, \
+             {wgs_all} if the whole shell were near):",
+            if rt { "RT primary + probe GI (SHIPPED)" } else { "software" },
         );
+        eprintln!(
+            "  {:<10} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} | {:>8} {:>8} {:>9}",
+            "segment", "vlight", "clouds", "beam", "probe", "main", "transp", "compose",
+            "FIXED", "frame", "no-vlight",
+        );
+        let wo_now = world.world_origin_voxel();
+        for (name, cam) in live_frame_segments(&world) {
+            rig.look(&queue, &cam, wo_now);
+            let mut per = [0.0f64; FRAME_PASSES.len()];
+            for (i, p) in FRAME_PASSES.iter().enumerate() {
+                per[i] = rig.time(&device, &queue, &[p], wgs_near);
+            }
+            let frame = rig.time(&device, &queue, &FRAME_PASSES, wgs_near);
+            // THE WITHIN-RUN CONTROL: the same frame with the light update
+            // dispatch size forced to zero, i.e. exactly what the gate encodes on
+            // a frame where nothing is due. Measured back to back with the line
+            // above, so a drifting GPU clock cannot forge the difference.
+            let frame_skipped = rig.time(&device, &queue, &FRAME_PASSES, 0);
+            // FIXED = the passes whose cost does not depend on what is on screen:
+            // the two world-space update passes. Everything else scales with the
+            // pixels that hit something.
+            let fixed = per[0] + per[3];
+            eprintln!(
+                "  {name:<10} {:7.3} {:7.3} {:7.3} {:7.3} {:7.3} {:7.3} {:7.3} | {fixed:8.3} \
+                 {frame:8.3} {frame_skipped:9.3}",
+                per[0], per[1], per[2], per[3], per[4], per[5], per[6],
+            );
+        }
+
+        // cs_main used to be timed here BOTH ways - with and without the
+        // screen-space shadow/AO reprojection cache - because whether a second
+        // lighting mechanism still paid for itself was a measurement, not an
+        // opinion. It did not (still camera: terrain 4.73 ms with, 4.30 ms
+        // without), so the cache is gone and so is the override that switched it.
+        // The number is recorded in raymarch.wgsl beside the binding it removed.
+
+        // ---- WHAT THE FIELD ACTUALLY COVERS, which decides whether the
+        // per-pixel fallback can be deleted at all.
+        eprintln!(
+            "\nField coverage of SHADED pixels (green = field answered, red = fell back to the \
+             per-pixel path):"
+        );
+        for (name, cam) in live_frame_segments(&world) {
+            rig.look(&queue, &cam, wo_now);
+            let (f, b, o) = rig.coverage(&device, &queue, wgs_near);
+            let shaded = (f + b).max(1);
+            eprintln!(
+                "  {name:<10} field {f:8} ({:6.3}% of shaded)  fallback {b:8} ({:6.3}%)  \
+                 unshaded (sky/glass) {o:8}",
+                100.0 * f as f64 / shaded as f64,
+                100.0 * b as f64 / shaded as f64,
+            );
+        }
     }
 
     /// Group-0 bindings plus the light-field pipelines for a headless harness.
@@ -9514,7 +10320,6 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 min_filter: wgpu::FilterMode::Linear,
                 ..Default::default()
             });
-            let (lin_tex, light_in_view) = create_lighting_texture(device, w, h);
             let (lout_tex, light_out_view) = create_lighting_texture(device, w, h);
             let transp_buf = create_transp_buf(device, w, h);
             let sprites_buf =
@@ -9526,7 +10331,7 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
                 &palette_buf, &output_view, &beam_view, &tile_dirty_buf, &players_buf,
                 &bu, &tu, &l4_mask_buf, &cloud_sampled_view, &cloud_sampler,
-                &light_in_view, &light_out_view, &transp_buf, &sprites_buf,
+                &light_out_view, &transp_buf, &sprites_buf,
                 &dummy_depth_view, &geom_view, &depth_view, vl,
             );
 
@@ -9558,7 +10363,7 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
 
             let keep: Vec<Box<dyn std::any::Any>> = vec![
                 Box::new(out_tex), Box::new(geom_tex), Box::new(beam_tex), Box::new(cloud_tex),
-                Box::new(lin_tex), Box::new(lout_tex), Box::new(depth_tex), Box::new(ddepth_tex),
+                Box::new(lout_tex), Box::new(depth_tex), Box::new(ddepth_tex),
                 Box::new(bricks_buf), Box::new(tile_mask_buf),
                 Box::new(chunk_mask_buf), Box::new(l4_mask_buf), Box::new(bu), Box::new(tu),
                 Box::new(palette_buf), Box::new(tile_dirty_buf), Box::new(players_buf),
@@ -9578,6 +10383,11 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
         probe: wgpu::ComputePipeline,
         /// Blocks bound for this world, i.e. the update pass's dispatch size.
         count: u32,
+        /// The update pass reads `world_origin` and `sun_time` from here.
+        camera_buf: wgpu::Buffer,
+        /// Window origin the camera uniform must keep quoting, so `set_sun` can
+        /// rebuild the uniform without re-deriving it.
+        world_origin: glam::IVec3,
         /// Screen-space bindings the update pass never reads. Held only so the
         /// bind group's resources outlive it.
         _keep: Vec<Box<dyn std::any::Any>>,
@@ -9598,19 +10408,30 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
             // same order: decide which bricks carry lit shell, then upload the
             // brick table and the compact work list.
             world.sync_light_shell_all();
-            let count = upload_voxlight(&queue, &vl, world, &mut VoxLightUploadStats::default());
+            let (count, _) =
+                upload_voxlight(&queue, &vl, world, &mut VoxLightUploadStats::default());
             assert!(
                 count < VL_PROBE_BLOCK,
                 "crafted scene bound {count} blocks and would collide with the probe scratch at {VL_PROBE_BLOCK}",
             );
 
             let g = VoxLightGroup0::new(&device, world, sun_time, &vl);
-            let mut keep = g.keep;
-            keep.push(Box::new(g.camera_buf));
             Some(Self {
                 vl, bg: g.bg, update: g.update, probe: g.probe, count,
-                _keep: keep, queue, device, _gpu: gpu,
+                camera_buf: g.camera_buf, world_origin: world.world_origin_voxel(),
+                _keep: g.keep, queue, device, _gpu: gpu,
             })
+        }
+
+        /// Move the sun. The update pass reads `camera.sun_time`, so this is how
+        /// a test asks what the field converges to under a DIFFERENT sun without
+        /// rebuilding anything.
+        fn set_sun(&self, sun_time: f32) {
+            let cam = Camera::new();
+            let cu = CameraUniform::from_camera(
+                &cam, 8, 8, sun_time, sun_time, self.world_origin, [0.0, 0.0], 0.0,
+            );
+            self.queue.write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&cu));
         }
 
         /// Run `rounds` update rounds through the shared loop.
@@ -9654,7 +10475,8 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 // near, i.e. exactly the cadence the field shipped with.
                 near_count: self.count,
                 far_div: VOXLIGHT_FAR_DIV,
-                _pad: [0; 2],
+                urgent_count: 0,
+                sweep: 1,
             });
         }
 
@@ -10161,6 +10983,343 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
             "a converged record in the penumbra swings {band_worst}/255 over one epoch cycle,              more than half the width of the water smoothstep ({}/255): water at a shadow edge              strobes between lit and shadowed on a scene that is not moving",
             (band_hi - band_lo) as u32,
         );
+    }
+
+    /// THE DISPATCH IS GENUINELY SKIPPED, not merely made cheaper.
+    ///
+    /// This is the claim Task 1 rests on, and it is a property of
+    /// `VoxLightSchedule` alone, so it is checked directly rather than inferred
+    /// from a timing. Four regimes:
+    ///
+    ///  - frozen sun, nothing dirty: NO rounds, for ever;
+    ///  - shipped sun at 60 fps: one round per frame, which is exactly the
+    ///    frame-counter cadence this replaces - the LOOK is unchanged;
+    ///  - shipped sun at 400 fps: the same rounds per SECOND, so about one frame
+    ///    in seven, which is where the saving comes from;
+    ///  - a geometry edit: one complete sweep of the shell and then quiet again.
+    #[test]
+    fn the_light_sweep_stops_when_the_sun_and_the_world_do() {
+        // 1. FROZEN SUN. `sun_dir_at` is fed the same clock every frame while
+        //    wall time advances, which is what --freeze-time and VOXELG_BENCH do.
+        let mut s = VoxLightSchedule::default();
+        s.accrue(0.0, 30.0);
+        // The first call has no history and treats everything as due; drain it.
+        while s.take_round() {}
+        let mut rounds = 0;
+        for f in 1..600 {
+            s.accrue(f as f32 / 60.0, 30.0);
+            rounds += s.take_round() as u32;
+        }
+        assert_eq!(
+            rounds, 0,
+            "the sweep ran {rounds} times over 600 frames with a frozen sun and no edits; \
+             every one of those dispatches would have written bytes identical to the ones \
+             already in the pool"
+        );
+
+        // 2. SHIPPED SUN AT 60 fps: unchanged from the frame-counter cadence.
+        let mut s = VoxLightSchedule::default();
+        s.accrue(0.0, 0.0);
+        while s.take_round() {}
+        let mut rounds = 0;
+        for f in 1..600 {
+            let t = f as f32 / 60.0;
+            s.accrue(t, t);
+            rounds += s.take_round() as u32;
+        }
+        assert!(
+            (595..=599).contains(&rounds),
+            "at 60 fps the sun should buy one round per frame (599 over 599 frames), got {rounds}"
+        );
+
+        // 3. SHIPPED SUN AT 400 fps: the same rounds per SECOND.
+        let mut s = VoxLightSchedule::default();
+        s.accrue(0.0, 0.0);
+        while s.take_round() {}
+        let mut rounds = 0;
+        for f in 1..4000 {
+            let t = f as f32 / 400.0;
+            s.accrue(t, t);
+            rounds += s.take_round() as u32;
+        }
+        // 4000 frames is 10 s of sun, i.e. 600 rounds' worth however fast the
+        // frames come.
+        assert!(
+            (590..=610).contains(&rounds),
+            "at 400 fps the sweep should still cost ~600 rounds per 10 s (one frame in seven), \
+             got {rounds} - the schedule is still coupled to the frame rate"
+        );
+
+        // 4. A GEOMETRY EDIT arms one complete sweep and then stops. Frozen sun,
+        //    so the sweep can only come from the edit.
+        let mut s = VoxLightSchedule::default();
+        s.accrue(0.0, 30.0);
+        while s.take_round() {}
+        s.mark_dirty();
+        let mut rounds = 0;
+        for f in 1..2000 {
+            s.accrue(f as f32 / 60.0, 30.0);
+            rounds += s.take_round() as u32;
+        }
+        // One complete sweep, plus at most the round or two of credit still
+        // banked when the counter ran out (`VOXLIGHT_ROUND_CREDIT_MAX`). What
+        // this pins is that the sweep is BOUNDED and that it STOPS.
+        let sweep = VOXLIGHT_UPDATE_DIV * VOXLIGHT_FAR_DIV;
+        assert!(
+            (sweep..=sweep + 2).contains(&rounds),
+            "one edit must buy one complete sweep of the shell ({sweep} rounds) and then go \
+             quiet; it ran {rounds} over 2000 frames"
+        );
+    }
+
+    /// SPIN 180 DEGREES AND SEE WHAT IT COSTS.
+    ///
+    /// Written to judge a FRUSTUM-SCOPED near tier, which it then failed - see
+    /// `World::set_light_focus` for the table and the decision. It is kept
+    /// because the question outlives the answer: the shipped tier is 64 voxels
+    /// of radius, most of what is on screen is outside it and therefore on the
+    /// far cadence anyway, and this says what that costs when the camera moves.
+    /// It measures end to end, in pixels, on the shipped frame:
+    ///
+    ///  1. converge everything at sun T0 - the settled state before the turn;
+    ///  2. advance the sun by one FAR period and run the update with the
+    ///     partition built for the camera FACING AWAY, so the shell behind it
+    ///     gets exactly the one far visit it would really get;
+    ///  3. turn the camera around, rebuild the partition, and render EVERY FRAME
+    ///     of the recovery against a fully converged reference, reporting the
+    ///     per-pixel error frame by frame.
+    ///
+    /// The thing that makes this bounded rather than a pop: a far block keeps a
+    /// VALID record, so no pixel changes shading path. The error is a shadow in
+    /// slightly the wrong place, and the recovery is that shadow sliding home.
+    ///
+    /// Measured on the shipped rule: at the moment of the turn, mean 0.204/255,
+    /// p99 6.5, max 54.3 against a converged field - and it decays smoothly to
+    /// 0.096/255 mean, p99 2.3 over 1.05 s. Nothing pops; the whole magnitude is
+    /// well under a percent of full scale on all but a handful of pixels.
+    #[test]
+    #[ignore]
+    fn voxlight_turnaround_artifact() {
+        let (rt, (device, queue, _gpu)) = match rt_headless_device() {
+            Some(d) => (true, d),
+            None => match headless_device() {
+                Some(d) => (false, d),
+                None => {
+                    eprintln!("voxlight_turnaround_artifact: no GPU adapter, skipping");
+                    return;
+                }
+            },
+        };
+        let (w, h) = (960u32, 540u32);
+        let mut world = World::new();
+        world.fill_demo_terrain();
+        world.sync_light_shell_all();
+        let wo = world.world_origin_voxel();
+        let vl = VoxLightBuffers::new(&device);
+        let rig = LiveFrameRig::new(&device, &queue, &world, &vl, w, h, rt);
+
+        // The camera that will be TURNED TO, and the pose it turns FROM.
+        let mut facing = ab_camera(&world);
+        facing.pitch = -0.25;
+        let mut away = facing.clone();
+        away.yaw += std::f32::consts::PI;
+
+        // FOUR far sweep periods of standing still facing the wrong way, so the
+        // far tier is not merely one visit behind but has had four chances to
+        // fall behind a continuously moving sun. At 60 fps that is 4.3 seconds.
+        let far_rounds = VOXLIGHT_UPDATE_DIV * VOXLIGHT_FAR_DIV;
+        let away_rounds = far_rounds * 4;
+        let sun0 = 0.0f32;
+        let sun1 = sun0 + away_rounds as f32 / 60.0;
+
+        let live = world.light.allocated() as u32;
+        let run = |rounds: u32, start: u32, near: u32| {
+            let wgs = voxlight_dispatch_blocks(live, near);
+            for r in 0..rounds {
+                queue.write_buffer(
+                    &vl.params, 0,
+                    bytemuck::bytes_of(&voxlight_params(live, start + r, 0, near)),
+                );
+                let mut e = device.create_command_encoder(&Default::default());
+                rig.encode_pass(&mut e, "vlight", wgs);
+                queue.submit(std::iter::once(e.finish()));
+            }
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        };
+        let luma = |px: &[u16]| -> f32 {
+            let f = |b: u16| {
+                let (s, e, m) = ((b >> 15) as u32, ((b >> 10) & 0x1F) as i32, (b & 0x3FF) as f32);
+                let v = if e == 0 { m / 1024.0 * 2f32.powi(-14) } else { (1.0 + m / 1024.0) * 2f32.powi(e - 15) };
+                if s == 1 { -v } else { v }
+            };
+            0.2126 * f(px[0]) + 0.7152 * f(px[1]) + 0.0722 * f(px[2])
+        };
+        let stats = |a: &[u16], b: &[u16]| -> (f64, f64, f64) {
+            let n = a.len() / 4;
+            let mut d: Vec<f64> = Vec::with_capacity(n);
+            for i in 0..n {
+                d.push(((luma(&a[i * 4..]) - luma(&b[i * 4..])).abs() * 255.0) as f64);
+            }
+            d.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            let mean = d.iter().sum::<f64>() / n as f64;
+            (mean, d[n * 99 / 100], d[n - 1])
+        };
+
+        // The reference and the control are properties of the SUN, not of the
+        // partition.
+        rig.look(&queue, &facing, wo);
+        let cu1 = CameraUniform::from_camera(&facing, w, h, sun1, sun1, wo, [0.0, 0.0], 0.0);
+        // The field has to be BOUND before anything is converged or rendered:
+        // `LiveFrameRig::new` builds the bindings, it does not fill them, and an
+        // empty table makes every tap invalid and every frame identical.
+        upload_voxlight_fresh(&queue, &vl, &world);
+        run(VOXLIGHT_CONVERGE_ROUNDS, 0, live);
+        queue.write_buffer(&rig.camera_buf, 0, bytemuck::bytes_of(&cu1));
+        let old_sun = rig.shade_and_read(&device, &queue, 0, false);
+        run(VOXLIGHT_CONVERGE_ROUNDS, 0, live);
+        let reference = rig.shade_and_read(&device, &queue, 0, false);
+        let (cm, cp, cx) = stats(&old_sun, &reference);
+        // A CONTROL, so a table of zeros cannot be read as "no artifact" when it
+        // really means "the rig cannot see one": the same frame with the field
+        // converged against the OLD sun, i.e. a field frozen for the whole 4.3 s
+        // and the hard upper bound on any lag artifact.
+        eprintln!(
+            "turn-around, {live} blocks, sun moves {:.3} rad (4 far periods, 4.3 s at 60 fps) \
+             while the camera faces away",
+            (sun1 - sun0) * 0.025 * 0.957826,
+        );
+        eprintln!(
+            "  CONTROL, field frozen for the whole 4.3 s: mean {cm:.3}/255 p99 {cp:.1} max {cx:.1}"
+        );
+        assert!(
+            cx > 0.5,
+            "the control shows no difference at all, so this rig cannot see a stale field and \
+             the recovery tables below would mean nothing"
+        );
+
+        {
+            // 1. Settled at sun T0 with everything near.
+            let cu0 = CameraUniform::from_camera(&facing, w, h, sun0, sun0, wo, [0.0, 0.0], 0.0);
+            queue.write_buffer(&rig.camera_buf, 0, bytemuck::bytes_of(&cu0));
+            world.light.repartition(|_| true);
+            upload_voxlight_fresh(&queue, &vl, &world);
+            run(VOXLIGHT_CONVERGE_ROUNDS, 0, live);
+
+            // 2. THE PLAYER STANDS FACING AWAY WHILE THE SUN MOVES. The sun
+            //    RAMPS one frame's worth per round, exactly as in a live session:
+            //    a step would let the far tier's single visit soak up the whole
+            //    change at once and flatter it.
+            world.set_light_focus(away.pos);
+            let near_away = world.light.near_count();
+            let before: std::collections::HashSet<u32> =
+                world.light.live_bricks()[..near_away as usize].iter().copied().collect();
+            upload_voxlight_fresh(&queue, &vl, &world);
+            for r in 0..away_rounds {
+                let t = sun0 + (sun1 - sun0) * (r + 1) as f32 / away_rounds as f32;
+                let cu = CameraUniform::from_camera(&away, w, h, t, t, wo, [0.0, 0.0], 0.0);
+                queue.write_buffer(&rig.camera_buf, 0, bytemuck::bytes_of(&cu));
+                run(1, r, near_away);
+            }
+
+            // 3. THE TURN.
+            world.set_light_focus(facing.pos);
+            let near_facing = world.light.near_count();
+            let after: std::collections::HashSet<u32> =
+                world.light.live_bricks()[..near_facing as usize].iter().copied().collect();
+            let promoted = after.difference(&before).count();
+            upload_voxlight_fresh(&queue, &vl, &world);
+            queue.write_buffer(&rig.camera_buf, 0, bytemuck::bytes_of(&cu1));
+            let wgs = voxlight_dispatch_blocks(live, near_facing);
+            eprintln!(
+                "  SHIPPED (radius only): near {near_away} -> {near_facing} ({promoted} promoted \
+                 by the turn), sweep round {wgs} wgs"
+            );
+            eprintln!("    frame  ms@60fps   mean/255     p99     max   (vs a converged field)");
+            for f in 0..VOXLIGHT_UPDATE_DIV * 8 {
+                queue.write_buffer(
+                    &vl.params, 0,
+                    bytemuck::bytes_of(&voxlight_params(live, f, 0, near_facing)),
+                );
+                let img = rig.shade_and_read(&device, &queue, wgs, false);
+                // Only the frames a human could resolve: every 8th, i.e. one per
+                // near visit, plus the first two.
+                if f < 2 || f % 8 == 7 {
+                    let (m, p, x) = stats(&img, &reference);
+                    eprintln!(
+                        "    {f:5}  {:7.1}   {m:8.3} {p:7.1} {x:7.1}",
+                        f as f64 * 1000.0 / 60.0,
+                    );
+                }
+            }
+        }
+    }
+
+    /// HOW WRONG a record is when the field lags the sun, measured rather than
+    /// argued.
+    ///
+    /// This is the number the refresh SCHEDULE has to be built on and it never
+    /// existed. The cadence was a frame count - near every 8 frames, far every 64
+    /// - which says nothing about the sun and silently means "refresh eight times
+    /// faster at 120 fps than at 15". A record's value is a function of geometry
+    /// and SUN DIRECTION, so the only honest schedule is "re-gather once the sun
+    /// has moved far enough to change the answer", and that needs to know how far
+    /// that is.
+    ///
+    /// Converges the demo world's field at one sun, then at a later one, and
+    /// reports how much the STORED value moved. `sun_dir_at` turns at 0.025 rad
+    /// per second of `sun_time`, so each row is also an angle.
+    #[test]
+    #[ignore]
+    fn voxlight_sun_lag_error() {
+        let mut world = World::new();
+        world.fill_demo_terrain();
+        let Some(rig) = VoxLightRig::new(&mut world, VL_SUN_TIME) else {
+            eprintln!("voxlight_sun_lag_error: no GPU adapter, skipping");
+            return;
+        };
+        rig.converge(VOXLIGHT_CONVERGE_ROUNDS);
+        let base = rig.read_live_pool();
+        let records = rig.count as usize * LIGHT_RECORDS_PER_BLOCK as usize;
+        eprintln!(
+            "voxlight sun-lag error, {} blocks / {records} records, sun turns 0.025 rad/s:",
+            rig.count,
+        );
+        eprintln!(
+            "  {:>7} {:>9} {:>8} {:>8} {:>8} {:>8}",
+            "lag s", "rad", "changed", "mean", "p99", "max",
+        );
+        // Lags spanning the shipped cadences at 60 fps: 8 frames (the near
+        // period) is 0.133 s, 64 frames (the far period) is 1.07 s.
+        for &lag in &[0.033f32, 0.133, 0.533, 1.067, 2.133, 4.267] {
+            rig.set_sun(VL_SUN_TIME + lag);
+            rig.converge(VOXLIGHT_CONVERGE_ROUNDS);
+            let now = rig.read_live_pool();
+            let mut diffs: Vec<u8> = Vec::with_capacity(records);
+            for i in 0..records {
+                let (a, b) = (base[i * 2], now[i * 2]);
+                // Only records that hold a real estimate on BOTH sides: a solid
+                // voxel writes zero and would read as a perfect match.
+                if (a >> 16) & 0xFF == 0 || (b >> 16) & 0xFF == 0 {
+                    continue;
+                }
+                diffs.push(((a & 0xFF) as i32 - (b & 0xFF) as i32).unsigned_abs() as u8);
+            }
+            diffs.sort_unstable();
+            let n = diffs.len().max(1);
+            let changed = diffs.iter().filter(|&&d| d > 0).count();
+            let mean = diffs.iter().map(|&d| d as f64).sum::<f64>() / n as f64;
+            eprintln!(
+                "  {lag:7.3} {:9.4} {:7.2}% {mean:8.2} {:8} {:8}",
+                lag * 0.025,
+                changed as f64 / n as f64 * 100.0,
+                diffs[(n - 1) * 99 / 100],
+                diffs[n - 1],
+            );
+            // Put it back so the next row measures a lag from the same base
+            // rather than a lag from the previous row.
+            rig.set_sun(VL_SUN_TIME);
+            rig.converge(VOXLIGHT_CONVERGE_ROUNDS);
+        }
     }
 
     /// The FAR half of the work list must converge to the same light as the near

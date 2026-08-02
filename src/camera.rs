@@ -89,10 +89,14 @@ pub struct CameraUniform {
     /// TAA history blend weight: 0 = use current frame only (reset / motion),
     /// ~0.9 = accumulate with reprojected history.
     pub taa_blend: f32,
-    /// 1.0 = the lighting (shadow/AO) reprojection cache may reuse last frame's
-    /// values; 0.0 = force a full trace (first frame / after a chunk cross where
-    /// the rebased world origin moved, invalidating cached positions).
-    pub reproject_lighting: f32,
+    /// 1.0 = last frame's screen is a valid reprojection target; 0.0 = it is not
+    /// (first frame, or a chunk cross where the rebased world origin moved and
+    /// every stored position means something different).
+    ///
+    /// It used to gate the shadow/AO reprojection cache as well, which is where
+    /// the old name `reproject_lighting` came from. That cache is gone; TAA's
+    /// full reprojection and the RT GI's history reuse are the consumers now.
+    pub reproject_ok: f32,
     // Previous-frame camera basis, for reprojecting a hit world-point into last
     // frame's screen to look up its cached shadow/AO.
     pub prev_origin: [f32; 3],
@@ -103,7 +107,7 @@ pub struct CameraUniform {
     pub sun_time: f32,
     pub prev_right: [f32; 3],
     /// 1.0 = the prev_* camera fields describe a real previous frame (set by
-    /// set_prev_camera). Unlike reproject_lighting this stays 1.0 while the
+    /// set_prev_camera). Unlike reproject_ok this stays 1.0 while the
     /// camera MOVES - consumers that reproject by absolute position (the
     /// water reflection history) stay valid under motion; the first frame's
     /// zeroed history is rejected by its stored-position check.
@@ -153,7 +157,7 @@ impl CameraUniform {
             gi_round: 0,
             jitter,
             taa_blend,
-            reproject_lighting: 0.0,
+            reproject_ok: 0.0,
             prev_origin: c.pos.to_array(),
             wind_z: wind_dir(time).y,
             prev_forward: c.forward().to_array(),
@@ -165,10 +169,11 @@ impl CameraUniform {
         }
     }
 
-    /// Fill in the previous-frame camera basis + enable lighting reprojection.
-    /// Called by the frame loop once it has last frame's camera.
+    /// Fill in the previous-frame camera basis and say whether it is usable as a
+    /// reprojection target. Called by the frame loop once it has last frame's
+    /// camera.
     pub fn set_prev_camera(&mut self, prev: &Camera, enable: bool) {
-        self.reproject_lighting = if enable { 1.0 } else { 0.0 };
+        self.reproject_ok = if enable { 1.0 } else { 0.0 };
         self.prev_valid = 1.0;
         self.prev_origin = prev.pos.to_array();
         self.prev_forward = prev.forward().to_array();

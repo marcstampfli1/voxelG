@@ -103,7 +103,7 @@ World-resident, independent of resolution:
     voxel bricks               75.5 MB   1,048,576 * 72 B
     light pool                 67.1 MB   131,072 blocks * 512 B (60,174 live)
     light brick->block table    4.2 MB   one u32 per brick
-    light work list             0.5 MB
+    light work list             0.5 MB   plus a 2 KB urgent tail
     GI probe grid              25.2 MB   131,072 probes * 192 B
     occupancy pyramid + hints   1.2 MB
     ------------------------------------
@@ -113,20 +113,24 @@ Screen-space, at 1920x1080 in the shipped RT + probe-GI configuration:
 
     transp records + godray scratch                  41.4 MB
     GI accumulation (gi_in + gi_out, Rgba32Float)    66.4 MB
-    lighting reprojection cache (out + hist)         66.4 MB
+    lighting G-buffer (Rgba32Float, ONE now)         33.2 MB
     HDR scene + geometry (Rgba16Float)               33.2 MB
     depth, LDR, resolve, bloom, cloud, beam          33.4 MB
     ------------------------------------------------------
-                                                    240.8 MB
+                                                    207.6 MB
 
-Total ~415 MB, plus the RT acceleration structures (not accounted here). The
-light field is 16% of that and the SECOND largest world-resident item after
+Total ~381 MB, plus the RT acceleration structures (not accounted here). The
+light field is 19% of that and the SECOND largest world-resident item after
 the brick pyramid it sits beside, which is proportionate for the thing that
 carries all shadowing, AO and local light.
 
 Both totals came down when the reflection field was deleted (2026-08-01): 21.1 MB
 of world-resident pool and table, and 33.2 MB of screen-space reflection history
-in `transp_buf`, which stylized water has nothing to accumulate into.
+in `transp_buf`, which stylized water has nothing to accumulate into. The
+screen-space column came down another 33.2 MB when the lighting reprojection
+CACHE was deleted (2026-08-02): the G-buffer stays for cs_taa and the grass pass,
+its previous-frame copy does not - along with the full-res Rgba32Float
+copy_texture_to_texture that fed it on every single frame.
 
 It would NOT have been proportionate the other way round, and that is
 measured rather than argued. The 393,216-block pool the broken membership
@@ -157,23 +161,61 @@ rarely, so nothing falls back to the per-pixel path and no boundary is visible.
 Bounding allocation would put a ring in the world where the two shading paths
 meet, and that is a different, larger decision.
 
-## Update pass: amortized and deterministic
+## Update pass: DEMAND-DRIVEN, amortized and deterministic
 
-A new compute pass `cs_voxel_light_update` slots in directly after the GI
-probe update, reusing that pass's proven amortization shape.
+The compute pass `cs_voxel_light_update` runs FIRST in the frame - before the
+cloud and beam pre-passes and outside the temporal-differential gate, because the
+field is world state and its queue is drained on the assumption that the frame
+dispatches it.
 
-- The work list is the compact array of allocated blocks, PARTITIONED
-  near-first: `LightField::near_count` splits it into shell within
-  `World::LIGHT_NEAR_RADIUS` of the camera and everything else.
-- Each frame updates 1/8 of the NEAR blocks and 1/64 of the far ones, strided by
-  a round counter, from one dispatch. This is a refresh RATE and nothing else:
-  every block keeps its storage and its converged record, so shading reads the
-  same field it read before and no pixel changes path. Anything with no readable
-  record - a newly bound block, an invalidated one - promotes itself into the
-  near group whatever its distance. See round G of the baseline for why this was
-  needed (the pass was the largest single GPU cost in the frame and had no idea
-  where the camera was) and for the measurement that pins the two groups
-  converging to the same field bit for bit.
+It has exactly TWO reasons to run, and when neither applies it is not encoded at
+all: no compute pass, no uniform write, nothing.
+
+1. THE URGENT LIST (`LightField::urgent`). Bricks whose block has no readable
+   record - newly bound, or just invalidated by an edit. Their pixels are shading
+   through the fallback until they are gathered, so they are dispatched IN FULL
+   on the next frame, up to `LIGHT_URGENT_BUDGET` per dispatch so a chunk install
+   cannot turn into one enormous launch. One visit converges them exactly (a
+   reset record has no history, so it takes the fresh estimate outright). Cost
+   scales with how much of the world actually changed.
+
+   This replaces `promote_near`, which pulled the same blocks into the near TIER
+   and left them there: promotion was one-way, so a still camera watching physics
+   dragged the whole shell into the near group one block at a time, and even then
+   a promoted block waited up to `update_div` rounds for its slice. Worst-case
+   latency after an edit goes from 8 frames to 1, and the tier boundary stops
+   drifting - which also removed the "near group is crowded" repartition trigger
+   that existed only to undo the drift.
+
+2. THE SWEEP, paced by SUN MOTION (`VoxLightSchedule`). The work list is
+   PARTITIONED near-first (`LightField::near_count`, shell within
+   `World::LIGHT_NEAR_RADIUS` of the camera); a round refreshes 1/8 of the near
+   group and 1/64 of the far one, strided by a round counter, from the same
+   dispatch. A round is issued when the sun has turned
+   `VOXLIGHT_SUN_RAD_PER_ROUND`, NOT once per frame, plus a floor of one complete
+   sweep per second while geometry is still settling (a placed block moves a
+   shadow that can land anywhere along the sun ray, and nothing local can know
+   where).
+
+   At 60 fps and the shipped sun that is one round per frame, i.e. exactly the
+   cadence this pass always had, so the LOOK is unchanged. At 400 fps it is one
+   frame in seven. With the sun frozen and nothing dirty it is nothing at all.
+
+   The justification is measured, not argued: over a whole near sweep period of
+   sun motion, 99.25% of the demo world's 3.85M records come back BIT-IDENTICAL
+   (`voxlight_sun_lag_error`). Re-gathering them was not slightly wasteful, it
+   was almost entirely redundant. Round H of the baseline has the table, the
+   per-frame-rate dispatch counts, and the two numerical defects the gate's tests
+   caught (`acos` of a unit vector with itself reads 3.4e-4 rad of motion; and
+   `sun_dir_at` turns at 0.02395 rad/s, not 0.025, because it normalizes a coned
+   vector).
+
+The near/far split is a refresh RATE and nothing else: every block keeps its
+storage and its converged record, so shading reads the same field and no pixel
+changes path. It is DISTANCE ONLY, deliberately - scoping it by the view frustum
+as well was built and measured and rejected, because it doubles the peak error on
+the frame you turn around for 8-12% of one pass. See `World::set_light_focus` and
+round H.
 - Per air voxel in the block:
   - AO from neighbour occupancy. Purely geometric, so it is written once and
     only recomputed when the brick's voxels change.
@@ -273,12 +315,24 @@ is a different surface.
   higher the ray enters this cell BELOW its own plate and the entry face is the
   hit. Cost per surface cell went from up to 24 neighbour probes to 4, and those
   4 only inside foam range.
-- LIT OR SHADOWED, not reflective. `shade_water_top` reads the per-voxel sun
-  visibility the light field already stores - about world +Y, so a whole plate
-  shares one value - and pushes it through a narrow smoothstep. Water in sun
-  reads bright; water in shadow reads at 0.42 of it with a crisp edge. Measured
-  on a wall cast across a sheet: the shadowed side sits at 0.316 of the lit side
-  and the 0.72-0.90 transition band is 1.1% of the shaded pixels.
+- LIT OR SHADOWED, not reflective, and AS SMOOTHLY AS TERRAIN.
+  `shade_water_top` reads the per-voxel sun visibility the light field already
+  stores - sampled about world +Y, because the record that matters is the one
+  directly over the cell - and multiplies by it DIRECTLY, exactly as terrain
+  does. Water in sun reads bright; water in full shadow reads at 0.42 of it.
+
+  It used to push that value through `smoothstep(0.41, 0.59, sun_vis)` first, a
+  band 45/255 wide, on the argument that a photoreal penumbra reads as a smudge
+  over faceted geometry. That was wrong twice: it re-quantized the exact gradient
+  the field exists to produce, so water read STEPPED beside terrain that read
+  smooth (Marc, 2026-08-02); and being only 45/255 wide it turned any wobble in
+  the stored value into a full lit/shadowed flip, which is the mechanism round G
+  traced the water flicker report to. Measured on a wall cast across a sheet, the
+  0.72-0.90 transition band goes from 1.1% to 4.0% of the shaded pixels and the
+  shadowed side sits at 0.330 of the lit side.
+
+  The stylization was never in this term: the plate quantization, the per-cell
+  tone ladder and the hard-edged foam carry it, and none of them moved.
 - THE FRESNEL BLEND TOWARD SKY IS KEPT, and capped at 0.45. Kept because
   without it a lake is one flat blue field from the shore to the horizon - the
   facet ladder gives cell-scale texture but nothing changes with view angle, so
@@ -314,18 +368,44 @@ A per-frame uploaded list of (position, colour, radius) is gathered into the
 the update pass, cost scales with lit voxels rather than with lit pixels, and
 adding lights does not touch the per-pixel path at all.
 
-## What this REPLACES
+## What this REPLACES - and the half of it that was wrong
 
-This is a net simplification, not an addition. It removes:
-- the per-pixel jittered shadow cone (`raymarch.wgsl:3970-3994`),
-- the per-pixel `compute_ao` call (the function survives, used by the update
-  pass),
-- the whole screen-space lighting reprojection cache
-  (`raymarch.wgsl:676-718`, `light_in`/`light_out`, `pack_light_cache`) and
-  its sun-staleness dither.
+The plan said this removes three things. It removes ONE of them, and the reason
+the other two stay is a measurement.
 
-One world-space mechanism replaces a screen-space cache plus a per-pixel
-trace plus a staleness heuristic. No second path is left that can drift.
+REMOVED: the whole screen-space lighting reprojection cache - binding 15, the
+previous-frame G-buffer, `REPROJ_EPS2`, the sun-staleness dither, the four reuse
+flags threaded through `shade`, 33 MB of VRAM and a full-resolution Rgba32Float
+ping-pong COPY every single frame. It had to go for two reasons and only one of
+them is performance:
+
+- IT WON OVER THE FIELD. `reuse_shadow` was tested BEFORE `vlf.valid`, so on a
+  still camera - the only state it engages in - a smooth world-space gradient was
+  overwritten by a value some earlier frame had traced from ONE binary ray.
+  Shadows visibly changed character when the camera stopped moving. That is
+  precisely the "two paths that can drift" this section was written to prevent,
+  and it was live for the whole of rounds A-G.
+- IT COST MORE THAN IT SAVED. Timed on a still camera with it compiled out,
+  cs_main went 4.73 -> 4.30 ms on terrain (the cache COST 9.9%) and moved within
+  noise on foliage and water. With the field answering 96.6% of terrain pixels,
+  reprojection was re-deriving what it had already been given.
+
+`light_out` STAYS and the plan was wrong to lump it in: it is also cs_taa's
+reprojection source and the grass pass's blade lighting. Only the history it was
+copied into, and everything that read it, is gone.
+
+KEPT: the per-pixel jittered shadow cone and the per-pixel `compute_ao` call, as
+a FALLBACK for the voxels the field cannot answer for. Measured coverage of
+shaded pixels: terrain 96.6%, water 99.9%, FOLIAGE 45.6%. The air cell against a
+leaf face is usually another leaf voxel, so the sampler's solidity gate drops all
+eight taps and the field has nothing to give for over half a canopy view -
+deleting the fallback would render it black. It costs nothing when unused (both
+branches sit behind `vlf.valid`), which is the condition this document set for
+keeping it. It also explains round D's "foliage saves nothing": on that camera
+the field answers for under half the pixels.
+
+So the frame carries ONE lighting mechanism plus a fallback for what that
+mechanism cannot see, rather than two mechanisms that overlap and disagree.
 
 Secondary rays gain the most: refraction and glass hits re-shade fully and
 deliberately bypass the cache ("secondary rays don't use the reprojection
@@ -393,8 +473,13 @@ Nothing here is judged by eye alone or declared done off a compile.
    (`raymarch.wgsl`, search `let vlf =`), so a secondary hit pays one field
    fetch instead of a shadow ray plus an AO evaluation. Water's own surface now
    reads the field DIRECTLY, in `shade_water_top`, for its lit/shadowed term.
-8. DONE - rounds A through F in `docs/rt/BASELINE-per-voxel-lighting.md`,
-   including the populated-field A/B that rounds A-C could not measure.
+8. DONE - rounds A through H in `docs/rt/BASELINE-per-voxel-lighting.md`,
+   including the populated-field A/B that rounds A-C could not measure, the live
+   session round G could not see, and the sky-facing frame and pixel-coverage
+   fraction round H added.
+9. DONE - the pass does no work when nothing changed. Sun-paced sweep plus an
+   urgent list, a frozen sun costing zero, and the frame-rate coupling removed.
+   Round H.
 
 ### Known follow-ups found while building
 
@@ -416,9 +501,17 @@ Nothing here is judged by eye alone or declared done off a compile.
   group refreshes eight times more rarely. Round G of the baseline has the
   numbers, the two triggers that keep the partition honest, and the test that
   proves both groups converge to the same field.
+- THE PASS RUNS ONLY WHEN SOMETHING CHANGED, and this entry is CLOSED. It used to
+  dispatch a full sweep round EVERY frame regardless, which at 400 fps refreshed
+  the field six times more often per second than the design ever asked for and
+  never stopped at all. It is now paced by sun motion with an urgent list for
+  everything that cannot wait, and a frozen sun over unchanged geometry dispatches
+  nothing. Round H of the baseline.
 - AO IS RECOMPUTED EVERY ROUND for no reason. It is purely geometric, so
   eighteen occupancy lookups per voxel per round are repeated work; it only
-  needs recomputing when the record is reset or its brick is edited.
+  needs recomputing when the record is reset or its brick is edited. STILL OPEN,
+  and cheaper than it was: with the sweep paced by the sun, a frozen-sun scene
+  recomputes it zero times per frame instead of once per block per eight frames.
 - POOL SIZING IS NOW VALIDATED, and it was short. See "Sparse storage" above:
   the membership rule bound a block for every fully solid brick, the demo
   world overflowed by 239,647 requests, and the loss was a contiguous z slab
@@ -469,18 +562,19 @@ Nothing here is judged by eye alone or declared done off a compile.
 
 ### What is NOT yet true
 
-The old per-pixel machinery is still present and still runs as the fallback
-for any voxel the field cannot answer for (no block, or a block that has not
-converged). The plan called for DELETING the per-pixel shadow cone, the
-per-pixel `compute_ao` call and the whole screen-space reprojection cache.
-None of that is removed yet, so the promised simplification - one world-space
-mechanism instead of a screen-space cache plus a per-pixel trace plus a
-staleness heuristic - has not landed. Two paths still exist and can drift.
-Removing them is only safe once the field is proven to cover the cases they
-handle, which is what the measurement stage is for.
+Point lights (stage 5) are gathered, uploaded and surfaced through
+`Renderer::set_point_lights`, and nothing in the game calls it. There is no test
+covering a lit point light.
 
-Water is the one surface where that fallback is now a SINGLE binary ray rather
-than the old cone: `shade_water_top` takes `vlf.sun` when the field answers and
-one `shadow_occluded` from just above the cell's top face when it does not. The
+Everything else this section used to list is closed by round H, and the closure
+is a measurement rather than a claim: the screen-space reprojection cache is
+gone, the per-pixel cone and `compute_ao` stay as a fallback because the field
+answers for only 45.6% of a canopy view, and the field's coverage is now reported
+by `LiveFrameRig::coverage` on every run of the live-session profiler rather than
+assumed.
+
+Water is the one surface where that fallback is a SINGLE binary ray rather than
+the cone: `shade_water_top` takes `vlf.sun` when the field answers and one
+`shadow_occluded` from just above the cell's top face when it does not. The
 crafted test scenes bind no shell, so that path is exercised on every run rather
 than left to rot.

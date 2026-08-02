@@ -817,9 +817,268 @@ frames regardless of where anyone is standing, which is what the renderer used t
 do and is not what it does now. Quoting only that line overstates the live cost
 several times over.
 
+## Round H: the sky-facing frame, and paying per SECOND instead of per FRAME
+
+Round H starts from a second user report: ~400 fps looking at the SKY before this
+branch, ~180 after. A sky-facing frame has almost no geometry in it, so almost
+nothing in it scales with what is visible; whatever it costs is the FIXED cost.
+Nothing measured it, because `live_session_profile` timed exactly one GPU pass in
+isolation and never rendered a frame.
+
+### The harness that was missing, again
+
+`live_session_profile` now builds the WHOLE shipped frame at 1920x1080 - clouds,
+beam, GI probe update, light update, cs_main, cs_transparent, cs_compose, in
+`Renderer::render`'s order and with `Renderer::new`'s override constants - on the
+world the walking session leaves behind, and times each pass for four camera
+segments. `sky` is new and is the one the report is about. It also reports, from
+the same rig:
+
+  - the FIELD'S PIXEL COVERAGE, by compiling cs_main and cs_transparent with a
+    `PROF_VLF_COVERAGE` override that paints every shaded surface green when
+    `voxlight_sample` answered and red when it fell through, then counting;
+  - the frame WITH and WITHOUT the light update dispatch, back to back, which is
+    the within-run control for everything below.
+
+### What a sky-facing frame is made of
+
+1920x1080, RT primary + probe GI, 49,086 live blocks:
+
+| segment | vlight | clouds | beam  | probe | main   | transp | compose | frame  | frame, no vlight |
+|---------|--------|--------|-------|-------|--------|--------|---------|--------|------------------|
+| sky     | 0.482  | 0.947  | 0.036 | 0.493 |  0.316 | 0.110  | 0.141   |  2.558 | 2.122            |
+| terrain | 0.470  | 0.414  | 0.035 | 0.485 |  4.156 | 0.227  | 0.342   |  6.143 | 5.649            |
+| foliage | 0.488  | 0.456  | 0.043 | 0.503 | 15.785 | 0.116  | 0.411   | 17.987 | 16.977           |
+| water   | 0.479  | 0.511  | 0.028 | 0.494 |  3.009 | 1.024  | 0.414   |  6.072 | 5.565            |
+
+READ THE `vlight` COLUMN ACROSS, not down: 0.48 / 0.47 / 0.49 / 0.48 ms. It is
+the same on a frame with nothing in it as on one that is all canopy, which is the
+diagnosis stated as a measurement - this pass's cost has nothing to do with what
+is on screen. `main` over the same four rows runs 0.32 to 15.8 ms.
+
+AND IT IS NOT 3 ms. On this machine, in this harness, the whole light-field
+update on a sky-facing frame is 0.44 ms of GPU (the within-run control: the same
+frame back to back, 2.558 ms with the dispatch and 2.122 without) plus 0.10 ms of
+CPU (`set_light_focus` + `sync_light_shell_dirty` + `upload_voxlight`, means).
+That is 391 -> 471 fps if it is removed entirely, not 180 -> 400. The reported
+3 ms is NOT reproduced here and this document does not claim it was found; what
+WAS found is a real 0.44 ms of fixed per-frame GPU that had no business being
+spent every frame, and it is now spent on about one frame in seven at the frame
+rates the report was taken at.
+
+### The dispatch gate: cost per SECOND, not per FRAME
+
+A record's value is a function of (geometry, sun direction, light set), so
+re-gathering it when none of the three moved writes bytes that are already there.
+`voxlight_sun_lag_error` measures how much of the field actually moves for a given
+sun lag, over 3,851,136 records of the demo world:
+
+| lag     | sun angle | records changed | mean | p99 | max |
+|---------|-----------|-----------------|------|-----|-----|
+| 0.033 s | 0.0008    |  0.17%          | 0.05 |   0 |  63 |
+| 0.133 s | 0.0033    |  0.75%          | 0.21 |   0 |  63 |
+| 0.533 s | 0.0133    |  1.38%          | 0.40 |  31 |  95 |
+| 1.067 s | 0.0267    |  1.98%          | 0.59 |  31 | 127 |
+| 2.133 s | 0.0533    |  2.60%          | 1.06 |  31 | 190 |
+| 4.267 s | 0.1067    |  3.15%          | 2.63 |  95 | 254 |
+
+0.133 s is a whole NEAR sweep period at 60 fps, and 99.25% of records come back
+BIT-IDENTICAL across it. The pass was not slightly wasteful; it was almost
+entirely redundant.
+
+So the sweep is now paced by SUN MOTION (`VoxLightSchedule`): a round is issued
+once the sun has turned `VOXLIGHT_SUN_RAD_PER_ROUND`, plus a floor of one
+complete sweep per second while geometry is still settling. At 60 fps and the
+shipped sun that is one round per frame - the old cadence exactly, so the LOOK is
+unchanged. At any other frame rate it is not:
+
+    per second: 58.8 sweep rounds + 2,544 urgent bricks
+    workgroups per frame:  60 fps 934   144 fps 389   240 fps 234   400 fps 140
+    the frame-counter schedule:  910 at every one of those rates
+
+That is 1.0x at 60 fps, 2.3x at 144, 3.9x at 240 and 6.5x at 400 - and zero with
+the sun still.
+
+With the sun frozen and nothing dirty it issues NOTHING and the compute pass is
+not encoded at all - pinned by
+`the_light_sweep_stops_when_the_sun_and_the_world_do`, which also pins the 60 fps
+and 400 fps rates and the one-sweep-per-edit bound.
+
+THE 60 fps ROW IS SLIGHTLY HIGHER THAN THE OLD SCHEDULE (934 against 910) and
+that is not noise. Blocks with no readable record - newly bound, just invalidated
+- used to be pushed into the near TIER and wait up to eight frames for their
+slice; they go on an URGENT list now and are dispatched on the very next frame.
+In a session sprinting at 24 voxels/s through streaming that is 2,544 bricks per
+second, i.e. 43 workgroups per frame at 60 fps, and it buys the worst-case
+latency after an edit going from 8 frames to 1. A standing player generates
+almost none of it.
+
+It was 3.3x that (8,375/s, 143 wgs/frame, and a 60 fps row of 1030 - a real
+regression) until the WHOLE-WORLD path stopped queueing. `sync_light_shell_all`
+binds every block in the world, so it queued the entire 60,174-block shell as
+urgent, which then drained at the per-dispatch budget for a hundred frames -
+re-doing work the sweep had already done, because that path also arms a full
+sweep AND runs it at the near cadence (with no camera focus yet, the whole shell
+is near, which `allocate` now preserves explicitly rather than by the side effect
+of the promotion it lost). It clears the queue instead.
+
+Two defects were found while building the gate, both by the tests rather than by
+reading:
+
+  - `acos(dot(a, b))` for the sun's angular step reads 3.4e-4 rad of motion
+    between a unit vector and ITSELF (the dot comes back as 0.99999994 and acos
+    has infinite slope at 1), which is 82% of a round. The frozen-sun case ran
+    599 sweeps in 600 frames. It uses the chord, `2 asin(|a - b| / 2)`, which is
+    the same angle and is exact at zero.
+  - `sun_dir_at` does not turn at 0.025 rad/s. It normalizes
+    `(cos a, sin a, 0.30)`, so the direction traces a cone - a circle of radius
+    0.95783 on the unit sphere - and sweeps 0.02395 rad/s. Using 0.025 would have
+    quietly refreshed 4.3% less often than the cadence it is meant to reproduce.
+
+### What the field covers, and why the fallback stays
+
+Measured per shaded pixel, at 1920x1080:
+
+| segment | field answers | falls back to the per-pixel path |
+|---------|---------------|----------------------------------|
+| terrain | 96.569%       |  3.431%                          |
+| water   | 99.949%       |  0.051%                          |
+| foliage | 45.644%       | 54.356%                          |
+
+FOLIAGE SETTLES IT: the per-pixel shadow cone and `compute_ao` CANNOT be deleted.
+The air cell against a leaf face is usually another leaf voxel, so the sampler's
+solidity gate drops every one of the eight taps and the field has nothing to give
+for over half a canopy view. Removing the fallback would render it black. This is
+also, at last, the cause of round D's "foliage saves nothing": on that camera the
+field is answering for under half the pixels.
+
+The fallback costs nothing when unused - both branches sit behind `vlf.valid` -
+so it stays, and the plan document stops calling for its removal.
+
+### What DID come out: the screen-space reprojection cache
+
+The other half of "one path, not two" is gone, and it was both a cost and a
+correctness bug.
+
+It was tested BEFORE the field (`reuse_shadow` before `vlf.valid`), so wherever
+reprojection hit - which is only on a STILL camera, the one state it engages in -
+a smooth world-space gradient was overwritten by a value some earlier frame had
+traced from ONE binary ray. Shadows changed character when the camera stopped.
+
+And it no longer paid. Timed on a still camera with it compiled out:
+
+| segment | cs_main, cache ON | OFF    | the cache is worth |
+|---------|-------------------|--------|--------------------|
+| terrain |  4.728 ms         |  4.302 | +0.426 (it COSTS)  |
+| foliage | 16.598            | 16.523 | +0.075 (noise)     |
+| water   |  2.967            |  2.931 | +0.036 (noise)     |
+| sky     |  0.382            |  0.431 | -0.049 (noise)     |
+
+With the field answering 96.6% of terrain, the reprojection was re-deriving what
+it had already been given. Removed: binding 15, `REPROJ_EPS2`, the sun-staleness
+dither, the four reuse flags threaded through `shade`, 33 MB of VRAM and the
+full-res Rgba32Float ping-pong COPY every frame - 66 MB/frame of traffic that a
+sky-facing frame paid in full for nothing.
+
+`light_out` STAYS, and the plan was wrong to call for deleting it: it is also
+cs_taa's reprojection source and the grass pass's blade lighting. What is gone is
+the history it was copied into, and everything that read it.
+
+The legacy per-pixel GI path (`GI_PROBE_MODE = 0`, a reference the shipped
+renderer does not run) lost its screen-space reprojection with it, because the
+positions it matched against lived in that history. It accumulates per pixel
+instead. Narrowing a reference path is a real narrowing, and it is recorded here
+rather than left to be discovered.
+
+### The view frustum: built, measured, rejected
+
+Scoping the near tier by a padded view cone as well as by radius was built and
+measured. `voxlight_turnaround_artifact` stands the camera facing away for 4.3 s
+of continuous sun motion, turns 180 degrees, and diffs every recovery frame
+against a fully converged field:
+
+| rule                                      | near | sweep    | error at the turn (mean / p99 / max, /255) |
+|-------------------------------------------|------|----------|--------------------------------------------|
+| radius only                               | 2692 | 1236 wgs | 0.204 /  6.5 /  54.3                       |
+| frustum + radius                          | 1337 | 1089 wgs | 0.411 / 13.9 /  68.8                       |
+| control: field frozen for the whole 4.3 s |      |          | 0.836 / 30.0 / 157.5                       |
+
+It works - 1,215 of 1,351 near blocks are newly promoted by the turn, so the cone
+really is culling - and it is not worth it. 12% off a sweep round (8% on the
+streamed world) for DOUBLE the peak error on the frame you turn. The near tier is
+only ~18% of a sweep round; the far remainder is 920 of 1,236 workgroups, so no
+frustum test can make a sky-facing camera "do almost no work". The thing that
+does that is the sun pacing, which takes it to zero. The tier stays
+view-independent, which is what the original note on `near_count` argued and this
+is the measurement it never had.
+
+The SHIPPED rule's own turn-around number is worth having and is now pinned:
+0.204/255 mean at the turn, decaying smoothly to 0.096 mean and p99 2.3 over
+1.05 s. Nothing pops, because a far block keeps a VALID record - no pixel changes
+shading path; the shadow is simply slightly in the wrong place and slides home.
+
+### Water shadows are as smooth as terrain shadows
+
+`shade_water_top` pushed the field's continuous sun visibility through
+`smoothstep(0.41, 0.59, sun_vis)`, a band 45/255 wide, before using it; terrain
+multiplies by the same value directly. That is why water read STEPPED beside
+terrain that read smooth, and it is the same narrowness round G blamed for the
+water flicker report. Water uses `sun_vis` directly now.
+
+Measured by `water_reads_lit_or_shadowed` on a wall cast across a sheet: the
+0.72-0.90 ratio band - the penumbra - goes from 1.1% to 4.0% of the shaded
+pixels, and the shadowed side sits at 0.330 of the lit side (was 0.316). The band
+is small either way because the physical penumbra in that scene IS small (a
+0.07 rad sun cone and a wall five voxels away casts a sub-voxel one); the 3.6x
+between them is the signal. That test's second assertion was INVERTED - it used
+to require a hard edge - and the reversal is stated in its doc comment rather
+than buried in a diff.
+
+The stylization is untouched: the plate quantization, the per-cell tone ladder
+and the hard-edged foam are all different terms.
+
+### Look, round H
+
+`dump_lookdev_views` captured before and after and diffed per pixel:
+
+| view          | mean/255 | max | >8/255 |
+|---------------|----------|-----|--------|
+| canopy_top    | 0.029    |   1 | 0.00%  |
+| forest_mid    | 0.003    |   1 | 0.00%  |
+| meadow        | 0.017    |   1 | 0.00%  |
+| tree_close    | 0.002    |   1 | 0.00%  |
+| water_graze   | 0.037    |   1 | 0.00%  |
+| water_terrace | 0.033    |   7 | 0.00%  |
+| water_view    | 0.017    |   1 | 0.00%  |
+| water_shadow  | 0.707    |  43 | 3.13%  |
+
+EVERY view is within 1/255 except the one built to show a shadow across water.
+Removing a whole screen-space lighting mechanism, rescheduling the update pass
+and rewriting the water shadow ramp moved exactly the pixels the water shadow
+ramp was meant to move and nothing else.
+
+Read directly at 5x on `water_shadow`: BEFORE, a hard near-vertical light/dark
+boundary one or two pixels wide runs down the frame, flat mid-blue on one side
+and flat navy on the other. AFTER, that boundary is gone and the same region
+darkens gradually across about 40 pixels. The faceted cell mosaic - distinct flat
+quads at different blues with hard cell-to-cell edges - is intact in both, and
+the chunky white foam is unchanged.
+
+### What round H does NOT claim
+
+The absolute frame times moved between the before and after runs on passes
+neither touched (`clouds` reads 1.114 ms before and 0.930 after on a sky frame),
+which is this machine's documented thermal spread. Every number quoted above is
+either a within-run control (the frame with and without the dispatch, back to
+back), a counter, or a pixel diff of two images rendered by the same build.
+
+End-to-end fps is not quoted, for the reason round G gives.
+
 ## Reproducing
 
     cargo test --lib live_session_profile -- --ignored --nocapture
+    cargo test --lib voxlight_sun_lag_error -- --ignored --nocapture
+    cargo test --lib voxlight_turnaround_artifact -- --ignored --nocapture
     cargo test --lib rt_vs_software_timing -- --nocapture --ignored
     cargo test --lib dump_lookdev_views -- --ignored --nocapture
     cargo test --lib flicker_probe_rt_views -- --ignored --nocapture

@@ -36,6 +36,23 @@ pub const WORLD_L4_Y: u32 = (WORLD_CHUNKS_Y + 3) / 4;
 pub const WORLD_L4_Z: u32 = (WORLD_CHUNKS_Z + 3) / 4;
 pub const WORLD_L4_TOTAL: u32 = WORLD_L4_X * WORLD_L4_Y * WORLD_L4_Z;
 
+// ---- per-voxel light field (docs/VOXEL_LIGHTING_PLAN.md) ----
+// Resident light blocks, one per brick that carries lit-shell air. It lives here
+// rather than in `src/voxlight.rs` because the SHADER needs it too: the URGENT
+// list is appended to `vl_live_bricks` at exactly this offset, so both sides
+// must agree and `build.rs` emits it into the shader prelude. The rationale for
+// the value is on `voxlight::LIGHT_BLOCKS_MAX`, which re-exports this.
+pub const LIGHT_BLOCKS_MAX: u32 = 131_072;
+
+// Urgent-list slots reserved past the work list in the same buffer. This is a
+// PER-DISPATCH budget, not a queue length: the CPU queue is unbounded and drains
+// at most this many bricks per dispatch, which is what stops a chunk install
+// (3,072 bricks dirtied at once, more after the neighbourhood walk) from turning
+// into one enormous workgroup launch on a single frame. 512 is about half a
+// normal sweep round on the demo world, so a burst costs less per frame than the
+// sweep it rides alongside.
+pub const LIGHT_URGENT_BUDGET: u32 = 512;
+
 // ---- GI irradiance probe grid (world-space DDGI-style cache) ----
 // One irradiance probe every PROBE_SPACING voxels, centered in its cell. The
 // grid is world-space and toroidal like the voxel storage, so it follows the

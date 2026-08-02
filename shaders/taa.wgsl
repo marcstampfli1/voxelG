@@ -32,10 +32,10 @@ fn cs_taa(@builtin(global_invocation_id) gid: vec3<u32>) {
     let is_blade = cur4.a < 0.5;
 
     // Hard reset (first frame / after resize → taa_blend 0) or no valid
-    // reprojection basis (origin shifted on a chunk cross → reproject_lighting 0)
+    // reprojection basis (origin shifted on a chunk cross → reproject_ok 0)
     // → pass the current frame straight through (sharp, no smear).
     let out_a = select(1.0, 0.0, is_blade);
-    if (camera.taa_blend <= 0.0 || camera.reproject_lighting < 0.5) {
+    if (camera.taa_blend <= 0.0 || camera.reproject_ok < 0.5) {
         textureStore(resolve_out, p, vec4<f32>(cur, out_a));
         return;
     }
@@ -47,7 +47,7 @@ fn cs_taa(@builtin(global_invocation_id) gid: vec3<u32>) {
     var hp = p; // history pixel
     let g = textureLoad(gbuffer, p, 0);
     // Sentinel position (1e9) marks sky/foliage/water — only terrain reprojects.
-    if (!is_blade && camera.reproject_lighting > 0.5 && g.x < 1e8) {
+    if (!is_blade && camera.reproject_ok > 0.5 && g.x < 1e8) {
         let abs_pos = g.xyz + vec3<f32>(camera.world_origin);
         let d = abs_pos - camera.prev_origin;
         let pz = dot(d, camera.prev_forward);

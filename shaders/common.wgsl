@@ -26,7 +26,7 @@ struct Camera {
     gi_round: i32,
     jitter: vec2<f32>,
     taa_blend: f32,
-    reproject_lighting: f32,
+    reproject_ok: f32,
     prev_origin: vec3<f32>,
     wind_z: f32,
     prev_forward: vec3<f32>,
@@ -35,7 +35,7 @@ struct Camera {
     sun_time: f32,
     prev_right: vec3<f32>,
     // 1.0 = prev_* fields describe a real previous frame; stays set while
-    // the camera moves (unlike reproject_lighting).
+    // the camera moves (unlike reproject_ok).
     prev_valid: f32,
     prev_up: vec3<f32>,
     _pad9: f32,

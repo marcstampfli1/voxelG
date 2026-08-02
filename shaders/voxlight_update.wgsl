@@ -144,43 +144,63 @@ fn vl_point_light(p: vec3<f32>) -> vec3<f32> {
     return sum;
 }
 
-/// This round's work-list entry for workgroup `wg`, or >= `live_count` when the
-/// workgroup has nothing to do.
+/// Where the URGENT list starts inside `vl_live_bricks`. The work list can hold
+/// at most `LIGHT_BLOCKS_MAX` entries, so the slots past it are free for a
+/// second, short list - which is why the urgent queue needs no binding of its
+/// own and no second upload path. Emitted from `src/world_dims.rs`, so the CPU
+/// side cannot drift from this.
+const VL_URGENT_BASE: u32 = u32(LIGHT_BLOCKS_MAX);
+
+/// The BRICK workgroup `wg` must gather this dispatch, or VL_NONE for nothing.
 ///
-/// The list is PARTITIONED near-first (`LightField::near_count`). The near
-/// prefix is walked in `update_div` slices exactly as the whole list used to be;
-/// the far remainder is walked in `update_div * far_div` slices, so a distant
-/// block is visited that many times more rarely. Dispatch size is
-/// `ceil(near/div) + ceil(far/(div*far_div))`, and the two groups are told apart
-/// by the workgroup index alone - one dispatch, and every invocation within a
-/// workgroup takes the same path.
+/// TWO SOURCES, in priority order, and the split is the whole of the "do no work
+/// when nothing changed" policy:
+///
+///  - URGENT, `wg < urgent_count`: bricks whose block has no readable record
+///    (newly bound, just invalidated) or whose neighbourhood just changed. These
+///    are dispatched IN FULL, every dispatch, because their pixels are shading
+///    through the fallback until they are gathered. Cost scales with how much of
+///    the world actually changed.
+///  - the SWEEP, everything past that and only when `sweep` is set: the periodic
+///    re-gather that tracks the SUN. The list is partitioned near-first
+///    (`LightField::near_count`); the near prefix is walked in `update_div`
+///    slices and the far remainder in `update_div * far_div` slices, so a distant
+///    block is visited that many times more rarely. The two groups are told apart
+///    by the workgroup index alone - one dispatch, and every invocation within a
+///    workgroup takes the same path.
 ///
 /// Nothing here depends on the visit COUNT, only on which entry is due, because
-/// each visit re-estimates the sun disc completely (`vl_sun_visibility`). A
-/// scheme that instead spread the disc over successive visits could not survive
-/// this split at all: `round / div` advances by a whole cycle between two
-/// consecutive visits of a far block, so a far block would sample the same slice
-/// of the disc for ever.
+/// each visit re-estimates the sun disc completely (`vl_sun_visibility`). That is
+/// also what lets the sweep be paced by sun motion instead of by frames: a round
+/// skipped because the sun did not move is a round whose output would have been
+/// bit-identical.
 fn vl_work(wg: u32) -> u32 {
+    if (wg < vl_params.urgent_count) {
+        return vl_live_bricks[VL_URGENT_BASE + wg];
+    }
+    let s = wg - vl_params.urgent_count;
     let div = max(1u, vl_params.update_div);
     let near = min(vl_params.near_count, vl_params.live_count);
     let near_wgs = (near + div - 1u) / div;
-    if (wg < near_wgs) {
-        let idx = wg * div + (vl_params.round % div);
+    var idx = 0u;
+    if (s < near_wgs) {
+        idx = s * div + (vl_params.round % div);
         // A near workgroup must not spill into the far region: it would refresh
         // a far block at the near cadence.
-        return select(vl_params.live_count, idx, idx < near);
+        if (idx >= near) { return VL_NONE; }
+    } else {
+        let fdiv = div * max(1u, vl_params.far_div);
+        idx = near + (s - near_wgs) * fdiv + (vl_params.round % fdiv);
     }
-    let fdiv = div * max(1u, vl_params.far_div);
-    return near + (wg - near_wgs) * fdiv + (vl_params.round % fdiv);
+    if (idx >= vl_params.live_count) { return VL_NONE; }
+    return vl_live_bricks[idx];
 }
 
 @compute @workgroup_size(64, 1, 1)
 fn cs_voxel_light_update(@builtin(workgroup_id) wg: vec3<u32>,
                          @builtin(local_invocation_index) li: u32) {
-    let idx = vl_work(wg.x);
-    if (idx >= vl_params.live_count) { return; }
-    let brick = vl_live_bricks[idx];
+    let brick = vl_work(wg.x);
+    if (brick == VL_NONE) { return; }
     let block = vl_block_of_brick[brick];
     if (block == VL_NONE) { return; }
 

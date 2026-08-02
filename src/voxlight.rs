@@ -23,6 +23,8 @@
 
 use crate::world_dims::{BRICK_VOXELS, WORLD_BRICKS_TOTAL};
 
+pub use crate::world_dims::LIGHT_URGENT_BUDGET;
+
 /// Light records per block. One per voxel of a brick.
 pub const LIGHT_RECORDS_PER_BLOCK: u32 = BRICK_VOXELS;
 
@@ -56,7 +58,11 @@ pub const LIGHT_RECORD_WORDS: u32 = 2;
 /// and refusals are now reported at ERROR level with a running total
 /// (`overflow_total`) so a world class that does outgrow this cannot saturate
 /// unnoticed the way this one did.
-pub const LIGHT_BLOCKS_MAX: u32 = 131_072;
+///
+/// The VALUE lives in `world_dims.rs` because the shader needs it: the urgent
+/// list is appended to the GPU work list at this offset. This is the name the
+/// rest of the engine uses and where the reasoning lives.
+pub use crate::world_dims::LIGHT_BLOCKS_MAX;
 
 /// u32 words of GPU storage backing the whole pool (64 MiB).
 pub const LIGHT_POOL_WORDS: u32 = LIGHT_BLOCKS_MAX * LIGHT_RECORDS_PER_BLOCK * LIGHT_RECORD_WORDS;
@@ -110,31 +116,48 @@ pub struct LightField {
     live: Vec<u32>,
     /// Length of the NEAR prefix of `live`.
     ///
-    /// The update pass refreshes the near prefix on the normal cadence and the
-    /// far remainder far more slowly, which is the whole of the camera-awareness
-    /// policy. It is a REFRESH RATE and nothing else: every block keeps its
-    /// storage and its converged record, so shading reads exactly the same field
-    /// it read before and no pixel changes path because of this split. A static
-    /// scene under a static sun converges and then stops changing, so refreshing
-    /// distant shell rarely costs nothing observable; a moving sun lags at
-    /// distance, where fog has already saturated.
+    /// The SWEEP refreshes the near prefix on the normal cadence and the far
+    /// remainder far more slowly. It is a REFRESH RATE and nothing else: every
+    /// block keeps its storage and its converged record, so shading reads
+    /// exactly the same field it read before and no pixel changes path because
+    /// of this split.
     ///
-    /// Distance ONLY, deliberately not the view frustum. A frustum test would
-    /// cut roughly another half, but it makes the refresh rate depend on where
-    /// the camera LOOKS, so a fast turn can face shell that has been starved for
-    /// a second - and the field and the per-pixel fallback do not render
-    /// identically, so that transition is a visible pop. Distance is
-    /// view-independent: turning on the spot changes nothing at all.
+    /// The sweep exists to track the SUN and nothing else. Everything that makes
+    /// a record UNREADABLE - a newly bound block, an invalidated one, a
+    /// neighbour whose occupancy just changed - goes on the URGENT list instead
+    /// and is serviced on the next dispatch whatever tier it is in, so this
+    /// partition can be as aggressive as the sun's tracking tolerance allows
+    /// without ever leaving a surface without light. See `urgent`.
     near_count: usize,
-    /// Blocks promoted into the near group since the last `repartition`.
+    /// BRICK indices whose block must be re-gathered on the NEXT dispatch,
+    /// whatever the sweep schedule says.
     ///
-    /// Promotion is one-way, so without a second trigger a STILL camera watching
-    /// physics accumulates every invalidated block into the near group and the
-    /// partition quietly degrades back to "everything is near" - measured, on
-    /// the shipped benchmark, as a near fraction that stayed at 43-66% however
-    /// far the radius was tightened. This is what tells the policy the partition
-    /// has gone stale for a reason other than camera motion.
-    promotions: u32,
+    /// THIS IS WHAT MAKES THE SWEEP SKIPPABLE. A record's value is a function of
+    /// (geometry, sun direction, light set), so re-gathering it when none of the
+    /// three moved writes bytes identical to the ones already there - measured on
+    /// the demo world, 99.25% of records are bit-identical across a whole near
+    /// sweep period of sun motion (`voxlight_sun_lag_error`). The sweep can
+    /// therefore be paced by the sun rather than by the frame counter, and paused
+    /// outright when the sun is still - but only if the cases that genuinely
+    /// cannot wait have somewhere else to go. This is that somewhere.
+    ///
+    /// It replaces `promote_near`, which pulled the same blocks into the near
+    /// TIER and left them there: promotion was one-way, so a still camera
+    /// watching physics dragged the whole shell into the near group one block at
+    /// a time, and even then a promoted block waited up to `update_div` rounds
+    /// for its slice to come round. An urgent block is serviced on the very next
+    /// dispatch and then leaves, so the tier boundary stops drifting and the
+    /// worst-case latency after an edit goes from 8 frames to 1.
+    ///
+    /// Bricks, not blocks, because that is what the GPU work list holds. A stale
+    /// entry (the brick was released, or rebound to another block) is SAFE: the
+    /// shader re-reads `block_of_brick` and skips an unbound brick, and a rebound
+    /// one needs the gather anyway.
+    urgent: Vec<u32>,
+    /// One bit per BRICK: membership of `urgent`. Brick-indexed rather than
+    /// block-indexed so a release/rebind between queueing and draining cannot
+    /// strand a bit on a block the brick no longer owns.
+    urgent_queued: Vec<u64>,
     /// Block indices available for reuse.
     free: Vec<u32>,
     /// Blocks whose accumulation must restart (brick edited, slot recycled).
@@ -188,7 +211,8 @@ impl LightField {
             slots: Vec::new(),
             live: Vec::new(),
             near_count: 0,
-            promotions: 0,
+            urgent: Vec::new(),
+            urgent_queued: vec![0u64; (WORLD_BRICKS_TOTAL as usize).div_ceil(64)],
             free: Vec::new(),
             pending_reset: Vec::new(),
             reset_queued: vec![0u64; (blocks_max as usize).div_ceil(64)],
@@ -257,10 +281,45 @@ impl LightField {
         self.near_count as u32
     }
 
-    /// Blocks promoted into the near group since the last `repartition`.
+    /// Bricks awaiting an urgent re-gather, oldest first.
     #[inline]
-    pub fn promotions(&self) -> u32 {
-        self.promotions
+    pub fn urgent(&self) -> &[u32] {
+        &self.urgent
+    }
+
+    /// Forget every queued urgent visit.
+    ///
+    /// For the whole-world rebind only (`World::sync_light_shell_all`): every
+    /// block is new there, so the queue would hold the entire shell and drain at
+    /// the per-dispatch budget for a hundred frames - while the sweep, which that
+    /// path also arms and which runs at the near cadence because everything is
+    /// near, covers all of it in eight. The queue would be re-doing work the
+    /// sweep is already doing.
+    pub fn clear_urgent(&mut self) {
+        for &b in &self.urgent {
+            self.urgent_queued[b as usize / 64] &= !(1u64 << (b % 64));
+        }
+        self.urgent.clear();
+    }
+
+    /// Drop the first `n` urgent entries, which the caller has just dispatched.
+    pub fn drain_urgent(&mut self, n: usize) {
+        let n = n.min(self.urgent.len());
+        for &b in &self.urgent[..n] {
+            self.urgent_queued[b as usize / 64] &= !(1u64 << (b % 64));
+        }
+        self.urgent.drain(..n);
+    }
+
+    /// Queue `brick` for an urgent visit unless it is already queued.
+    #[inline]
+    fn queue_urgent(&mut self, brick: u32) {
+        let (w, bit) = (brick as usize / 64, 1u64 << (brick % 64));
+        if self.urgent_queued[w] & bit != 0 {
+            return;
+        }
+        self.urgent_queued[w] |= bit;
+        self.urgent.push(brick);
     }
 
     /// Move every brick for which `near` holds into the front of the work list
@@ -291,7 +350,6 @@ impl LightField {
             self.list_dirty = true;
         }
         self.near_count = lo;
-        self.promotions = 0;
         moved || self.list_dirty
     }
 
@@ -346,16 +404,24 @@ impl LightField {
                 b
             }
         };
+        let was_all_near = self.near_count == self.live.len();
         self.live.push(brick);
         self.block_of_brick[brick as usize] = block;
-        // A NEW block joins the NEAR partition, whatever its distance: see
-        // `promote_near`.
-        let last = self.live.len() - 1;
-        self.live.swap(self.near_count, last);
-        self.fix_live_idx(self.near_count);
-        self.fix_live_idx(last);
-        self.near_count += 1;
-        self.promotions += 1;
+        // "EVERYTHING IS NEAR" IS PRESERVED, and nothing else is. Until the first
+        // `World::set_light_focus` there is no camera and no tier, and the field
+        // is defined to treat the whole shell as near - that is what makes a
+        // freshly bound world converge on the near cadence (8 frames) instead of
+        // the far one (64). Once a real partition exists this test is false and a
+        // newly bound block lands in the far group, which is the point: letting
+        // every streamed brick into the near tier is what used to drag it back to
+        // "everything is near" one block at a time.
+        if was_all_near {
+            self.near_count += 1;
+        }
+        // A NEW block has no record at all, so it also joins the URGENT list
+        // whatever its tier: until it is gathered, every pixel on that surface
+        // shades through the fallback.
+        self.queue_urgent(brick);
         self.table_touched.push(brick);
         self.list_dirty = true;
         // A NEVER-BOUND block needs no reset: the pool buffer starts zeroed and
@@ -411,36 +477,12 @@ impl LightField {
         if let Some(b) = self.block_of(brick) {
             self.queue_reset(b);
             // An invalidated block has just had its records zeroed, so until the
-            // update pass reaches it again its voxels shade through the
-            // per-pixel fallback. On the FAR cadence that is up to 64 frames of
-            // one surface visibly rendering through a different path - which is
-            // the flicker this policy must not introduce - so anything that goes
-            // dark is pulled back into the near group until it is lit again.
-            self.promote_near(b);
+            // update pass reaches it again its voxels shade through the fallback.
+            // The sweep cannot be relied on for that: it is paced by the sun and
+            // stops altogether when the sun does. Urgent means the next dispatch,
+            // whatever the schedule.
+            self.queue_urgent(brick);
         }
-    }
-
-    /// Move `block`'s work-list entry into the near group if it is not already
-    /// there. O(1), one swap.
-    ///
-    /// The two callers are the two ways a record stops being readable: a NEW
-    /// block has never had one, and an INVALIDATED block just lost the one it
-    /// had. Both shade through the per-pixel fallback until the update pass
-    /// reaches them, and the fallback does not render identically to the field,
-    /// so both have to be refreshed on the fast cadence no matter how far away
-    /// they are. The next repartition demotes them once they are lit.
-    #[inline]
-    fn promote_near(&mut self, block: u32) {
-        let idx = self.slots[block as usize].live_idx as usize;
-        if idx < self.near_count {
-            return;
-        }
-        self.live.swap(idx, self.near_count);
-        self.fix_live_idx(idx);
-        self.fix_live_idx(self.near_count);
-        self.near_count += 1;
-        self.promotions += 1;
-        self.list_dirty = true;
     }
 
     /// Queue `block` for zeroing unless it is already queued.
@@ -826,24 +868,63 @@ mod tests {
         assert_eq!(far, [4u32, 5, 7].into_iter().collect());
     }
 
-    /// A newly bound block joins the NEAR group, wherever it is.
+    /// A newly bound block goes on the URGENT list, wherever it is.
     ///
-    /// It has no converged record, so until it gets one its voxels shade through
-    /// the per-pixel fallback - and the two paths do not look identical. Making
-    /// new blocks wait out a far refresh period would put that difference on
-    /// screen for up to a second after a player places a block.
+    /// It has no record at all, so until it gets one its voxels shade through the
+    /// fallback. It used to be pushed into the NEAR TIER instead, which was wrong
+    /// twice over: it still waited up to `update_div` rounds for its slice, and
+    /// the promotion was one-way, so streaming dragged the tier boundary out
+    /// until "near" meant "most of the shell". The tier is the sun's tracking
+    /// radius and nothing else now; urgency is a separate list.
     #[test]
-    fn a_new_block_starts_near() {
+    fn a_new_block_is_urgent_not_near() {
         let mut lf = LightField::new(LIGHT_BLOCKS_MAX);
         for brick in 0..4u32 {
             lf.allocate(brick).unwrap();
         }
+        // With no partition yet, everything is near - that is what makes a fresh
+        // world converge on the near cadence.
+        assert_eq!(lf.near_count(), 4, "with no camera focus the whole shell is near");
+        lf.drain_urgent(lf.urgent().len());
         lf.repartition(|_| false);
         assert_eq!(lf.near_count(), 0, "nothing is near");
         lf.allocate(99).unwrap();
-        assert_eq!(lf.near_count(), 1);
-        assert_eq!(lf.live_bricks()[0], 99, "the new brick sits in the near prefix");
+        assert_eq!(lf.near_count(), 0, "a new block must not widen the sun-tracking tier");
+        assert_eq!(lf.urgent(), &[99], "it must be serviced on the next dispatch instead");
         lf.debug_assert_consistent();
+        // Draining is what the dispatch acknowledges; the entry must not linger
+        // and re-dispatch for ever.
+        lf.drain_urgent(1);
+        assert!(lf.urgent().is_empty());
+        // ... and the same brick must be queueable again after a later edit.
+        lf.invalidate(99);
+        assert_eq!(lf.urgent(), &[99]);
+    }
+
+    /// The urgent list must drain in FIFO order and at the caller's budget, so a
+    /// burst is spread over frames instead of launched in one enormous dispatch.
+    ///
+    /// A chunk install dirties 3,072 bricks at once. Dispatching every one of
+    /// them on the frame the install lands would be a spike on exactly the frame
+    /// that is already paying for the install.
+    #[test]
+    fn urgent_drains_oldest_first_at_the_callers_budget() {
+        let mut lf = LightField::new(LIGHT_BLOCKS_MAX);
+        for brick in 0..10u32 {
+            lf.allocate(brick).unwrap();
+        }
+        assert_eq!(lf.urgent().len(), 10);
+        lf.drain_urgent(4);
+        assert_eq!(lf.urgent(), &[4, 5, 6, 7, 8, 9], "oldest four go first");
+        // A brick still queued must not be queued twice by a second edit.
+        lf.invalidate(5);
+        assert_eq!(lf.urgent(), &[4, 5, 6, 7, 8, 9]);
+        // One already drained can be.
+        lf.invalidate(1);
+        assert_eq!(lf.urgent(), &[4, 5, 6, 7, 8, 9, 1]);
+        // Draining past the end is clamped, not a panic.
+        lf.drain_urgent(999);
+        assert!(lf.urgent().is_empty());
     }
 
     /// Repartitioning must not lose or duplicate a block, and must leave every
