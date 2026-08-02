@@ -38,6 +38,54 @@ structure of per-brick AABBs.
     shaders/            WGSL. raymarch.wgsl is the main body; the rest are
                         preludes and passes concatenated around it.
 
+Working in the repo: `CONTRIBUTING.md`. Reusable building blocks and the raw
+patterns they replace: `docs/PRIMITIVES.md`.
+
+## Entry points
+
+`main.rs: main` parses the mode, then either `server::run_server(port)` for a
+dedicated server or `app::run_client(..)` for the game. The client's per-frame
+work is `app::render_frame`, which ends in `Renderer::render`. Physics runs on
+its own thread spawned from `app`, not from the frame loop.
+
+## Dependency direction and boundaries
+
+    world_dims  <-  voxel  <-  physics / raycast / accel / renderer
+                               renderer  <-  app  ->  net  <-  server
+
+`world_dims` depends on nothing and everything geometric depends on it.
+`voxel` owns world state and never touches wgpu. `renderer` owns all GPU
+resources and never mutates world state. `app` is the only place that wires
+them together.
+
+Three boundaries matter:
+
+- **CPU world vs GPU buffers.** The GPU copy is downstream; it is updated only
+  through the dirty-brick upload path. Anything that writes GPU state without
+  updating `World` creates a split brain (see the GPU physics trap below).
+- **Render thread vs physics worker.** Physics runs at 30 Hz on its own thread
+  and takes the `World` mutex. Hold it briefly.
+- **Client vs server.** `server.rs` owns the authoritative edit log. Gameplay
+  that changes the world flows through it or multiplayer diverges.
+
+## Key flows
+
+Waypoint chains, greppable in order.
+
+**Frame:** `app::render_frame` -> `Renderer::render` -> clouds -> beam -> probe
+-> vlight -> `cs_main` -> transparent -> compose -> grass -> post -> taa -> blit.
+
+**Player edit:** click queued -> `raycast::raycast` -> `apply_sphere` or
+`World::apply_edit` -> `World::set_voxel` -> `refresh_masks_for_brick` +
+`mark_brick_dirty` -> dirty-brick upload -> `net::Message::VoxelEdit` broadcast.
+
+**Streaming:** camera moves -> `World::shift_origin` -> `clear_slot_masks`
+(which also frees that slot's light blocks) -> async chunk generation ->
+`install_finished_chunks` -> `apply_slot_data` -> `replay_edits_for_chunk`.
+
+**Light field:** `World::sync_light_shell_dirty` -> `upload_voxlight` ->
+`cs_voxel_light_update` -> read by `voxlight_sample` inside `shade`.
+
 ## The world
 
 A toroidal streaming window of 512 x 256 x 512 voxels. The window slides in x
@@ -125,14 +173,28 @@ CPU physics on a worker thread, which does update the world.
     VOXELG_NO_SHADER_CACHE  disable the persistent pipeline cache
     VOXELG_SHADER_CACHE_DIR relocate the pipeline cache
 
+## Invariants, and where each is enforced
+
+- **Window-relative DDA math.** All float traversal is relative to
+  `camera.world_origin`; the integer grid stays absolute. ENFORCED by the
+  `renders_far_from_origin` test, which fails at a few million voxels out.
+- **World dimensions have one home.** `world_dims.rs` feeds both Rust and, via
+  `build.rs`, the generated WGSL constants. ENFORCED by construction: there is
+  no second place to edit.
+- **The foliage predicate is shared.** `is_foliage_mat` drives the shell rule,
+  the update pass and the sampler. ENFORCED by a test that parses the WGSL and
+  compares it against the Rust definition.
+- **Group 0's declared storage buffers must fit the requested limit.** ENFORCED
+  at bind-group-layout creation, which fails loudly but only inside GPU test
+  output.
+- **The toroidal mapping in `raycast.rs` must match the shaders.** NOT ENFORCED
+  by any test today. A mismatch is silent and position-dependent. This is a
+  known gap, not a claim of safety.
+- **Every render pass needs its own `GPU_PROFILE_LABELS` entry.** NOT ENFORCED.
+  A pass that shares another's label is invisible in the profiler, which has
+  already hidden a pass eating 18-32 percent of frame time.
+
 ## Dev loop
 
-    cargo test --lib                                  unit + GPU gates
-    cargo test --lib dump_lookdev_views -- --ignored   stills to target/lookdev
-    cargo test --lib rt_vs_software_timing -- --ignored --nocapture
-    cargo test --lib live_session_profile -- --ignored --nocapture
-    cargo test --lib flicker_probe_rt_views -- --ignored --nocapture
-
-Visual work is never judged by argument: capture stills and read them. Feel is
-never judged by asking: measure the felt quantity headless against a stated
-band. `docs/PERF.md` records proven AND rejected optimisations, with numbers.
+See `CONTRIBUTING.md`. `docs/PERF.md` records proven AND rejected
+optimisations, with numbers.
