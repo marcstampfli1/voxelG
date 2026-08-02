@@ -6,15 +6,22 @@ and this file is updated in the same commit as the change it describes.
 
 ## What this is
 
-A from-scratch GPU-raymarched voxel engine. A voxel is **25 cm today**
-(`world_dims::VOXEL_METRES`); 10 cm is a planned change, not the current state
-(`docs/SCALE_TO_10CM.md`, and the roadmap section of `docs/IMPLEMENTED.md`).
-Gameplay sizes are written in SI and converted through `VOXEL_METRES`, so that
-bump moves the grid without moving the player. There is no mesh
-and no rasterised terrain: the world is a hierarchical occupancy pyramid in GPU
-storage buffers, and a compute shader marches rays through it per pixel.
+A from-scratch GPU-raymarched voxel engine. A voxel is **10 cm**
+(`world_dims::VOXEL_METRES`), over a 160 x 64 x 160 m streaming window. Every
+size that means something in the real world - player height, view distance, LOD
+radii, cloud scale, tree height, surf width - is written in metres and converted
+once, through `m_to_vox` in Rust and `VOXELS_PER_METRE` (emitted by `build.rs`)
+in WGSL. A bare voxel count standing for a length is a bug, and a silent one: it
+compiles, renders and passes, it just means something 2.5x smaller. There is no
+mesh and no rasterised terrain: the world is a hierarchical occupancy pyramid in
+GPU storage buffers, and a compute shader marches rays through it per pixel.
 Optional hardware ray tracing traces the same world through an acceleration
 structure of per-brick AABBs.
+
+**10 cm is not shippable yet, and the reason is measured.** Traversal survived
+the bump (see `docs/SCALE_TO_10CM.md`), but the CPU physics CA costs 168 ms a
+tick against a 33 ms budget, the frame is 20-40 ms, and neither shrinks usefully
+with the window. That document holds the size ladder and the verdict.
 
 ## Codemap
 
@@ -106,14 +113,31 @@ input latched) -> `Player::step` -> `probe_ground` / `move_and_collide` ->
 
 ## The world
 
-A toroidal streaming window of 512 x 256 x 512 voxels. The window slides in x
-and z as the camera moves; y is fixed. Storage wraps modulo the window, so a
-world voxel maps to a storage cell by `pos_mod`, and a recycled slot is
-regenerated in the background.
+A toroidal streaming window of 1600 x 640 x 1600 voxels = 160 x 64 x 160 m. The
+window slides in x and z as the camera moves; y is fixed. Storage wraps modulo
+the window, so a world voxel maps to a storage cell by `pos_mod`, and a recycled
+slot is regenerated in the background.
+
+A `World` is a DENSE brick array: 25.6 M bricks x 72 B = **1.84 GB**, on the CPU
+and again on the GPU. That is why `Renderer::new` and the headless test device
+request limits derived from `world_dims` (`renderer::world_limits`) rather than a
+round number - a single 1.84 GB storage binding is over wgpu's defaults and the
+failure presents as "the game will not launch". It is also why
+`.cargo/config.toml` pins `RUST_TEST_THREADS`: `cargo test --lib` otherwise runs
+one test per core and several of them build a full world.
 
 The occupancy pyramid is four levels: brick (4^3 voxels, one u64 of occupancy),
 tile (4^3 bricks), chunk (4^3 tiles), and L4 (4^3 chunks, so one bit test skips
-a 256^3 region). Every traversal, CPU or GPU, is expected to use it.
+a 256^3 region). Every traversal, CPU or GPU, is expected to use it. It is what
+made the 25 cm -> 10 cm bump cost between -23% and +8% of traversal time instead
+of the 2.5x a flat grid would have: a DDA step count scales with the surface a
+ray meets, not with the grid it crosses.
+
+The demo world's terrain is a metre-space noise stack (continent / relief /
+ridged mountains / hills / detail / sub-metre grain) and `World::DEMO_SEED` is
+CHOSEN, not arbitrary - the window is a fixed 160 m patch and every benchmark
+camera is framed inside it, so a seed that lands the window on a dry shelf makes
+the water benchmarks measure an empty lake. `voxel::tests` guards that.
 
 INVARIANT: all float DDA math is done RELATIVE to `camera.world_origin`, while
 the integer voxel grid stays absolute. This is what keeps precision usable far
@@ -145,11 +169,27 @@ has happened and cost a day.
 
 ## Lighting
 
-Shadows, AO and local light are per-VOXEL, not per-pixel: stored in air and
-foliage voxels of the lit shell, sampled with a solidity-gated trilinear fetch,
-and refreshed by an amortized compute pass paced by sun motion. There is no
-per-pixel shadow ray any more. Full design and rationale:
+Shadows, AO and local light are stored in the world, not computed per pixel: in
+the air and foliage cells of the lit shell, sampled with a solidity-gated
+trilinear fetch, and refreshed by an amortized compute pass paced by sun motion.
+There is no per-pixel shadow ray any more. Full design and rationale:
 `docs/VOXEL_LIGHTING_PLAN.md`. Measurements: `docs/rt/BASELINE-per-voxel-lighting.md`.
+
+A record covers a `LIGHT_RECORD_STEP^3` = 2x2x2 voxel CELL - a 20 cm field, finer
+in metres than the per-voxel one the 25 cm build shipped, at an eighth the
+storage and an eighth the sun rays. The lattice is the source of two rules that
+are easy to get wrong and silent when you do:
+
+- a cell holding ANY opaque voxel is left dead, which is what keeps a one-voxel
+  wall opaque. So the cell touching a surface is often dead, and the nearest live
+  record is one or two voxels off the surface depending on that surface's parity.
+- therefore everything that reaches for a record must work at CELL granularity:
+  `voxlight_sample` steps off the surface by half a CELL (half a voxel put the
+  whole trilinear weight on the dead cell for one parity, and a quarter of all
+  surfaces shaded with no light at all), and `vl_cell_ao` asks whether a
+  neighbouring CELL holds an occluder (single-voxel probes found the ground for
+  one parity and missed it for the other, so contact AO blinked between adjacent
+  terrain steps).
 
 The field lives in a GPU buffer that is never read back on the render path. The
 CPU owns only the brick -> block mapping.
@@ -181,6 +221,19 @@ CPU physics on a worker thread, which does update the world.
 117 fps on different runs, and an untouched software column moved 21.25 to
 24.39 ms. Quote within-run controls, never a cross-run FPS delta.
 
+**A dispatch dimension caps at 65,535.** One workgroup per 64 bricks is 400,000
+at 10 cm, and exceeding the cap is a validation abort, not a slow frame. Anything
+sized by the world goes through `renderer::linear_dispatch`, which tiles over x
+and y; the shader rebuilds the linear index and MUST bounds-check itself, because
+the tail row over-dispatches.
+
+**A bare voxel count that stands for a length is a silent bug.** It compiles,
+renders and passes; it just means something 2.5x smaller than it says. The list
+of ones that got through the 10 cm bump - cloud scale, surf width, biome
+elevation bands, the light field's near radius, the multiplayer interest radius,
+half the benchmark cameras - is in `docs/SCALE_TO_10CM.md`. They were found by
+reading pictures and harness output, not by reading the diff.
+
 ## Environment flags
 
     VOXELG_RT               hardware ray tracing (also needs adapter support)
@@ -198,7 +251,17 @@ CPU physics on a worker thread, which does update the world.
   `renders_far_from_origin` test, which fails at a few million voxels out.
 - **World dimensions have one home.** `world_dims.rs` feeds both Rust and, via
   `build.rs`, the generated WGSL constants. ENFORCED by construction: there is
-  no second place to edit.
+  no second place to edit. `shaders/grass.wgsl` is the one shader assembled
+  WITHOUT that prelude and carries its own copy of the scale; ENFORCED by
+  `grass::shader_scale_matches_world_dims`, which parses the WGSL.
+- **A world-sized dispatch fits the per-dimension workgroup cap.** ENFORCED by
+  `world_sized_dispatches_fit_the_workgroup_limit`, against the real brick total
+  and the real 65,535 limit rather than a remembered number.
+- **The demo window holds a landscape.** Water, grass and canopy in the loaded
+  window are what the benchmark cameras and the lookdev stills are framed
+  against, and worldgen can lose all three without failing anything else.
+  ENFORCED by `voxel::tests::the_demo_window_holds_both_land_and_water` and
+  `::the_demo_window_grows_a_forest`.
 - **The foliage predicate is shared.** `is_foliage_mat` drives the shell rule,
   the update pass and the sampler. ENFORCED by a test that parses the WGSL and
   compares it against the Rust definition.

@@ -1,3 +1,0 @@
-Progress: dims 400x160x400 bricks @10cm (160x64x160 m), metres-based shader distances,
-worldgen rescaled + new relief field, light field at 2x record spacing (8 records/block,
-pool 2^21 blocks = 128 MiB, demo world binds 536k). Fixing tests now, then measuring.

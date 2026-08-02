@@ -32,7 +32,13 @@ fn vmat(b: Brick, vi: u32) -> u32 {
 
 @compute @workgroup_size(64, 1, 1)
 fn cs_physics(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let bi = gid.x;
+    // The dispatch is TILED over x and y: one workgroup per 64 bricks is 400,000
+    // workgroups at 10 cm and every dispatch dimension caps at 65,535. Workgroup
+    // size y is 1, so `gid.y` IS the workgroup row and the linear brick index is
+    // that row times a full row of INVOCATIONS. `renderer::linear_dispatch` is
+    // the one place that decides the tiling. The tail row over-runs `total`,
+    // which the bounds check below already handled and now depends on.
+    let bi = gid.x + gid.y * u32(DISPATCH_ROW_WGS) * 64u;
     let wbx = u32(WORLD_BRICKS_X);
     let wby = u32(WORLD_BRICKS_Y);
     let wbz = u32(WORLD_BRICKS_Z);

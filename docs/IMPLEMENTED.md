@@ -185,6 +185,12 @@ lowest 65 (excluding the one-time startup second). Chunk-load spike: fixed
 
 ## Roadmap to 10 cm voxels @ 100 fps
 
+**SUPERSEDED by `docs/SCALE_TO_10CM.md`, which is the measured record.** The grid
+IS 10 cm in the tree now, over a 160 m window, and the answer on 100 fps is no:
+the frame is 20-40 ms and the CPU physics tick is 168 ms. Read that document
+first; the section below is the plan as it stood before the bump was measured,
+kept because the wins it describes are the ones that made traversal survive.
+
 10 cm voxels at the current ~128 m world means a ~2.5× denser grid (~15× the
 voxels). Traversal and shading both scale up; the wins below are the path. Done
 this pass are the high-ROI, measured, low-risk ones; the rest are designed but

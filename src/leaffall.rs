@@ -375,12 +375,55 @@ mod tests {
         (w, Vec3::new(240.0, 70.0, 240.0))
     }
 
+    /// The densest patch of canopy in the demo world, and the ground under it.
+    ///
+    /// The camera this replaces was a pair of voxel literals copied from the
+    /// lookdev still - (48, 101, 254) - and voxel literals are precisely what a
+    /// scale change invalidates. That point was 12 m x 63 m into the 128 m
+    /// window a 25 cm voxel gave and is 4.8 m x 25 m into the 160 m window a
+    /// 10 cm voxel gives: a corner of a different world, where this seed grows
+    /// nothing. The test means "park the camera over the forest", so it now
+    /// FINDS the forest instead of remembering where it used to be.
+    ///
+    /// Scanned on a 2 m lattice through the 8 m of air above the terrain-noise
+    /// height, which is where a canopy is; both are real-world sizes, so the
+    /// scan describes the same search at any voxel size.
+    fn forest_anchor(w: &World) -> Vec3 {
+        let step = m_to_vox(2.0) as i32;
+        let reach = m_to_vox(8.0) as i32;
+        let mut best = (0usize, glam::IVec2::ZERO, 0i32);
+        let mut z = 0;
+        while z < crate::voxel::WORLD_VOXELS_Z as i32 {
+            let mut x = 0;
+            while x < crate::voxel::WORLD_VOXELS_X as i32 {
+                let h = crate::voxel::sample_terrain(x as f32, z as f32, w.seed).h;
+                let mut n = 0usize;
+                for y in h..(h + reach).min(WORLD_VOXELS_Y as i32 - 1) {
+                    if is_leaf_mat(w.material_at_world(x, y, z)) {
+                        n += 1;
+                    }
+                }
+                if n > best.0 {
+                    best = (n, glam::IVec2::new(x, z), h);
+                }
+                x += step;
+            }
+            z += step;
+        }
+        assert!(best.0 > 0, "the demo world grew no canopy at all to spawn leaves from");
+        eprintln!(
+            "forest anchor: {:?}, {} leaf voxels in the 8 m above ground y={}",
+            best.1, best.0, best.2
+        );
+        // Eye height above the ground under the canopy: a place, not a voxel count.
+        Vec3::new(best.1.x as f32, best.2 as f32 + m_to_vox(1.7), best.1.y as f32)
+    }
+
     #[test]
     fn spawns_in_demo_world() {
         let mut w = World::new();
         w.fill_demo_terrain();
-        // Same anchor logic as the lookdev still.
-        let cam = Vec3::new(16.0_f32.max(48.0), 101.0, 272.0_f32.min(464.0) - 18.0);
+        let cam = forest_anchor(&w);
         let mut sim = LeafSim::new(11);
         for i in 0..240 {
             sim.step(&w, cam, 1.0 / 60.0, SUN);

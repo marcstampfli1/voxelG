@@ -1,0 +1,57 @@
+﻿cargo : warning: unused variable: `output_tex`
+In Zeile:1 Zeichen:29
++ ... HREADS="1"; cargo test --lib -j 4 live_session_profile -- --ignored - ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (warning: unused variable: `output_tex`:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+    --> src\renderer.rs:4153:13
+     |
+4153 |         let output_tex = _otex;
+     |             ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_output_tex`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `voxel` (lib test) generated 1 warning (run `cargo fix --lib -p voxel --tests` to apply 1 suggestion)
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.36s
+     Running unittests src\lib.rs (target\debug\deps\voxelg-0dcf7c375cba86f7.exe)
+
+running 1 test
+live_session_profile: init frame  sync_light_shell_all 579.3 ms, upload 6.7 ms, 1123509 blocks bound
+
+=== live session: 600 frames in 106.7 s, 3 origin shift(s), 1354752 dirty bricks total (max 3072/frame) ===
+CPU, per frame:
+  physics::tick          mean 168.103 ms  p50  0.000  p99 378.240  max 434.391
+  streaming              mean  1.396 ms  p50  0.076  p99 26.737  max 49.430
+  set_light_focus        mean  0.118 ms  p50  0.000  p99  0.000  max 13.141
+  sync_light_shell_dirty mean  0.174 ms  p50  0.215  p99  0.361  max  0.422
+  upload_voxlight        mean  0.418 ms  p50  0.048  p99  1.360  max  3.893
+voxlight upload: 296 / 600 frames dirty (49%), 12.87 MB/s table + 0.09 MB/s resets, 116.5 writes/frame (148976 reset blocks), cpu shell 0.17 ms + upload 0.42 ms per frame; shell 1057672 blocks, 22817 near 
+(2%), sweep round 19023 wgs of 132209, urgent 247.6 wgs/frame
+  live blocks 1038342..1123509 (pool 4194304), overflow total 0
+  near prefix 22817..33506 of the work list; a sweep round is 19023 workgroups against 132209 if the whole shell were near
+  DISPATCH GATE: 600 / 600 frames dispatched (100%), 600 sweep rounds, 20339 wgs/frame mean (148547 urgent bricks total) - against 600 frames x 19023 wgs on the frame-counter schedule
+  per second: 5.6 sweep rounds + 1392 urgent bricks => wgs/frame at  60fps 1806  144fps 752  240fps 451  400fps 271  (frame-counter schedule: 19023 at every rate)
+
+GPU, 1920x1080, RT primary + probe GI (SHIPPED) variant, 1057672 live blocks (22817 near => 19023 wgs, 132209 if the whole shell were near):
+  segment     vlight  clouds    beam   probe    main  transp compose |    FIXED    frame no-vlight
+scenario anchors: water cell IVec2(600, 40) (64 cols), leaf cell IVec2(520, 760) (70 voxels, ground y=331)
+  sky          2.187   0.783   0.042   2.868   0.311   0.066   0.113 |    5.055    6.419     4.153
+  terrain      2.245   0.322   0.035   2.857  32.711   0.066   0.325 |    5.102   39.518    36.990
+  foliage      2.239   0.333   0.032   2.844  15.837   0.079   0.324 |    5.083   21.997    19.462
+  water        2.202   0.457   0.040   2.852   6.164   1.252   0.306 |    5.055   13.359    11.020
+
+Field coverage of SHADED pixels (green = the field answered, red = it did not and the pixel takes the designed no-direct-sun term):
+scenario anchors: water cell IVec2(600, 40) (64 cols), leaf cell IVec2(520, 760) (70 voxels, ground y=331)
+  sky        field        0 ( 0.000% of shaded)  unanswered        0 ( 0.000%)  unshaded (sky/glass)  2073600
+  terrain    field  1955641 (99.698% of shaded)  unanswered     5923 ( 0.302%)  unshaded (sky/glass)   112036
+    unanswered pixels span x 111..=1352, y 186..=273 of 1920x1080; first: [(1168, 186), (1176, 188), (1174, 189), (1179, 189), (564, 195), (569, 197), (569, 198), (590, 205), (568, 213), (568, 214), (569, 
+214), (574, 216)]
+  foliage    field  1934416 (99.507% of shaded)  unanswered     9590 ( 0.493%)  unshaded (sky/glass)   129594
+    unanswered pixels span x 108..=796, y 0..=92 of 1920x1080; first: [(424, 0), (424, 1), (416, 13), (670, 13), (416, 14), (417, 14), (418, 14), (659, 24), (659, 25), (675, 32), (649, 41), (446, 46)]
+  water      field  1809646 (99.967% of shaded)  unanswered      590 ( 0.033%)  unshaded (sky/glass)   263364
+    unanswered pixels span x 19..=1447, y 55..=303 of 1920x1080; first: [(743, 55), (747, 57), (745, 62), (737, 76), (736, 81), (185, 86), (244, 93), (244, 94), (734, 101), (380, 115), (647, 115), (833, 116)]
+test renderer::gpu_render_tests::live_session_profile ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 161 filtered out; finished in 137.91s
+

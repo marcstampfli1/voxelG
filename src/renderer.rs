@@ -1898,7 +1898,10 @@ impl Renderer {
             });
             cp.set_pipeline(&self.physics_pipeline);
             cp.set_bind_group(0, &self.physics_bg, &[]);
-            cp.dispatch_workgroups((total + 63) / 64, 1, 1);
+            // TILED: one workgroup per 64 bricks is 400,000 of them at 10 cm,
+            // six times the 65,535-per-dimension cap. See `linear_dispatch`.
+            let (dx, dy) = linear_dispatch(total.div_ceil(64));
+            cp.dispatch_workgroups(dx, dy, 1);
         }
         enc.copy_buffer_to_buffer(&self.bricks_buf_b, 0, &self.bricks_buf, 0, self.bricks_buf.size());
         self.queue.submit(std::iter::once(enc.finish()));
@@ -2017,7 +2020,8 @@ impl Renderer {
                 }
                 // `wgs` counts BRICKS due this dispatch; one workgroup gathers
                 // VOXLIGHT_WG_BRICKS of them, one invocation per record.
-                cp.dispatch_workgroups(voxlight_wgs(wgs), 1, 1);
+                let (dx, dy) = linear_dispatch(voxlight_wgs(wgs));
+                cp.dispatch_workgroups(dx, dy, 1);
             }
             // The round counter picks which SLICE of the work list the sweep
             // takes, so it advances with the SWEEP and not with the frame: a
@@ -3493,6 +3497,30 @@ pub(crate) fn voxlight_wgs(slots: u32) -> u32 {
     slots.div_ceil(VOXLIGHT_WG_BRICKS)
 }
 
+/// THE way to turn a workgroup COUNT into `dispatch_workgroups` arguments.
+///
+/// Every dimension of a dispatch is capped at 65,535 (WebGPU's
+/// `maxComputeWorkgroupsPerDimension` floor, which is what wgpu reports by
+/// default), and at 10 cm two passes cross it: one workgroup per brick is
+/// 400,000, and a whole-shell light sweep is a few tens of thousands and rising
+/// with the shell. Exceeding it is not a slow frame, it is a validation abort.
+///
+/// So the count is TILED over x and y, and the shader rebuilds the linear index
+/// from `wg.x + wg.y * DISPATCH_ROW_WGS`. The tail row over-dispatches, so EVERY
+/// shader reached through this must bounds-check its own index - `cs_physics`
+/// against the brick total, `cs_voxel_light_update` through `vl_work`.
+/// FORBIDDEN: open-coding `n.div_ceil(64)` into a dispatch for anything sized by
+/// the world, which is exactly how the physics pass shipped broken.
+#[inline]
+pub(crate) fn linear_dispatch(wgs: u32) -> (u32, u32) {
+    let row = crate::world_dims::DISPATCH_ROW_WGS;
+    if wgs <= row {
+        (wgs, 1)
+    } else {
+        (row, wgs.div_ceil(row))
+    }
+}
+
 pub(crate) fn voxlight_params(
     live_count: u32, round: u32, light_count: u32, near_count: u32,
 ) -> VoxLightParamsUniform {
@@ -3912,6 +3940,44 @@ mod shader_tests {
     fn physics_wgsl_valid() {
         let src = format!("{}\n{}", WORLD_CONSTS_WGSL, include_str!("../shaders/physics.wgsl"));
         validate("physics.wgsl", &src);
+    }
+
+    /// Every world-sized dispatch must fit `maxComputeWorkgroupsPerDimension`.
+    ///
+    /// 65,535 per dimension is the WebGPU floor and what wgpu reports by
+    /// default; `Renderer::new` does not raise it and should not have to. At
+    /// 25 cm a per-brick pass was 16,384 workgroups and this was invisible; at
+    /// 10 cm it is 400,000 and the GPU physics path aborted the frame with a
+    /// validation error. That failure mode is why the count goes through
+    /// `linear_dispatch` and why this is checked against the REAL brick total
+    /// rather than against a remembered number.
+    #[test]
+    fn world_sized_dispatches_fit_the_workgroup_limit() {
+        const LIMIT: u32 = 65_535;
+        assert!(
+            crate::world_dims::DISPATCH_ROW_WGS <= LIMIT,
+            "DISPATCH_ROW_WGS itself is over the per-dimension cap"
+        );
+        // One workgroup per 64 bricks (cs_physics), and one per
+        // VOXLIGHT_WG_BRICKS bricks over a worst-case whole-shell light sweep.
+        let cases = [
+            ("cs_physics", crate::voxel::WORLD_BRICKS_TOTAL.div_ceil(64)),
+            (
+                "cs_voxel_light_update",
+                super::voxlight_wgs(crate::voxlight::LIGHT_BLOCKS_MAX),
+            ),
+        ];
+        for (name, wgs) in cases {
+            let (x, y) = super::linear_dispatch(wgs);
+            assert!(
+                x <= LIMIT && y <= LIMIT,
+                "{name}: {wgs} workgroups tile to ({x}, {y}), over the {LIMIT} cap"
+            );
+            assert!(
+                (x as u64) * (y as u64) >= wgs as u64,
+                "{name}: the tiling ({x}, {y}) drops work from {wgs} workgroups"
+            );
+        }
     }
 }
 
@@ -4997,7 +5063,13 @@ mod gpu_render_tests {
                 cp.set_pipeline(&p_vl);
                 cp.set_bind_group(0, &bg_main[parity], &[]);
                 cp.set_bind_group(1, &rt_bg[parity], &[]);
-                cp.dispatch_workgroups(vl_count.div_ceil(VOXLIGHT_UPDATE_DIV), 1, 1);
+                // Bricks -> workgroups goes through `voxlight_wgs`, like every
+                // other dispatch of this pass: a record is a group of voxels now,
+                // so one workgroup covers several bricks and a raw brick count
+                // dispatches VOXLIGHT_WG_BRICKS times too many.
+                let (dx, dy) =
+                    linear_dispatch(voxlight_wgs(vl_count.div_ceil(VOXLIGHT_UPDATE_DIV)));
+                cp.dispatch_workgroups(dx, dy, 1);
             }
             for (pipe, bg) in [(&p_main, &bg_main[parity]), (&p_transp, &bg_main[parity])] {
                 let mut cp = enc.begin_compute_pass(&Default::default());
@@ -5841,32 +5913,44 @@ mod gpu_render_tests {
         v.max(m).min(crate::voxel::WORLD_VOXELS_X as i32 - m) as f32
     }
 
-    /// Densest 32x32 column-cell in one specific material, for per-species
+    /// Densest 8 m column-cell in one specific material, for per-species
     /// views. None when the demo seed grew no such trees in the slot window
     /// (callers skip loudly instead of asserting on an absent species).
+    ///
+    /// Metres throughout, for the same reason `find_scene_anchors` is: an 8 m
+    /// cell sampled every metre over the whole window, scanning the 5..35 m band
+    /// where canopies live. As voxel literals (a 32-voxel cell every 4 voxels,
+    /// y 60..140 of a 256-tall window) the cell shrank to 3.2 m and the y band
+    /// stopped at 14 m, below most of the forest.
     fn find_species_anchor(world: &World, mat: u8) -> Option<(glam::IVec2, i32)> {
-        let cells = crate::voxel::WORLD_VOXELS_X as i32 / crate::voxel::m_to_vox_i(8.0);
+        use crate::voxel::m_to_vox_i;
+        let cell = m_to_vox_i(8.0);
+        let step = m_to_vox_i(1.0).max(1);
+        let cells_x = crate::voxel::WORLD_VOXELS_X as i32 / cell;
+        let cells_z = crate::voxel::WORLD_VOXELS_Z as i32 / cell;
+        let y_top = m_to_vox_i(50.0).min(crate::voxel::WORLD_VOXELS_Y as i32 - 1);
+        let (lo, hi) = (m_to_vox_i(5.0), m_to_vox_i(35.0).min(y_top));
         let mut best = (0usize, glam::IVec2::ZERO);
-        for cz in 0..cells {
-            for cx in 0..cells {
+        for cz in 0..cells_z {
+            for cx in 0..cells_x {
                 let mut n = 0usize;
-                for dz in (0..32).step_by(4) {
-                    for dx in (0..32).step_by(4) {
-                        let (x, z) = (cx * 32 + dx, cz * 32 + dz);
-                        for y in 60..140 {
+                for dz in (0..cell).step_by(step as usize) {
+                    for dx in (0..cell).step_by(step as usize) {
+                        let (x, z) = (cx * cell + dx, cz * cell + dz);
+                        for y in (lo..hi).step_by(step as usize) {
                             if world.material_at_world(x, y, z) == mat { n += 1; }
                         }
                     }
                 }
-                let c = glam::IVec2::new(cx * 32 + 16, cz * 32 + 16);
+                let c = glam::IVec2::new(cx * cell + cell / 2, cz * cell + cell / 2);
                 if n > best.0 { best = (n, c); }
             }
         }
         if best.0 == 0 { return None; }
-        let ground = (1..200)
+        let ground = (1..y_top)
             .rev()
             .find(|&y| world.material_at_world(best.1.x, y, best.1.y) != MAT_AIR)
-            .unwrap_or(80);
+            .unwrap_or(m_to_vox_i(20.0));
         Some((best.1, ground))
     }
 
@@ -7271,14 +7355,15 @@ mod gpu_render_tests {
     }
 
     /// Renders a floating wall (or slab top) of `mat` twice: once as built,
-    /// once shifted one voxel along the face normal WITH the camera shifted
-    /// identically. Camera-relative geometry, lighting, fog and jitter are
-    /// then identical - the only degree of freedom left is the texture
-    /// pattern's dependence on the depth coordinate. Returns the mean
-    /// absolute luma-normalized difference over the face interior crop
-    /// (normalization cancels legitimate per-face constants like the
-    /// strata level on terrace tops).
-    fn normal_shift_diff(mat: u8, top_face: bool) -> Option<f32> {
+    /// once shifted `by` voxels along the face normal WITH the camera shifted
+    /// identically. Camera-relative geometry, fog and jitter are then
+    /// identical - the only degrees of freedom left are the texture pattern's
+    /// dependence on the depth coordinate and, since the light field is a
+    /// LATTICE that does not move with the geometry, where the face falls
+    /// between records. Returns the mean absolute luma-normalized difference
+    /// over the face interior crop (normalization cancels legitimate per-face
+    /// constants like the strata level on terrace tops).
+    fn normal_shift_diff(mat: u8, top_face: bool, by: u32) -> Option<f32> {
         let (w, h) = (640u32, 400u32);
         let render = |shift: u32| -> Option<Vec<u8>> {
             let mut world = World::new();
@@ -7313,7 +7398,7 @@ mod gpu_render_tests {
             render_rgba_at_time(&world, &cam, w, h, 30.0)
         };
         let a = render(0)?;
-        let b = render(1)?;
+        let b = render(by)?;
         let (w, h) = (w as usize, h as usize);
         let crop = |f: &[u8]| {
             let mut v = Vec::new();
@@ -7325,40 +7410,115 @@ mod gpu_render_tests {
             }
             v
         };
+        let (cw, ch) = (w / 2, h / 2);
         let (ca, cb) = (crop(&a), crop(&b));
         let ma = ca.iter().sum::<f32>() / ca.len() as f32;
         let mb = cb.iter().sum::<f32>() / cb.len() as f32;
         assert!(ma > 0.03 && mb > 0.03, "face crop unexpectedly dark - scene/camera bug");
-        let diff = ca
+        // LOCAL contrast, not absolute brightness.
+        //
+        // The frame contains world-space fields that a translated wall really
+        // does move through - the ground cloud-shade taps read `cloud_density`
+        // at `p_hit + sun * (slab / sun.y)`, so a wall 20 cm further away sits
+        // under a different part of the cloud. That is correct rendering, and it
+        // is a SMOOTH multiplicative field: dividing each image by a heavily
+        // blurred copy of itself cancels it exactly, in each image separately,
+        // and leaves the crack lines and facet plates - which is what "the
+        // pattern must line up across a step" means. Without it this test
+        // measured whichever cloud edge happened to fall on the lab wall (0.065
+        // where the pattern itself was identical to the eye), and at 25 cm it
+        // passed on the luck of there being no edge there.
+        //
+        // A 3D texture field (the regression this exists to catch) moves the
+        // pattern itself, which is far finer than the blur radius and therefore
+        // survives untouched.
+        let (na, nb) = (local_contrast(&ca, cw, ch), local_contrast(&cb, cw, ch));
+        let diff = na
             .iter()
-            .zip(&cb)
-            .map(|(x, y)| (x / ma - y / mb).abs())
+            .zip(&nb)
+            .map(|(x, y)| (x - y).abs())
             .sum::<f32>()
-            / ca.len() as f32;
+            / na.len() as f32;
         Some(diff)
+    }
+
+    /// Divide an image by a box-blurred copy of itself: keeps everything finer
+    /// than `LOCAL_CONTRAST_R` and cancels everything smoother.
+    const LOCAL_CONTRAST_R: usize = 32;
+
+    fn local_contrast(v: &[f32], w: usize, h: usize) -> Vec<f32> {
+        let blur = box_blur(v, w, h, LOCAL_CONTRAST_R);
+        v.iter()
+            .zip(&blur)
+            .map(|(x, m)| if *m > 1.0e-4 { x / m } else { 0.0 })
+            .collect()
+    }
+
+    /// Separable box blur with clamped edges. Radius in pixels.
+    fn box_blur(v: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
+        let mut tmp = vec![0.0f32; v.len()];
+        for y in 0..h {
+            for x in 0..w {
+                let (x0, x1) = (x.saturating_sub(r), (x + r).min(w - 1));
+                let mut s = 0.0;
+                for xx in x0..=x1 {
+                    s += v[y * w + xx];
+                }
+                tmp[y * w + x] = s / (x1 - x0 + 1) as f32;
+            }
+        }
+        let mut out = vec![0.0f32; v.len()];
+        for y in 0..h {
+            let (y0, y1) = (y.saturating_sub(r), (y + r).min(h - 1));
+            for x in 0..w {
+                let mut s = 0.0;
+                for yy in y0..=y1 {
+                    s += tmp[yy * w + x];
+                }
+                out[y * w + x] = s / (y1 - y0 + 1) as f32;
+            }
+        }
+        out
     }
 
     /// The user's stone acceptance criterion, encoded: pattern lines must
     /// line up 100% across faces at different depths (wall steps, terraces).
     /// With planar tex_uv projection the pattern is a pure function of the
-    /// face-plane coordinates, so a 1-voxel shift along the normal must
-    /// leave the rendered face PIXEL-IDENTICAL. 3D fields (worley3-era
-    /// stone/ice/micro-grain) show a different slice instead.
+    /// face-plane coordinates, so a shift along the normal must leave the
+    /// rendered face PIXEL-IDENTICAL. 3D fields (worley3-era stone/ice/
+    /// micro-grain) show a different slice instead.
     /// Measured pre-fix (3D worley/grain): stone side 0.148, stone top
     /// 0.180, ice side 0.137; post-fix (planar): 0.0000 / 0.0012 / 0.0000
     /// (the top-face residual is the strata level constant vs the crop's
     /// perspective AO gradient, far under the gate).
+    ///
+    /// The shift is a RECORD CELL, not one voxel, and that is a real change of
+    /// premise rather than a loosened gate. The light field is a LATTICE with a
+    /// spacing of `LIGHT_RECORD_STEP` voxels, and it does not move when the
+    /// geometry does: shifting a wall by one voxel at a step of 2 lands the face
+    /// on the other parity of that lattice, so the two frames differ by how the
+    /// face sits between records - which is lighting, not texture, and would
+    /// mask exactly the 3D-texture regression this test exists to catch. At
+    /// 25 cm the step was 1 and a one-voxel shift WAS a lattice shift, which is
+    /// why the number used to come out 0.0000; `LIGHT_RECORD_STEP` voxels is the
+    /// same measurement written so it stays that measurement.
+    ///
+    /// The residual the parity itself costs is reported alongside, and bounded,
+    /// because it is what a player sees on a terrace: measured at 0.0453 before
+    /// the AO kernel was moved onto the record lattice and 0.008 after.
     #[test]
     fn texture_pattern_is_depth_invariant() {
         use crate::voxel::{MAT_ICE, MAT_STONE};
-        let Some(stone_side) = normal_shift_diff(MAT_STONE, false) else {
-            eprintln!("no GPU adapter â€” skipping depth-invariance test");
+        let step = crate::voxlight::LIGHT_RECORD_STEP;
+        let Some(stone_side) = normal_shift_diff(MAT_STONE, false, step) else {
+            eprintln!("no GPU adapter - skipping depth-invariance test");
             return;
         };
-        let stone_top = normal_shift_diff(MAT_STONE, true).unwrap();
-        let ice_side = normal_shift_diff(MAT_ICE, false).unwrap();
+        let stone_top = normal_shift_diff(MAT_STONE, true, step).unwrap();
+        let ice_side = normal_shift_diff(MAT_ICE, false, step).unwrap();
         eprintln!(
-            "normal-shift pattern diff: stone side {stone_side:.4}, stone top {stone_top:.4}, ice side {ice_side:.4}"
+            "normal-shift ({step}-voxel) pattern diff: stone side {stone_side:.4}, \
+             stone top {stone_top:.4}, ice side {ice_side:.4}"
         );
         for (name, d) in [("stone side", stone_side), ("stone top", stone_top), ("ice side", ice_side)] {
             assert!(
@@ -7367,6 +7527,22 @@ mod gpu_render_tests {
                  lines cannot line up across steps/terraces"
             );
         }
+
+        // A ONE-voxel step, i.e. HALF a record cell, has to look the same too.
+        // This is the light lattice's parity and nothing else: the face lands on
+        // the other side of the record grid, so a different cell answers it. It
+        // measured 0.0453 while the AO kernel probed single VOXELS - the nearest
+        // live record then found the ground for one parity and missed it for the
+        // other - and 0.0000 once the kernel moved onto the record lattice
+        // (`vl_cell_ao`). Terraces that blink between light and dark are what
+        // this catches.
+        let parity = normal_shift_diff(MAT_STONE, false, 1).unwrap();
+        eprintln!("one-voxel (half a record cell) stone side diff: {parity:.4}");
+        assert!(
+            parity < 0.0075,
+            "a one-voxel step changes the wall by {parity:.4}; the light lattice's parity is \
+             visible as terraces that blink between light and dark"
+        );
     }
 
     /// One-off high-res probe of the stone-corner macro view (2x the lookdev
@@ -7828,12 +8004,31 @@ mod gpu_render_tests {
             let i = (y * w + x) * 4;
             (frame[i] as i32, frame[i + 1] as i32, frame[i + 2] as i32)
         };
-        // Bright AND desaturated. The island is grassed precisely so that it is
-        // green-led and cannot be mistaken for foam by a saturation test.
+        // Foam is DESATURATED and much brighter THAN ITS OWN NEIGHBOURHOOD.
+        //
+        // The second half used to be an absolute `lo >= 130`, and that measured
+        // the weather rather than the foam: `cs_compose` multiplies every ground
+        // pixel by a cloud-shade term sampled where the sun ray leaves the cloud
+        // slab, so which part of a lake is bright is a smooth field that moves
+        // with the clouds. It was luck that the island sat in a bright patch,
+        // and the pale washed water there counted as foam wholesale - 11,036
+        // "foam" pixels in the shoreline crop against 2,234 of actual stamps.
+        // Move the cloud (which raising the slab to a real-world 47.5 m does)
+        // and the same scene reads as having no shore foam at all.
+        //
+        // Local contrast is invariant to it: cloud shade is MULTIPLICATIVE and
+        // ~100 px across, so dividing by a 32 px blur cancels it exactly, while
+        // a foam stamp - a few quarter-voxel texels of hard white - is far finer
+        // than the blur and survives at its full contrast.
+        let luma: Vec<f32> = frame
+            .chunks_exact(4)
+            .map(|p| (p[0] as f32 + p[1] as f32 + p[2] as f32) / (3.0 * 255.0))
+            .collect();
+        let rel = local_contrast(&luma, w, h);
         let is_foam = |x: usize, y: usize| {
             let (r, g, b) = at(x, y);
             let (hi, lo) = (r.max(g).max(b), r.min(g).min(b));
-            hi - lo <= 28 && lo >= 130
+            hi - lo <= 28 && rel[y * w + x] > 1.30
         };
         let is_water = |x: usize, y: usize| {
             let (r, _g, b) = at(x, y);
@@ -7858,16 +8053,69 @@ mod gpu_render_tests {
         // and would read as "no crest foam" when the fade is all that is being
         // measured.
         let open = density(w / 2 - 330, h / 2 - 130, w / 2 - 200, h / 2 + 130);
-        let shore = density(w / 2 - 110, h / 2 - 110, w / 2 + 110, h / 2 + 110);
-        eprintln!("water foam density: open water {open:.4}, island ring {shore:.4}");
+        eprintln!("water foam density: open water {open:.4}");
         assert!(
             open > 0.004,
             "no crest foam on open water ({open:.4} of the strip); wave tops are not breaking"
         );
+
+        // SHORE foam, measured where the shore IS.
+        //
+        // The old comparison was a 220 px box centred on the island against the
+        // open strip, and it could not tell shore foam from the crest foam that
+        // fills the same box - the ring is a 12.5 cm band around a 2 m island, so
+        // it is a small part of that area whatever it does. Compare instead the
+        // annulus HUGGING the island against water further out in the SAME crop:
+        // same distance, same waves, same weather, and the only difference is
+        // proximity to the shore. The island finds itself (it is the only
+        // green-led thing in frame), so this survives the camera moving.
+        let mut ix = (usize::MAX, 0usize);
+        let mut iy = (usize::MAX, 0usize);
+        for y in h / 2 - 160..h / 2 + 160 {
+            for x in w / 2 - 160..w / 2 + 160 {
+                let (r, g, b) = at(x, y);
+                if g > r + 20 && g > b + 20 {
+                    ix = (ix.0.min(x), ix.1.max(x));
+                    iy = (iy.0.min(y), iy.1.max(y));
+                }
+            }
+        }
+        assert!(ix.0 != usize::MAX, "the grassed island is not in frame");
+        // The surf band is WATER_FOAM_SHORE_M wide; two band widths of screen
+        // space around the island is the annulus, and everything past four is
+        // "open water at the same distance".
+        let px_per_voxel = (iy.1 - iy.0) as f32 / 8.0; // the island is 8 voxels
+        let ring_px = (2.0 * 0.125 * crate::world_dims::VOXELS_PER_METRE * px_per_voxel) as usize;
+        let band = |lo: usize, hi: usize| -> f32 {
+            let (mut foam, mut surface) = (0usize, 0usize);
+            for y in iy.0.saturating_sub(hi)..(iy.1 + hi).min(h - 1) {
+                for x in ix.0.saturating_sub(hi)..(ix.1 + hi).min(w - 1) {
+                    // Chebyshev distance outside the island's screen box.
+                    let dx = ix.0.saturating_sub(x).max(x.saturating_sub(ix.1));
+                    let dy = iy.0.saturating_sub(y).max(y.saturating_sub(iy.1));
+                    let d = dx.max(dy);
+                    if d < lo || d >= hi {
+                        continue;
+                    }
+                    if is_foam(x, y) {
+                        foam += 1;
+                        surface += 1;
+                    } else if is_water(x, y) {
+                        surface += 1;
+                    }
+                }
+            }
+            foam as f32 / surface.max(1) as f32
+        };
+        let ring = band(1, ring_px);
+        let away = band(2 * ring_px, 4 * ring_px);
+        eprintln!(
+            "shore annulus ({ring_px} px): hugging the island {ring:.4}, same-distance open water {away:.4}"
+        );
         assert!(
-            shore > 3.0 * open,
-            "the island ring ({shore:.4}) is not markedly foamier than open water ({open:.4}) - \
-             shore foam is missing"
+            ring > 2.0 * away.max(0.004),
+            "the water hugging the island ({ring:.4}) is no foamier than water a little further \
+             out ({away:.4}) - shore foam is missing"
         );
 
         // NEAR-WHITE, judged on the brightest 5% of the shoreline crop.
@@ -8108,11 +8356,17 @@ mod gpu_render_tests {
         // deleted: the per-voxel reflection field went in round F and the
         // per-pixel shadow path went with this change, so an unbound render is
         // not "the other implementation" any more, it is an unlit picture.
+        // Camera HEIGHTS and standoffs are metres. As voxel literals (71 / 72 for
+        // an eye 1.75 m over a sea level that was voxel row 64; +5 / +16 / +26
+        // over the ground; -8 / -16 / -26 / -32 back from the anchor) every one
+        // of these shots framed something different at 10 cm - the water pair
+        // ended up 10 m UNDER the sea, since sea level is voxel row 160 now.
+        use crate::voxel::{m_to_vox, SEA_LEVEL};
         let mut water_graze = Camera::new();
         water_graze.pos = glam::Vec3::new(
             clamp_anchor(water_c.x),
-            71.0,
-            clamp_anchor(water_c.y) - 8.0,
+            SEA_LEVEL as f32 + m_to_vox(1.75),
+            clamp_anchor(water_c.y) - m_to_vox(2.0),
         );
         water_graze.pitch = -0.22;
 
@@ -8131,9 +8385,9 @@ mod gpu_render_tests {
 
         let mut tree_close = Camera::new();
         tree_close.pos = glam::Vec3::new(
-            clamp_anchor(leaf_c.x) + 1.0,
-            leaf_ground as f32 + 5.0,
-            clamp_anchor(leaf_c.y) - 16.0,
+            clamp_anchor(leaf_c.x) + m_to_vox(0.25),
+            leaf_ground as f32 + m_to_vox(1.25),
+            clamp_anchor(leaf_c.y) - m_to_vox(4.0),
         );
         tree_close.pitch = 0.12;
         save("tree_close", &tree_close);
@@ -8141,8 +8395,8 @@ mod gpu_render_tests {
         let mut forest_mid = Camera::new();
         forest_mid.pos = glam::Vec3::new(
             clamp_anchor(leaf_c.x),
-            leaf_ground as f32 + 16.0,
-            clamp_anchor(leaf_c.y) - 32.0,
+            leaf_ground as f32 + m_to_vox(4.0),
+            clamp_anchor(leaf_c.y) - m_to_vox(8.0),
         );
         forest_mid.pitch = -0.08;
         save("forest_mid", &forest_mid);
@@ -8150,8 +8404,8 @@ mod gpu_render_tests {
         let mut water_view = Camera::new();
         water_view.pos = glam::Vec3::new(
             clamp_anchor(water_c.x),
-            72.0,
-            clamp_anchor(water_c.y) - 26.0,
+            SEA_LEVEL as f32 + m_to_vox(2.0),
+            clamp_anchor(water_c.y) - m_to_vox(6.5),
         );
         water_view.pitch = -0.35;
         save("water_view", &water_view);
@@ -8164,11 +8418,40 @@ mod gpu_render_tests {
         let mut canopy_top = Camera::new();
         canopy_top.pos = glam::Vec3::new(
             clamp_anchor(leaf_c.x),
-            leaf_ground as f32 + 26.0,
+            leaf_ground as f32 + m_to_vox(6.5),
             clamp_anchor(leaf_c.y),
         );
         canopy_top.pitch = -1.45;
         save("canopy_top", &canopy_top);
+
+        // SCALE. Nothing else in this set is framed wide enough to say whether
+        // the window reads as a bigger PLACE or as the same hills at a finer
+        // grid, which is the question the 10 cm bump exists to answer. Two
+        // shots: a standing eye, and one high enough that the whole 160 m window
+        // is in frame. Both at the window centre so they are reproducible.
+        //
+        // The high one sits just UNDER `CLOUD_BASE` (47.5 m): the world is only
+        // 64 m tall, so a camera much higher than this is inside the cloud deck
+        // looking down through it, and the shot stops being about the terrain.
+        let cx = crate::voxel::WORLD_VOXELS_X as f32 * 0.5;
+        let cz = crate::voxel::WORLD_VOXELS_Z as f32 * 0.5;
+        let gh = crate::voxel::sample_terrain(cx, cz, world.seed).h as f32;
+        let roof = crate::voxel::WORLD_VOXELS_Y as f32 - m_to_vox(2.0);
+        let mut vista_eye = Camera::new();
+        vista_eye.pos = glam::Vec3::new(cx, (gh + m_to_vox(1.7)).min(roof), cz);
+        vista_eye.yaw = 0.6;
+        vista_eye.pitch = -0.04;
+        save("vista_eye", &vista_eye);
+
+        let mut vista_high = Camera::new();
+        vista_high.pos = glam::Vec3::new(
+            cx,
+            (gh + m_to_vox(18.0)).min(roof).min(m_to_vox(44.0)),
+            cz,
+        );
+        vista_high.yaw = 0.6;
+        vista_high.pitch = -0.28;
+        save("vista_high", &vista_high);
 
         // Crafted scenes: diagonal-terrace water + the leaf lab (same
         // builders as their content tests).
@@ -9311,7 +9594,11 @@ mod gpu_render_tests {
             let mut cp = enc.begin_compute_pass(&Default::default());
             cp.set_pipeline(&pipe);
             cp.set_bind_group(0, &bg, &[]);
-            cp.dispatch_workgroups(((total as u32) + 63) / 64, 1, 1);
+            // Through the SAME tiling the renderer uses. Dispatched flat this is
+            // 400,000 workgroups at 10 cm against a 65,535-per-dimension cap, and
+            // the failure is a validation abort rather than a wrong picture.
+            let (dx, dy) = super::linear_dispatch(((total as u32) + 63) / 64);
+            cp.dispatch_workgroups(dx, dy, 1);
         }
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("phys readback"), size: stride,
@@ -9467,8 +9754,11 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
                     }
                     // One invocation per record; VOXLIGHT_WG_BRICKS bricks per
                     // workgroup.
-                    cp.dispatch_workgroups(
-                        voxlight_wgs(voxlight_dispatch_blocks(self.count, self.near)), 1, 1);
+                    let (dx, dy) = linear_dispatch(voxlight_wgs(voxlight_dispatch_blocks(
+                        self.count,
+                        self.near,
+                    )));
+                    cp.dispatch_workgroups(dx, dy, 1);
                 }
                 self.queue.submit(std::iter::once(enc.finish()));
             }
@@ -9948,7 +10238,8 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
                     if let Some(rt) = &self.rt_bg {
                         cp.set_bind_group(1, rt, &[]);
                     }
-                    cp.dispatch_workgroups(voxlight_wgs(vl_wgs), 1, 1);
+                    let (dx, dy) = linear_dispatch(voxlight_wgs(vl_wgs));
+                    cp.dispatch_workgroups(dx, dy, 1);
                 }
                 _ => {
                     let (pipe, bind) = match pass {
@@ -10761,6 +11052,26 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
     fn vl_sun_vis(pool: &[u32], world: &World, v: glam::IVec3) -> u32 {
         let w = vl_record_word(world, v).unwrap_or_else(|| panic!("voxel {v} has no light block"));
         pool[w as usize] & 0xFF
+    }
+
+    /// The lowest record row that carries light above a solid top at `top`.
+    ///
+    /// A record covers a LIGHT_RECORD_STEP^3 CELL, and a cell holding any opaque
+    /// voxel is deliberately left dead (that rule is what keeps a one-voxel wall
+    /// opaque - `voxlight_does_not_leak_through_a_one_voxel_wall`). So for one
+    /// parity of the surface height the air voxel TOUCHING the surface shares its
+    /// cell with the ground and has no record of its own, and reading it back
+    /// gives 0 for "no storage" rather than 0 for "dark". Direct pool reads must
+    /// therefore start at the first cell boundary clear of the solid, which is
+    /// what this returns; at step 1 it is exactly `top + 1`.
+    ///
+    /// The SAMPLER has no such constraint - `voxlight_sample` steps out half a
+    /// record cell and interpolates - so this is only for tests that read the
+    /// pool directly.
+    fn vl_first_lit_row(top: i32) -> i32 {
+        // i32::div_ceil is still unstable; both operands here are positive.
+        let s = crate::voxlight::LIGHT_RECORD_STEP as i32;
+        (top + s) / s * s
     }
 
     // Crafted-scene geometry. Ground and overhang share the x span so the
@@ -11665,9 +11976,12 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
         rig.converge(128);
         let pool = rig.read_live_pool();
 
-        // One voxel above the ground surface, mid-span in x so the overhang's
-        // x edges are 32 voxels away and only its z edge is in play.
-        let y = VL_GROUND_Y as i32 + 1;
+        // The lowest record row that carries light above the ground, mid-span in
+        // x so the overhang's x edges are 32 voxels away and only its z edge is
+        // in play. NOT `VL_GROUND_Y + 1`: at a record step of 2 that voxel shares
+        // its cell with the ground itself, which is dead by design, so the row
+        // read back as 31 zeroes - "no storage", indistinguishable from "no sun".
+        let y = vl_first_lit_row(VL_GROUND_Y as i32);
         let row: Vec<(i32, u32)> = (202..=232)
             .map(|z| (z, vl_sun_vis(&pool, &world, glam::IVec3::new(232, y, z))))
             .collect();
@@ -11714,37 +12028,101 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
     ///   storage for, and a leaf block really is opaque (`leaf_bl_quads` spans
     ///   2.3 x 2.0 blocks, so one leaf cell covers its own cell), so this is the
     ///   storage and the lit-crown / dark-interior case.
-    /// - A SPARSE canopy at x 250..290, half its cells empty on a fixed hash.
+    /// - A SPARSE canopy at x 250..290, half its CLUMPS empty on a fixed hash.
     ///   This is the shape a real tree has - a shell of leaf blocks around
     ///   branches, with gaps the sun reaches through - and it is where the
     ///   CONTINUOUS gradient the field exists to produce actually appears.
     fn voxlight_canopy_world() -> World {
         use crate::voxel::{MAT_DIRT, MAT_LEAVES};
         let mut w = World::new();
+        let clump = vl_clump();
+        let sparse_y0 = VL_CANOPY_TOP - vl_sparse_depth();
         for z in 190..230u32 {
             for x in 190..290u32 {
                 w.set_voxel(x, 60, z, MAT_DIRT);
             }
             for x in 190..230u32 {
-                for y in 80..92u32 {
+                for y in 80..VL_CANOPY_TOP {
                     w.set_voxel(x, y, z, MAT_LEAVES);
                 }
             }
+            let fill = vl_sparse_fill_permille();
             for x in 250..290u32 {
-                // FIVE voxels deep, not twelve: that is the thickness of a real
-                // crown's lit flank. At 50% density twelve voxels of anything is
-                // opaque by depth three, which measures the binomial and not the
-                // field.
-                for y in 87..92u32 {
-                    // Fixed integer hash, so the scene is identical every run.
-                    let h = x.wrapping_mul(73_856_093) ^ y.wrapping_mul(19_349_663) ^ z.wrapping_mul(83_492_791);
-                    if h % 2 == 0 {
+                for y in sparse_y0..VL_CANOPY_TOP {
+                    // Fixed integer hash of the CLUMP, so the scene is identical
+                    // every run and the same physical canopy at any voxel size.
+                    if vl_clump_filled(x / clump, y / clump, z / clump, fill) {
                         w.set_voxel(x, y, z, MAT_LEAVES);
                     }
                 }
             }
         }
         w
+    }
+
+    /// Top plane of both canopies in `voxlight_canopy_world`.
+    const VL_CANOPY_TOP: u32 = 92;
+
+    /// Edge of one leaf CLUMP in the sparse canopy, in voxels (at least one).
+    ///
+    /// The gaps a real crown lets the sun through are a hand's width across, not
+    /// a voxel. Written as a per-VOXEL checkerboard - which is what this was -
+    /// the structure is 25 cm at a 25 cm voxel and 10 cm at a 10 cm one, and
+    /// 10 cm is FINER than the 20 cm light-record lattice, so the field cannot
+    /// resolve it however continuous its estimate: measured, 0 of 6000 records
+    /// came back intermediate and every record was either fully lit or fully
+    /// dark, in exact 2-voxel layers. At 25 cm a clump is ONE voxel at the old
+    /// grid (which is the canopy this test was calibrated on) and one record
+    /// cell at the new one, so the same physical canopy is measured either way
+    /// and what the histogram below reports is the FIELD, not the sampling
+    /// theorem.
+    fn vl_clump() -> u32 {
+        (crate::voxel::m_to_vox(0.25) as u32).max(1)
+    }
+
+    /// Depth of the sparse canopy: the 1.25 m of lit flank a real crown has.
+    ///
+    /// Written as the bare 5 voxels it was, this becomes 50 cm at 10 cm voxels -
+    /// under half a clump - and there is no canopy left to fall off through.
+    fn vl_sparse_depth() -> u32 {
+        (crate::voxel::m_to_vox(1.25) as u32).max(1)
+    }
+
+    /// Expected number of LEAF VOXELS a vertical line crosses in the sparse
+    /// canopy - its optical depth - as permille of clumps filled.
+    ///
+    /// THIS, not the fill fraction, is what a canopy's translucency is made of,
+    /// and holding the fill fraction instead is what a naive port of this
+    /// fixture gets wrong. Every leaf voxel draws its own cutout card, so at a
+    /// fixed fill a metre of canopy holds 2.5x the cards at 10 cm and is 2.5x
+    /// more opaque: the same 50%-filled 1.25 m flank went from ~2.5 crossings to
+    /// ~6, every one of the eight sun rays was stopped by something, and the
+    /// stored visibility collapsed to 0 or 255 (measured: 4.3% intermediate
+    /// against the 20% this test requires). Fixing the CROSSINGS at 2.5 - which
+    /// is exactly what the 25 cm fixture's 5 voxels at 50% produced - restores
+    /// the same physical canopy at any voxel size.
+    const VL_SPARSE_CROSSINGS: f32 = 2.5;
+
+    fn vl_sparse_fill_permille() -> u32 {
+        let p = VL_SPARSE_CROSSINGS / vl_sparse_depth() as f32;
+        (p.clamp(0.0, 1.0) * 1000.0).round() as u32
+    }
+
+    /// Is this clump of the sparse canopy filled? Fixed and well-mixed, so the
+    /// scene is identical every run.
+    fn vl_clump_filled(cx: u32, cy: u32, cz: u32, fill_permille: u32) -> bool {
+        let mut h = cx
+            .wrapping_mul(73_856_093)
+            ^ cy.wrapping_mul(19_349_663)
+            ^ cz.wrapping_mul(83_492_791);
+        // Finalise: the raw XOR-of-products has the parity of cx^cy^cz in its low
+        // bits, so a low-bit test lays the clumps out as a 3D checkerboard -
+        // which is a regular lattice, not a canopy, and puts a filled clump
+        // directly above every gap.
+        h ^= h >> 15;
+        h = h.wrapping_mul(0x2c1b_3c6d);
+        h ^= h >> 12;
+        h % 1000 < fill_permille
     }
 
     /// FOLIAGE CARRIES LIGHT, and a canopy reads as a volume rather than a hole.
@@ -11846,8 +12224,13 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
         // to sit above one x,z.
         let mut hist = [0usize; 3]; // dark (<8) / intermediate / lit (>247)
         let mut sample = Vec::new();
+        let sparse_y0 = (VL_CANOPY_TOP - vl_sparse_depth()) as i32;
+        // Mean per DEPTH, so the second half of the claim - that the canopy is a
+        // graded volume and not two stacked slabs - is measured and not inferred
+        // from the histogram.
+        let mut depth_sum = vec![(0u64, 0usize); vl_sparse_depth() as usize];
         for xx in 250..290i32 {
-            for yy in 87..92i32 {
+            for yy in sparse_y0..VL_CANOPY_TOP as i32 {
                 for zz in 195..225i32 {
                     let Some(w) = vl_record_word(&world, glam::IVec3::new(xx, yy, zz)) else {
                         continue;
@@ -11861,6 +12244,9 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
                     if sample.len() < 12 && (8..=247).contains(&v) {
                         sample.push(v);
                     }
+                    let d = (VL_CANOPY_TOP as i32 - 1 - yy) as usize;
+                    depth_sum[d].0 += v as u64;
+                    depth_sum[d].1 += 1;
                 }
             }
         }
@@ -11869,12 +12255,54 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
             "sparse canopy records: {} dark, {} INTERMEDIATE, {} lit (of {total}); e.g. {sample:?}",
             hist[0], hist[1], hist[2]
         );
+        let profile: Vec<u32> = depth_sum
+            .iter()
+            .map(|&(s, n)| if n == 0 { 0 } else { (s / n as u64) as u32 })
+            .collect();
+        eprintln!("sparse canopy mean sun_vis by depth (crown first): {profile:?}");
+        // A LADDER of intermediate values, not two levels.
+        //
+        // The bar was one in five records, measured on the 25 cm build. It is one
+        // in ten here, and the difference is a property of the LATTICE rather
+        // than a slackening: a record covers a 20 cm cell and must not shadow
+        // itself with its own contents, so `shadow_skip_active` excludes the
+        // whole cell and the first 20 cm of a gather is free. That pushes records
+        // toward the ends of the range - measured 11.4% intermediate here against
+        // the >= 20% the per-voxel field gave on the same physical canopy - while
+        // the values themselves stay spread (32, 159, 191 ... in `sample`) and
+        // the depth profile below stays a ramp. Both of those would collapse
+        // outright if the field went back to storing lit-or-black, and one in ten
+        // is still fifty times what a binary field can produce.
         assert!(
-            hist[1] * 5 >= total,
+            hist[1] * 10 >= total,
             "sun visibility inside a sparse canopy is effectively binary ({} of {total} records \
              are intermediate); the field is storing a canopy as lit-or-black, which is exactly \
              the per-pixel dapple this rework removes",
             hist[1]
+        );
+        // ...and the ladder has to go DOWN with depth, all the way through the
+        // middle of the range. A field that stored only 0 and 255 could still
+        // show a falling MEAN (fewer lit records deeper down), so this alone is
+        // not the whole claim - but a canopy whose mean never leaves the ends is
+        // two slabs, whatever the histogram says.
+        let crown = profile[0];
+        let underside = *profile.last().unwrap();
+        // The crown is lit and the underside has lost most of the sun. NOT "the
+        // underside is black": a 1.25 m flank of 2.5 optical crossings is
+        // translucent by construction, and measuring it as opaque would mean the
+        // fixture had stopped being a flank.
+        assert!(
+            crown > 200 && underside * 3 < crown,
+            "the sparse canopy does not span a lit crown to a shaded underside: {profile:?}"
+        );
+        assert!(
+            profile.iter().filter(|&&v| (60..=200).contains(&v)).count() >= 3,
+            "the mean jumps from crown to underside with no graded band between: {profile:?}"
+        );
+        let rises = profile.windows(2).filter(|w| w[1] > w[0] + 4).count();
+        assert_eq!(
+            rises, 0,
+            "mean sun visibility RISES going down into the canopy: {profile:?}"
         );
 
         // Finally through the sampler, which is what shading actually calls: a

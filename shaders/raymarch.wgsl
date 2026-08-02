@@ -425,6 +425,63 @@ fn vl_group_blocks(bi: i32, r: vec3<i32>) -> bool {
     return false;
 }
 
+/// Does the record CELL whose low voxel is `q` hold an ambient occluder?
+///
+/// `q` must be VL_STEP-aligned - every record cell is, and every offset the AO
+/// kernel takes is a whole number of cells, so the cell never straddles a brick.
+///
+/// This is the AO question asked at the LATTICE the field actually stores, and
+/// it has to be: with VL_STEP > 1 the cell holding a surface is VETOED (it is
+/// not all-air), so the nearest LIVE record is one or two voxels off the surface
+/// depending on the parity of the surface's coordinate. A kernel of single-voxel
+/// probes therefore finds the ground for one parity and misses it for the other,
+/// which renders as contact shadows that blink on and off between adjacent
+/// terrain steps. Asking "does the neighbouring CELL contain an occluder" gives
+/// the same answer for both parities, because the surface is inside that cell
+/// either way. At VL_STEP == 1 it degenerates to exactly `ao_occluder`.
+///
+/// One hierarchy descent and one occupancy load answer the empty case, which is
+/// most of the kernel over open ground; the material fetches only run for the
+/// voxels that are actually occupied. That is why this replaced the per-voxel
+/// `ao_occluder` outright rather than wrapping it: that one paid a SECOND full
+/// descent (`is_voxel_solid` then `voxel_material_at`) per probe.
+///
+/// A cell occludes ambient light only if it holds an actually-solid block:
+/// grass tufts, flowers, dry straw and the invisible canopy fringe occupy their
+/// cells (the DDA must find them) but must NOT stamp AO squares onto the ground
+/// - thousands of hash-scattered tufts otherwise read as a diffused
+/// checkerboard-pattern shadow carpet.
+fn vl_cell_occluder(q: vec3<i32>) -> bool {
+    let rel = q - camera.world_origin;
+    if (rel.x < 0 || rel.x >= WORLD_VOXELS_X
+     || rel.y < 0 || rel.y >= WORLD_VOXELS_Y
+     || rel.z < 0 || rel.z >= WORLD_VOXELS_Z) {
+        return false;
+    }
+    let v = world_to_slot_voxel(q);
+    let bp = v >> vec3<u32>(2u);
+    let tp = v >> vec3<u32>(4u);
+    let cp = v >> vec3<u32>(6u);
+    let ci = world_chunk_idx(cp.x, cp.y, cp.z);
+    let tile_lin = (tp.x & 3) + (tp.z & 3) * 4 + (tp.y & 3) * 16;
+    if (!chunk_has_child(ci, tile_lin)) { return false; }
+    let ti = world_tile_idx(tp.x, tp.y, tp.z);
+    let brick_lin = (bp.x & 3) + (bp.z & 3) * 4 + (bp.y & 3) * 16;
+    if (!tile_has_child(ti, brick_lin)) { return false; }
+    let bi = world_brick_idx(bp.x, bp.y, bp.z);
+    let r = (v - bp * BRICK_DIM) / VL_STEP;
+    var m = vl_group_occ(bi, r);
+    if (m == 0u) { return false; }
+    let vbase = select(0, 32, r.y == 1);
+    loop {
+        if (m == 0u) { break; }
+        let b = i32(firstTrailingBit(m));
+        m = m & (m - 1u);
+        if (!is_decoration_mat(brick_voxel_material(bi, vbase + b))) { return true; }
+    }
+    return false;
+}
+
 struct VoxLightParams {
     live_count: u32,
     round: u32,
@@ -598,7 +655,21 @@ fn voxlight_sample(p_world: vec3<f32>, n: vec3<f32>) -> VoxLight {
     //
     // `vl_tap` returns before the occupancy walk when the brick has no block, so
     // this miss costs exactly what the old `vl_record_word` cost.
-    let ps = p_world + n * 0.5;
+    // Step off the surface by half a RECORD CELL, not half a voxel.
+    //
+    // Half a voxel was right when a record WAS a voxel: it landed the sample
+    // exactly on the centre of the air voxel against the face, so that voxel's
+    // record took the whole trilinear weight and the answer could not be vetoed.
+    // At VL_STEP > 1 that same offset lands on a cell BOUNDARY for one parity of
+    // the surface coordinate, and for a negative-facing face the whole weight
+    // then falls on the cell that CONTAINS the surface - which is vetoed as
+    // opaque, so `wsum` came out 0 and the surface shaded with no light at all.
+    // That is a quarter of every surface in the world (three of six face
+    // directions, one of two parities), and it is silent: the pixel just takes
+    // the designed no-direct-sun term. Half a cell puts the weight on the two
+    // cells STRADDLING the face in both parities, so at least one of them is the
+    // air side. At VL_STEP == 1 it is bit-identical to the old n * 0.5.
+    let ps = p_world + n * (VL_STEP_F * 0.5);
     if (vl_tap(vec3<i32>(floor(ps / VL_STEP_F))).word == VL_NONE) { return o; }
 
     // Step into the air voxel against the face, then place the lattice on RECORD
@@ -2680,8 +2751,24 @@ fn vec2p_base(pa: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(pa.x * 2.3, 17.0, pa.z * 2.3);
 }
 
+/// World position -> cloud NOISE space, the one place the cloud field's scale is
+/// set. Both density fields go through it, and drift is added afterwards in
+/// noise units so the clouds keep travelling at the same real speed.
+///
+/// A cumulus is ~45 m across, which is why one noise unit is 45.5 m. Written as
+/// the bare 0.0055 per VOXEL it was, that is 45.5 m only while a voxel is 25 cm:
+/// at 10 cm the same number makes every cloud 18 m across, and because the
+/// ground cloud-SHADE taps read the same field, the shadow pattern on the ground
+/// gets 2.5x finer with it. It is the sort of regression that reads as "the sky
+/// looks busy" rather than as a bug, and it was found by a texture test - a wall
+/// moved 20 cm along its own normal changed brightness by 6.5%, which is a
+/// cloud-shadow edge sweeping across it.
+fn cloud_noise_p(p: vec3<f32>) -> vec3<f32> {
+    return p * (0.022 * VOXEL_METRES);
+}
+
 fn cloud_density_coarse(p: vec3<f32>, t: f32) -> f32 {
-    let pa = p * 0.0055 + vec3<f32>(t * 0.06, 0.0, t * 0.035);
+    let pa = cloud_noise_p(p) + vec3<f32>(t * 0.06, 0.0, t * 0.035);
     let cov_lo = vnoise3(pa * 1.05);
     let cov_mid = vnoise3(pa * 2.6);
     let cov = smoothstep(0.55, 0.65, cov_lo * 0.60 + cov_mid * 0.40);
@@ -2727,7 +2814,7 @@ fn worley3f(p: vec3<f32>) -> f32 {
 // pinned by --freeze-time so frozen scenes freeze their clouds (and the
 // rigid-ground temporal guard isolates rogue shading fields from legit drift).
 fn cloud_density(p: vec3<f32>, t: f32) -> f32 {
-    let pa = p * 0.0055 + vec3<f32>(t * 0.06, 0.0, t * 0.035);
+    let pa = cloud_noise_p(p) + vec3<f32>(t * 0.06, 0.0, t * 0.035);
     // Cumulus coverage: a low-freq clump field carved by a smoothstep
     // threshold into DISTINCT clouds with genuinely clear sky between -
     // never a linear coverage ramp, which spreads a translucent stratus
@@ -3354,10 +3441,16 @@ fn water_facet_normal(grad: vec2<f32>) -> vec3<f32> {
     return normalize(vec3<f32>(-grad.x, 1.0, -grad.y));
 }
 
-/// Pack the per-cell facet band + shore mask into the transp record's spare
-/// word. The band is biased and scaled into a byte: 8 bits over a range of
+/// Pack the per-cell facet band + shore distances into the transp record's
+/// spare word. The band is biased and scaled into a byte: 8 bits over a range of
 /// 2*WATER_WAVE_BANDS is a resolution of 0.024 of a band, two orders finer than
 /// the eased boundary it has to represent.
+///
+/// `shore` is FOUR 2-BIT DISTANCES (+x, -x, +z, -z), 0 for "no shore within
+/// reach" and otherwise the number of cells to the first non-water one. It was a
+/// four-bit yes/no mask, which is the same thing while a cell is wide enough to
+/// hold the whole surf band; at 10 cm the band spans more than one cell, so the
+/// shading needs to know how far away the edge is.
 fn water_pack_facet(band: f32, shore: u32) -> u32 {
     let q = clamp((band + WATER_WAVE_BANDS) * (255.0 / (2.0 * WATER_WAVE_BANDS)), 0.0, 255.0);
     return u32(round(q)) | (shore << 8u);
@@ -3366,7 +3459,7 @@ fn water_unpack_band(code: u32) -> f32 {
     return f32(code & 0xFFu) * ((2.0 * WATER_WAVE_BANDS) / 255.0) - WATER_WAVE_BANDS;
 }
 fn water_unpack_shore(code: u32) -> u32 {
-    return (code >> 8u) & 0xFu;
+    return (code >> 8u) & 0xFFu;
 }
 
 // Sub-voxel water surface for one cell the DDA landed in. `entry_n`/`t_entry`
@@ -3439,8 +3532,11 @@ fn water_subvoxel(
     }
     out.grad = fc.grad;
     out.band = fc.band;
-    // Shore probes LAST and only when foam can be seen: four neighbour
-    // lookups, against the up-to-24 the corner surface paid on every cell.
+    // Shore probes LAST and only when foam can be seen: 4 * WATER_SHORE_REACH
+    // neighbour lookups (4 at 25 cm, 8 at 10 cm), against the up-to-24 the
+    // corner surface paid on every cell. The reach follows the surf WIDTH, which
+    // is a real-world 12.5 cm: at 10 cm a voxel is narrower than the band, so a
+    // one-cell probe cannot see the shore from the far side of it.
     //
     // The test is "the neighbour is NOT WATER", i.e. this cell is on the EDGE
     // OF THE WATER BODY - deliberately wider than "adjacent to solid". A lake
@@ -3455,8 +3551,12 @@ fn water_subvoxel(
             if (k == 1u) { d = vec3<i32>(-1, 0, 0); }
             else if (k == 2u) { d = vec3<i32>(0, 0, 1); }
             else if (k == 3u) { d = vec3<i32>(0, 0, -1); }
-            if (!is_water_mat(neighbor_material(voxel, slot_v, bp, bi, d))) {
-                shore = shore | (1u << k);
+            for (var s = 1; s <= WATER_SHORE_REACH; s = s + 1) {
+                if (!is_water_mat(neighbor_material(voxel, slot_v, bp, bi, d * s))) {
+                    // Distance in CELLS to the water's edge, 1..3; 0 = none.
+                    shore = shore | (u32(s) << (k * 2u));
+                    break;
+                }
             }
         }
         out.shore = shore;
@@ -3689,7 +3789,20 @@ fn trace_no_water(origin: vec3<f32>, dir: vec3<f32>, t_cap: f32) -> Hit {
 const WATER_SHADOW_TONE: f32 = 0.42;   // multiplier on water sitting in full shadow
 const WATER_FACET_CONTRAST: f32 = 0.22; // tone spread from trough band to crest band
 const WATER_SKY_MAX: f32 = 0.45;       // ceiling on the grazing Fresnel blend toward sky
-const WATER_FOAM_SHORE_SUB: i32 = 2;   // shore-foam band width, in quarter-voxel texels
+// Surf at a shoreline is a hand's width of white water. 12.5 cm is what the
+// 25 cm build's "up to 2 quarter-voxel texels of the shore-adjacent cell" came
+// to, and it is a REAL-WORLD width: as a bare 2 texels it becomes 5 cm at a
+// 10 cm voxel, which is a hairline that does not read as a shore at all
+// (measured: the island ring came out 0.036 foam density against 0.032 on open
+// water, i.e. the ring contributed almost nothing over the ambient whitecaps).
+const WATER_FOAM_SHORE_M: f32 = 0.125;
+// ...in QUARTER-VOXEL texels, which is the grid the foam stamp is drawn on so
+// that a band edge is always a texel boundary and never a curve.
+const WATER_FOAM_SHORE_Q: i32 = i32(WATER_FOAM_SHORE_M * VOXELS_PER_METRE * 4.0 + 0.5);
+// ...and how many CELLS out the shore probe must look to cover that width. Two
+// at 10 cm, one at 25 cm. MUST stay <= 3: the distance is packed 2 bits per
+// direction by `water_pack_facet`.
+const WATER_SHORE_REACH: i32 = (WATER_FOAM_SHORE_Q + 3) / 4;
 // Eighths of crest cells that actually break into foam. NOT every crest does,
 // and the reason it has to be well under 8 is a grazing-angle effect that only
 // showed up when it was measured: a crest cell's plate stands 0.16 voxels
@@ -3928,12 +4041,24 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>, facet_code: u32)
         // of voxels off the water - and merely varying 1 vs 2 only softened it:
         // an unbroken band of any width is still a band. Dropping whole cells
         // is what breaks the rim into surf.
-        let bw = min(i32((fh >> 6u) & 3u), WATER_FOAM_SHORE_SUB);
+        //
+        // Widths are in QUARTER-VOXEL texels and scale with the surf's real
+        // width, so the {none, half, full, full} ladder the 25 cm build drew
+        // (0/1/2/2 texels of a 25 cm cell) is the same ladder in metres here.
+        let bw = (min(i32((fh >> 6u) & 3u), 2) * WATER_FOAM_SHORE_Q) / 2;
+        // `shore` holds the distance IN CELLS to the water's edge per direction
+        // (0 = none), so a band wider than one cell still knows where its edge
+        // is: (cells - 1) * 4 texels, plus how far this texel sits from the
+        // cell's own face on that side.
         var near_shore = false;
-        if ((shore & 1u) != 0u && sub.x >= 4 - bw) { near_shore = true; }
-        if ((shore & 2u) != 0u && sub.x < bw) { near_shore = true; }
-        if ((shore & 4u) != 0u && sub.y >= 4 - bw) { near_shore = true; }
-        if ((shore & 8u) != 0u && sub.y < bw) { near_shore = true; }
+        let sxp = i32((shore >> 0u) & 3u);
+        if (sxp != 0 && (sxp - 1) * 4 + (3 - sub.x) < bw) { near_shore = true; }
+        let sxn = i32((shore >> 2u) & 3u);
+        if (sxn != 0 && (sxn - 1) * 4 + sub.x < bw) { near_shore = true; }
+        let szp = i32((shore >> 4u) & 3u);
+        if (szp != 0 && (szp - 1) * 4 + (3 - sub.y) < bw) { near_shore = true; }
+        let szn = i32((shore >> 6u) & 3u);
+        if (szn != 0 && (szn - 1) * 4 + sub.y < bw) { near_shore = true; }
         var t = 0u;
         if (near_shore) {
             t = foam_texel(SPR_FOAM_SHORE, local, fh);
@@ -4642,17 +4767,6 @@ fn trace_any(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> bool {
         dda_step(&voxel, &slot_v, &t_max, &t_cur, &last_axis, step, t_delta);
     }
     return false;
-}
-
-// A cell occludes ambient light only if it holds an actually-solid block:
-// grass tufts, flowers, dry straw and the invisible canopy fringe occupy
-// their cells (the DDA must find them) but must NOT stamp AO squares onto
-// the ground - thousands of hash-scattered tufts otherwise read as a
-// diffused checkerboard-pattern shadow carpet. The material fetch is
-// gated on the occupancy bit, so probes over open ground stay one load.
-fn ao_occluder(c: vec3<i32>) -> bool {
-    if (!is_voxel_solid(c)) { return false; }
-    return !is_decoration_mat(voxel_material_at(c));
 }
 
 fn axis_select(v: vec3<f32>, ax: i32) -> f32 {

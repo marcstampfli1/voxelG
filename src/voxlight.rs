@@ -788,14 +788,15 @@ mod tests {
     #[test]
     fn pool_sizing_matches_the_documented_budget() {
         // WAS: 131,072 blocks x 64 records (one per voxel) x 2 words = 64 MiB.
-        // NOW: 2,097,152 blocks x 8 records (one per 2x2x2 voxels) x 2 words
-        // = 128 MiB. The PREMISE changed, not the invariant: at 10 cm the lit
-        // shell is ~10x the blocks (it is a surface, and the resolution doubled
-        // and a half twice over), and the pool pays for that with a 16x cheaper
-        // block rather than with 16x the memory. See LIGHT_RECORD_STEP.
+        // NOW: 4,194,304 blocks x 8 records (one per 2x2x2 voxels) x 2 words
+        // = 256 MiB. The PREMISE changed, not the invariant: at 10 cm the demo
+        // world's lit shell measures 1.12 M blocks against 63,903 at 25 cm (it
+        // is a SURFACE, and the resolution went up two and a half times over a
+        // wider window), and the pool pays for that with a 16x cheaper block
+        // rather than with 16x the memory. See LIGHT_RECORD_STEP.
         assert_eq!(LIGHT_RECORDS_PER_BLOCK, 8);
         assert_eq!(LIGHT_BLOCK_WORDS * 4, 64, "a block is 64 bytes");
-        assert_eq!(LIGHT_POOL_WORDS as u64 * 4, 128 * 1024 * 1024);
+        assert_eq!(LIGHT_POOL_WORDS as u64 * 4, 256 * 1024 * 1024);
     }
 
     #[test]

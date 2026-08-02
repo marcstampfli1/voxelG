@@ -461,8 +461,26 @@ pub struct World {
 }
 
 impl World {
+    /// The seed `World::new` uses, and therefore the one every headless render,
+    /// benchmark and lookdev still is framed against.
+    ///
+    /// CHOSEN, not arbitrary. The window is a fixed 160 m patch of an infinite
+    /// world, so whether it holds a coast, a mountain or neither is decided by
+    /// where the seed offset lands it - and every benchmark camera is framed
+    /// inside it. The old literal put the 10 cm window on a dry shelf: 0.0%
+    /// water by area and 12 m of relief across 160 m, so both water scenarios of
+    /// `rt_vs_software_timing` were pointed at an empty lake and measured
+    /// nothing.
+    ///
+    /// Measured on this one: 24% of the window under water, 53% of its ground
+    /// grassed and half of that wooded, median ground 25 m and a 54 m summit -
+    /// 38 m of rock standing over the waterline, all inside a 160 m window.
+    /// `the_demo_window_holds_both_land_and_water` and
+    /// `the_demo_window_grows_a_forest` are the guards.
+    pub const DEMO_SEED: u64 = 0x6C56_484A_9D21_6E25;
+
     pub fn new() -> Self {
-        Self::with_seed(0xC0FFEE_F00D_BEEFu64)
+        Self::with_seed(Self::DEMO_SEED)
     }
 
     pub fn with_seed(seed: u64) -> Self {
@@ -968,13 +986,18 @@ impl World {
     /// (`LightField::urgent`) and is serviced on the next dispatch regardless of
     /// tier, so the radius carries only tracking latency.
     ///
-    /// 128 was measured first and was far too generous: on the shipped benchmark
+    /// 32 m was measured first and was far too generous: on the shipped benchmark
     /// it classified 48-77% of a 60,000-block shell as near, because lit shell is
     /// a 3D surface and a sphere that size over hilly terrain and canopy sweeps
-    /// up an enormous amount of it. 64 is a radius no player interaction reaches
-    /// past - build reach is single digits - while still covering the ground the
-    /// camera stands on with a wide margin.
-    pub const LIGHT_NEAR_RADIUS: f32 = 64.0;
+    /// up an enormous amount of it. 16 m is a radius no player interaction
+    /// reaches past - build reach is single digits of metres - while still
+    /// covering the ground the camera stands on with a wide margin.
+    ///
+    /// It is a REAL-WORLD radius and has to be written as one. As the bare 64
+    /// voxels it was, it became 6.4 m at a 10 cm voxel, and the tier collapsed:
+    /// 31 blocks of a 536,168-block shell classified near, i.e. the sun stopped
+    /// being tracked at the full rate anywhere the player is standing.
+    pub const LIGHT_NEAR_RADIUS: f32 = crate::world_dims::m_to_vox(16.0);
 
     /// THE VIEW FRUSTUM WAS TRIED HERE AND IT DID NOT SURVIVE MEASUREMENT.
     ///
@@ -1005,13 +1028,14 @@ impl World {
     /// the tier stays VIEW-INDEPENDENT: turning on the spot changes nothing at
     /// all.
 
-    /// How far the focus may drift before the partition is rebuilt, in world
-    /// voxels. A deadband for the same reason streaming has one: repartitioning
-    /// walks the whole work list and re-uploads it, and doing that every frame
-    /// to reproduce almost the same answer is the cost this policy exists to
-    /// avoid. 16 voxels is 1/8 of the radius, so a block is at most 16 voxels
-    /// past the boundary before it is reclassified.
-    const LIGHT_FOCUS_DEADBAND: f32 = 16.0;
+    /// How far the focus may drift before the partition is rebuilt. A deadband
+    /// for the same reason streaming has one: repartitioning walks the whole work
+    /// list and re-uploads it, and doing that every frame to reproduce almost the
+    /// same answer is the cost this policy exists to avoid. 4 m is 1/4 of the
+    /// radius, so a block is at most 4 m past the boundary before it is
+    /// reclassified - a fraction OF THE RADIUS, hence derived from it rather
+    /// than written as its own number.
+    const LIGHT_FOCUS_DEADBAND: f32 = Self::LIGHT_NEAR_RADIUS * 0.25;
 
     /// Point the light field's sweep priority at `pos` (world voxels).
     ///
@@ -1492,6 +1516,10 @@ pub struct TerrainSample {
 /// is measured from here, and it is a real-world height so the coastline stays
 /// put when the voxel changes size.
 pub const SEA_LEVEL_M: f32 = 16.0;
+/// How deep the sea is allowed to get, in metres below `SEA_LEVEL_M`. The bed
+/// approaches this asymptotically (see `sample_terrain`), so it is a limit and
+/// not a floor - nothing ever lands exactly on it and the bed keeps its relief.
+pub const SEABED_MAX_DEPTH_M: f32 = 12.0;
 /// Sea level as a voxel row. `as u32` on a `const fn` result, in one place.
 pub const SEA_LEVEL: u32 = m_to_vox(SEA_LEVEL_M) as u32;
 
@@ -1544,9 +1572,14 @@ pub fn climate_at(x: f32, z: f32) -> (f32, f32) {
 ///
 /// The shape of the terrain, largest wavelength first:
 ///
-///  - CONTINENT (~700 m): where the land is high and where the sea gets in. One
-///    wavelength is several windows across, so a session sees a coast or an
-///    interior, not a tiling of both.
+///  - CONTINENT (~285 m): where the land is high and where the sea gets in. Not
+///    much longer than the 160 m window, ON PURPOSE: which side of sea level a
+///    window sits on is decided by essentially ONE sample of this field, so at a
+///    wavelength of several windows (which is where this started, at 700 m) a
+///    session is dry or drowned by coin flip. Measured on the demo seed at 700 m
+///    with the land baseline 2 m above sea: the whole window came out 0.0% water,
+///    with 12 m of relief across 160 m. Just over one window per wavelength puts
+///    a coast in most views and still gives inland stretches with no sea in them.
 ///  - RELIEF (~180 m): how rugged this stretch is, 0 = flat pasture, 1 = alpine.
 ///    This is the field that makes a 160 m window read as a PLACE rather than as
 ///    the same hills repeated: hill amplitude, mountain gain and the ridge sharpness
@@ -1572,33 +1605,58 @@ pub fn sample_terrain(wx: f32, wz: f32, seed: u64) -> TerrainSample {
     let wpx = px + warp_x;
     let wpz = pz + warp_z;
 
-    // CONTINENT: a slow +/-9 m swing about sea level, so some of the window is
-    // low ground that floods and some is a shelf well above the water.
-    let continent = fbm_2d(wpx * 0.0014, wpz * 0.0014, 3) * 9.0;
+    // CONTINENT: a +/-14 m swing about sea level on a ~285 m wavelength, so a
+    // 160 m window normally holds both a shelf well above the water and low
+    // ground that floods.
+    let continent = fbm_2d(wpx * 0.0035, wpz * 0.0035, 3) * 14.0;
 
     // RELIEF: 0 flat .. 1 alpine, on a wavelength a little longer than the
     // window so a single view is mostly one character with a transition in it.
     let relief = (fbm_2d(wpx * 0.0055 + 300.0, wpz * 0.0055 + 300.0, 3) * 1.5 + 0.45)
         .clamp(0.0, 1.0);
 
-    // HILLS: 1.5 m in pasture, 11 m in broken country.
-    let hills = fbm_2d(wpx * 0.022, wpz * 0.022, 4) * (1.5 + 9.5 * relief);
+    // HILLS: 2 m in pasture, 15 m in broken country.
+    let hills = fbm_2d(wpx * 0.022, wpz * 0.022, 4) * (2.0 + 13.0 * relief);
 
     // MOUNTAINS: ridged, and gated by BOTH a range mask (~320 m, so ranges are
     // places rather than a global bumpiness) and relief, so crags only grow
-    // where the ground is already rough.
+    // where the ground is already rough. The gain is what makes a peak LOOM:
+    // 34 m of it put the demo window's tallest ground 13 m above its median,
+    // which over 160 m is a moor, not a landscape.
     let range = (fbm_2d(wpx * 0.0031, wpz * 0.0031, 2) + 0.15).max(0.0).min(1.0);
     let ridged = ridge_noise_2d(wpx * 0.009, wpz * 0.009);
     // powf sharpens the crest and flattens the valleys; more relief = sharper.
     let crest = ridged.powf(1.6 + 1.8 * relief);
-    let mountain_h = crest * range * relief * 34.0;
+    let mountain_h = crest * range * relief * 52.0;
 
     let detail = fbm_2d(wpx * 0.14, wpz * 0.14, 2) * (0.35 + 0.85 * relief);
     // Sub-metre grain. Cheap (2 octaves at one frequency) and only legible
     // because a voxel is 10 cm.
     let grain = value_noise_2d(px * 0.62, pz * 0.62) * 0.12;
 
-    let h_m = SEA_LEVEL_M + 2.0 + continent + hills + mountain_h + detail + grain;
+    // The land baseline sits ON sea level, not above it: the continent swing has
+    // to cross, or `water_top` never fires and the world has no coastline.
+    let raw_m = SEA_LEVEL_M + continent + hills + mountain_h + detail + grain;
+    // SEA FLOOR: below the waterline the profile is COMPRESSED toward a maximum
+    // depth instead of being allowed to run off the bottom of the window.
+    //
+    // The raw field swings 14 m of continent on top of 15 m of hills, so an
+    // ocean basin asks for -13 m and the only thing that used to stop it was the
+    // `clamp(2.0, ..)` below - which is a hard floor, so every deep basin came
+    // out as one dead-flat plane at the world floor. Measured: at seed 42 four
+    // neighbouring surface chunks near the origin were bit-identical, which is
+    // what `worldgen_depends_on_chunk` caught.
+    //
+    // `1 - exp(-d/D)` is the smooth version of `min(d, D)`: it is the identity
+    // for small d, so the shoreline shelf keeps its shape and shallows stay
+    // shallow, and it approaches D without ever reaching it, so the bed keeps
+    // relief all the way down.
+    let h_m = if raw_m < SEA_LEVEL_M {
+        let d = SEA_LEVEL_M - raw_m;
+        SEA_LEVEL_M - SEABED_MAX_DEPTH_M * (1.0 - (-d / SEABED_MAX_DEPTH_M).exp())
+    } else {
+        raw_m
+    };
 
     // Rivers DISABLED. They used the same ridge-noise mechanism and carved thin
     // winding channels that dipped below sea level and filled, reading as rivers
@@ -2194,9 +2252,26 @@ pub enum Biome {
     Mountain,
 }
 
+/// Elevation bands, as METRES ABOVE SEA LEVEL.
+///
+/// These were bare VOXEL offsets from sea level (36 / 55 / 1): 9 m / 13.75 m /
+/// 25 cm at a 25 cm voxel, and 3.6 m / 5.5 m / 10 cm at a 10 cm one. The
+/// consequence was not subtle. With the mountain line at 3.6 m the demo window -
+/// median ground 7.4 m above sea - came out Mountain biome nearly everywhere, so
+/// its top block was bare stone under a snow cap, its tree density fell to 0.14,
+/// and the headless foliage benchmark rendered a frame with 0.000 green pixels.
+///
+/// The values are re-derived for the terrain `sample_terrain` actually makes
+/// rather than converted from the old ones: rock from 18 m above sea (about the
+/// demo window's p90 ground height), snow from 30 m (the top of the tallest
+/// peaks), and beach within half a metre of the waterline.
+pub const BIOME_MOUNTAIN_M: f32 = 18.0;
+pub const BIOME_SNOWLINE_M: f32 = 30.0;
+pub const BIOME_BEACH_M: f32 = 0.5;
+
 pub fn pick_biome(temp: f32, humid: f32, h: u32, sea_level: u32) -> Biome {
-    if h > sea_level + 36 { return Biome::Mountain; }
-    if h <= sea_level + 1 { return Biome::Beach; }
+    if h > sea_level + m_to_vox(BIOME_MOUNTAIN_M) as u32 { return Biome::Mountain; }
+    if h <= sea_level + m_to_vox(BIOME_BEACH_M) as u32 { return Biome::Beach; }
     if temp < -0.20 { return Biome::Tundra; }
     if temp > 0.25 && humid < -0.05 { return Biome::Desert; }
     if temp > 0.15 && humid > 0.25 { return Biome::Jungle; }
@@ -2210,7 +2285,9 @@ impl Biome {
         match self {
             Biome::Tundra => MAT_SNOW,
             Biome::Desert | Biome::Beach | Biome::Savanna => MAT_SAND,
-            Biome::Mountain => if h > sea_level + 55 { MAT_SNOW } else { MAT_STONE },
+            Biome::Mountain => {
+                if h > sea_level + m_to_vox(BIOME_SNOWLINE_M) as u32 { MAT_SNOW } else { MAT_STONE }
+            }
             _ => MAT_GRASS,
         }
     }
@@ -2398,4 +2475,160 @@ pub fn value_noise_3d(x: f32, y: f32, z: f32) -> f32 {
     let ab = a * (1.0 - yf) + b * yf;
     let cd = c * (1.0 - yf) + d * yf;
     ab * (1.0 - zf) + cd * zf
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Terrain heights in metres over `span` metres square from the window
+    /// origin, sampled on a 2 m lattice.
+    fn heights_m(span_m: f32) -> Vec<f32> {
+        let seed = World::DEMO_SEED;
+        let step = m_to_vox(2.0) as i32;
+        let end = m_to_vox(span_m) as i32;
+        let mut out = Vec::new();
+        let mut z = 0;
+        while z < end {
+            let mut x = 0;
+            while x < end {
+                out.push(vox_to_m(sample_terrain(x as f32, z as f32, seed).h as f32));
+                x += step;
+            }
+            z += step;
+        }
+        out
+    }
+
+    /// The loaded window itself.
+    fn window_heights_m() -> Vec<f32> {
+        heights_m(vox_to_m(WORLD_VOXELS_X as f32))
+    }
+
+    fn report(tag: &str, h: &[f32]) -> f32 {
+        let mut sorted = h.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let pick = |f: f32| sorted[((sorted.len() - 1) as f32 * f) as usize];
+        let frac = h.iter().filter(|&&y| y < SEA_LEVEL_M).count() as f32 / h.len() as f32;
+        eprintln!(
+            "{tag} terrain (m): min {:.1}  p10 {:.1}  median {:.1}  p90 {:.1}  p99 {:.1}  \
+             max {:.1}  sea {:.1}  under water {:.1}%",
+            pick(0.0), pick(0.10), pick(0.5), pick(0.90), pick(0.99), pick(1.0),
+            SEA_LEVEL_M, frac * 100.0
+        );
+        frac
+    }
+
+    /// THE LOADED WINDOW MUST HOLD BOTH LAND AND WATER.
+    ///
+    /// Not a taste question, and not a test of the noise: `find_scene_anchors`
+    /// picks the timing harness's water camera by looking for water in this
+    /// window, `live_session_profile` reports a water scenario, and water is the
+    /// one material with a whole deferred pass of its own. A window with no
+    /// water renders nothing a player would call a lake AND makes two of the
+    /// four benchmark scenarios measure an empty frame.
+    ///
+    /// That is exactly what the metre-space worldgen rewrite produced: with the
+    /// land baseline 2 m ABOVE sea level and a mountain term that only ever
+    /// adds, the whole 160 m window came out dry (0 water columns, measured).
+    /// The continent wavelength is deliberately longer than the window, so
+    /// "which side of sea level is this window on" is decided by ONE noise
+    /// sample - the baseline has to sit low enough that the swing crosses.
+    #[test]
+    fn the_demo_window_holds_both_land_and_water() {
+        // The wider world too, so a window that happens to sit on a coast is not
+        // mistaken for a world that has coasts.
+        report("2 km region", &heights_m(2000.0));
+        let h = window_heights_m();
+        let frac = report("demo window", &h);
+        assert!(
+            frac > 0.03,
+            "the demo window is {:.1}% water: the benchmark's water scenarios and the \
+             lookdev water stills have nothing to point at",
+            frac * 100.0
+        );
+        assert!(
+            frac < 0.70,
+            "the demo window is {:.1}% water: it is an ocean with islands, not a landscape",
+            frac * 100.0
+        );
+    }
+
+    /// THE LOADED WINDOW MUST GROW A FOREST, AND GREEN GROUND UNDER IT.
+    ///
+    /// The same class of failure as the water one and found the same way: with
+    /// the biome elevation bands still written as bare voxel offsets from sea
+    /// level, everything more than 3.6 m above the waterline came out Mountain,
+    /// so the window was bare stone with a snow cap, `find_scene_anchors` found
+    /// 28 leaf voxels in its densest 8 m cell, and
+    /// `renders_water_blue_and_foliage_green` measured 0.000 green pixels.
+    ///
+    /// Counted on the REAL generated world, not on `sample_terrain`: tree
+    /// placement runs through `trees_for_chunk` -> `paint_tree`, and every one of
+    /// those steps has its own size constants to get wrong.
+    #[test]
+    fn the_demo_window_grows_a_forest() {
+        let mut w = World::new();
+        w.fill_demo_terrain();
+        let step = m_to_vox(1.0) as i32;
+        let (mut leaf, mut grass, mut cols) = (0usize, 0usize, 0usize);
+        let mut z = 0;
+        while z < WORLD_VOXELS_Z as i32 {
+            let mut x = 0;
+            while x < WORLD_VOXELS_X as i32 {
+                cols += 1;
+                let mut hit_leaf = false;
+                for y in (1..WORLD_VOXELS_Y as i32 - 1).rev() {
+                    let m = w.material_at_world(x, y, z);
+                    if m == MAT_AIR || m == MAT_LEAF_FRINGE {
+                        continue;
+                    }
+                    if is_leaf_mat(m) {
+                        hit_leaf = true;
+                    } else if m == MAT_GRASS || m == MAT_TALL_GRASS {
+                        grass += 1;
+                    }
+                    break;
+                }
+                if hit_leaf {
+                    leaf += 1;
+                }
+                x += step;
+            }
+            z += step;
+        }
+        let (lf, gf) = (leaf as f32 / cols as f32, grass as f32 / cols as f32);
+        eprintln!(
+            "demo window canopy cover {:.1}% of columns, grass ground {:.1}% (of {cols} columns)",
+            lf * 100.0,
+            gf * 100.0
+        );
+        assert!(
+            lf > 0.02,
+            "only {:.2}% of the window is under canopy; the foliage benchmark and the forest \
+             lookdev stills have no forest to point at",
+            lf * 100.0
+        );
+        assert!(
+            gf > 0.15,
+            "only {:.1}% of the window's ground is grass; the biome bands have put the whole \
+             window above the treeline",
+            gf * 100.0
+        );
+    }
+
+    /// Terrain must stay inside the window's vertical extent with headroom for
+    /// trees, or `trees_for_chunk` rejects every tree on a mountain.
+    #[test]
+    fn terrain_fits_the_window_height() {
+        let h = window_heights_m();
+        let max = h.iter().cloned().fold(f32::MIN, f32::max);
+        let roof = vox_to_m(WORLD_VOXELS_Y as f32);
+        eprintln!("tallest terrain {max:.1} m against a {roof:.1} m window roof");
+        assert!(
+            max + 6.0 < roof,
+            "terrain reaches {max:.1} m in a {roof:.1} m window - a tree on that peak has \
+             nowhere to grow, and the clamp in `sample_terrain` flattens the summit"
+        );
+    }
 }

@@ -18,7 +18,11 @@ pub fn run_server(port: u16) -> ! {
     let mut edit_log: Vec<net::Message> = Vec::new();
     let mut next_seq: u64 = 1;
 
-    const INTEREST_R: f32 = 600.0;
+    // How far a player's edits and poses are relayed. A view distance, so it is
+    // a real-world length: as the bare 600 voxels it was, it meant 150 m at a
+    // 25 cm voxel and would silently have become 60 m at 10 cm - less than half
+    // the loaded window, so a peer visibly inside the world would stop updating.
+    const INTEREST_R: f32 = crate::world_dims::m_to_vox(150.0);
     const INTEREST_R2: f32 = INTEREST_R * INTEREST_R;
     // Distance interest test: keep a recipient if their pose is unknown, or they
     // are within INTEREST_R of (ox, oz). Shared by the pose/edit/explode fan-out.

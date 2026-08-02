@@ -46,36 +46,44 @@ fn vl_brick_world_base(brick: u32) -> vec3<i32> {
 /// one FACE and bilinearly blended them. A per-voxel field cannot be
 /// face-indexed, so occlusion is measured for the air cell itself and the
 /// smooth gradient comes from the trilinear fetch instead of the in-face blend.
-/// `ao_occluder` is reused verbatim so decoration cells (grass tufts, flowers,
-/// the invisible canopy fringe) still do not stamp AO squares onto the ground.
+/// `vl_cell_occluder` keeps `ao_occluder`'s rule verbatim, so decoration cells
+/// (grass tufts, flowers, the invisible canopy fringe) still do not stamp AO
+/// squares onto the ground.
 ///
-/// The offsets are -1 and +VL_STEP, NOT +/-1, because the cell is VL_STEP voxels
-/// wide: the voxels TOUCHING it are one below its low face and VL_STEP above its
-/// low corner. At VL_STEP == 1 this is exactly the per-voxel formula it grew
-/// from; at 2 it measures occlusion over a 20 cm neighbourhood, which is the
-/// same real-world contact scale the 25 cm build's +/-1 kernel had.
-fn vl_voxel_ao(v: vec3<i32>) -> f32 {
-    let n = -1;
-    let p = VL_STEP;
+/// The neighbours are the 18 adjacent record CELLS, one whole cell out in each
+/// direction, NOT the 18 adjacent voxels. That is forced by the lattice: a cell
+/// containing a surface is vetoed as opaque, so the nearest LIVE record sits one
+/// or two voxels off the surface depending on the parity of the surface's
+/// coordinate, and a single-voxel probe finds the ground for one parity and
+/// misses it for the other. Measured before this: AO on flat open ground came
+/// back 255 (no contact at all) for half of all ground heights, and a wall
+/// shifted one voxel along its own normal changed brightness by 4.5% - the
+/// blink that `texture_pattern_is_depth_invariant` exists to catch. At
+/// VL_STEP == 1 every cell is a voxel and this is the per-voxel formula again.
+///
+/// Reach: one cell = VL_STEP voxels = 20 cm, against the 25 cm the per-voxel
+/// kernel had at 25 cm voxels. Contact AO stays a contact-scale effect.
+fn vl_cell_ao(v: vec3<i32>) -> f32 {
+    let s = VL_STEP;
     var occ = 0.0;
-    // 6 face neighbours, weight 2.
-    if (ao_occluder(v + vec3<i32>(p, 0, 0))) { occ = occ + 2.0; }
-    if (ao_occluder(v + vec3<i32>(n, 0, 0))) { occ = occ + 2.0; }
-    if (ao_occluder(v + vec3<i32>(0, p, 0))) { occ = occ + 2.0; }
-    if (ao_occluder(v + vec3<i32>(0, n, 0))) { occ = occ + 2.0; }
-    if (ao_occluder(v + vec3<i32>(0, 0, p))) { occ = occ + 2.0; }
-    if (ao_occluder(v + vec3<i32>(0, 0, n))) { occ = occ + 2.0; }
-    // 12 edge neighbours, weight 1.
+    // 6 face-neighbour cells, weight 2 (a face blocks twice an edge's solid angle).
+    if (vl_cell_occluder(v + vec3<i32>( s, 0, 0))) { occ = occ + 2.0; }
+    if (vl_cell_occluder(v + vec3<i32>(-s, 0, 0))) { occ = occ + 2.0; }
+    if (vl_cell_occluder(v + vec3<i32>(0,  s, 0))) { occ = occ + 2.0; }
+    if (vl_cell_occluder(v + vec3<i32>(0, -s, 0))) { occ = occ + 2.0; }
+    if (vl_cell_occluder(v + vec3<i32>(0, 0,  s))) { occ = occ + 2.0; }
+    if (vl_cell_occluder(v + vec3<i32>(0, 0, -s))) { occ = occ + 2.0; }
+    // 12 edge-neighbour cells, weight 1.
     for (var a = 0u; a < 3u; a = a + 1u) {
         for (var s0 = 0u; s0 < 2u; s0 = s0 + 1u) {
             for (var s1 = 0u; s1 < 2u; s1 = s1 + 1u) {
-                let d0 = select(n, p, s0 == 1u);
-                let d1 = select(n, p, s1 == 1u);
+                let d0 = select(-s, s, s0 == 1u);
+                let d1 = select(-s, s, s1 == 1u);
                 var e = vec3<i32>(0);
                 if (a == 0u) { e = vec3<i32>(0, d0, d1); }
                 else if (a == 1u) { e = vec3<i32>(d0, 0, d1); }
                 else { e = vec3<i32>(d0, d1, 0); }
-                if (ao_occluder(v + e)) { occ = occ + 1.0; }
+                if (vl_cell_occluder(v + e)) { occ = occ + 1.0; }
             }
         }
     }
@@ -218,7 +226,13 @@ fn cs_voxel_light_update(@builtin(workgroup_id) wg: vec3<u32>,
     let rpb = u32(LIGHT_RECORDS_PER_BLOCK);
     // Lanes are grouped by brick so the 8 lanes sharing a block also share its
     // pool cache line and its brick occupancy word.
-    let slot = wg.x * VL_WG_BRICKS + li / rpb;
+    //
+    // The dispatch is TILED over x and y (`renderer::linear_dispatch`): a whole-
+    // shell sweep is already tens of thousands of workgroups at 10 cm and every
+    // dispatch dimension caps at 65,535. `vl_work` already returns VL_NONE past
+    // the work list, which is what makes the over-dispatched tail row free.
+    let lin = wg.x + wg.y * u32(DISPATCH_ROW_WGS);
+    let slot = lin * VL_WG_BRICKS + li / rpb;
     let ri = li % rpb;
     let brick = vl_work(slot);
     if (brick == VL_NONE) { return; }
@@ -293,7 +307,7 @@ fn cs_voxel_light_update(@builtin(workgroup_id) wg: vec3<u32>,
         sun = mix(f32(prev & 0xFFu) * (1.0 / 255.0), fresh_sun, vl_params.fold);
     }
 
-    let ao = vl_voxel_ao(wv);
+    let ao = vl_cell_ao(wv);
     let pt = vl_point_light(p);
 
     // The third byte is the "this record holds a real estimate" marker and

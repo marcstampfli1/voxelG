@@ -82,26 +82,50 @@ pub const WORLD_L4_Y: u32 = (WORLD_CHUNKS_Y + 3) / 4;
 pub const WORLD_L4_Z: u32 = (WORLD_CHUNKS_Z + 3) / 4;
 pub const WORLD_L4_TOTAL: u32 = WORLD_L4_X * WORLD_L4_Y * WORLD_L4_Z;
 
+// ---- compute dispatch tiling ----
+// Workgroups carried by the X dimension of a linearised compute dispatch.
+//
+// `dispatch_workgroups` caps EVERY dimension at 65,535 - that is WebGPU's
+// `maxComputeWorkgroupsPerDimension` floor and what wgpu reports by default.
+// A one-invocation-per-brick pass is WORLD_BRICKS_TOTAL / 64 workgroups, which
+// was 16,384 at 25 cm and is 400,000 at 10 cm: the GPU physics dispatch went
+// from comfortably inside the limit to a hard validation abort, with nothing in
+// between to warn about it. So a world-sized dispatch is TILED - X carries this
+// many workgroups and Y carries however many rows are needed - and the shader
+// rebuilds the linear index with `linear_wg` / the same multiply.
+//
+// 32,768 is half the limit and a power of two, so the reconstruction is a shift
+// and there is room for the limit to be reported lower by some future adapter
+// without the value needing to move. `renderer::linear_dispatch` is the only
+// place that converts a workgroup COUNT into a dispatch; nothing else should
+// open-code the division.
+pub const DISPATCH_ROW_WGS: u32 = 32_768;
+
 // ---- per-voxel light field (docs/VOXEL_LIGHTING_PLAN.md) ----
 // Resident light blocks, one per brick that carries lit-shell air. It lives here
 // rather than in `src/voxlight.rs` because the SHADER needs it too: the URGENT
 // list is appended to `vl_live_bricks` at exactly this offset, so both sides
 // must agree and `build.rs` emits it into the shader prelude. The rationale for
 // the value is on `voxlight::LIGHT_BLOCKS_MAX`, which re-exports this.
-// 2^21. The lit shell is a SURFACE, so it grows with the square of the linear
+// 2^22. The lit shell is a SURFACE, so it grows with the square of the linear
 // resolution: at 25 cm the demo world bound 63,903 blocks, and 2.5x finer voxels
-// over a 1.25x wider window is 6.25 x 1.56 = 9.8x that, ~625 k. The old 131,072
-// ceiling would have been overrun 5x, and overflow does not degrade gracefully -
+// over a 1.25x wider window is 6.25 x 1.56 = 9.8x that. The old 131,072 ceiling
+// would have been overrun by 8x, and overflow does not degrade gracefully -
 // `allocate` fills in brick-index order, which is z-major, so the shortfall
 // lands as a hard geographic band (that exact failure is the round-D story on
 // `voxlight::LIGHT_BLOCKS_MAX`).
 //
+// MEASURED, not estimated: a demo world with a coast, a forest and a 38 m peak
+// in it binds 1,118,187 blocks. 2^21 held it but with only 47% spare, which is
+// not headroom for a rougher seed - the shell scales with SURFACE, and caves,
+// cliffs and dense canopy are all surface.
+//
 // What pays for it is LIGHT_RECORDS_PER_BLOCK dropping 64 -> 8 (records at 2x
-// voxel spacing): a block is 64 B instead of 512 B, so 16x the blocks cost 2x
-// the pool - 128 MiB against 64 MiB - and the field is still finer in metres
+// voxel spacing): a block is 64 B instead of 512 B, so 32x the blocks cost 4x
+// the pool - 256 MiB against 64 MiB - and the field is still finer in metres
 // than the 25 cm build shipped. Measured headroom on the demo world is in
 // `the_demo_world_light_shell_fits_the_pool_and_still_covers_it`.
-pub const LIGHT_BLOCKS_MAX: u32 = 2_097_152;
+pub const LIGHT_BLOCKS_MAX: u32 = 4_194_304;
 
 // Edge of a light record's cell, in voxels. A record covers a
 // LIGHT_RECORD_STEP^3 group, so a brick holds (BRICK_DIM/STEP)^3 of them.

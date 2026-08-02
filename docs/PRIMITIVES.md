@@ -12,8 +12,10 @@ Every entry here was verified present in the tree when written.
 **`world_dims.rs` constants** - the SINGLE source of truth for every world
 dimension. `build.rs` generates the matching WGSL constants from this same file,
 so Rust, the CPU raycaster and every shader move together.
-FORBIDDEN: a literal 512 / 128 / 64 / 4 for a world dimension anywhere, and any
-second copy of these values in WGSL.
+FORBIDDEN: a literal 1600 / 400 / 640 / 160 / 4 for a world dimension anywhere,
+and any second copy of these values in WGSL. `shaders/grass.wgsl` is the one
+shader assembled without that prelude and has to carry its own copy of the scale;
+`grass::shader_scale_matches_world_dims` parses the WGSL and pins it.
 
 **`brick_idx` / `brick_coords`** (`voxel.rs`) - forward and inverse brick
 linearisation, deliberately adjacent in the file so they cannot drift apart.
@@ -117,13 +119,48 @@ presents as a hung launch.
 
 ## Scale
 
-**`world_dims::VOXEL_METRES`** - how big a voxel is in metres, 0.25 today. All
-gameplay sizes are written in SI and converted with `m_to_vox`, so the planned
-10 cm change (`docs/SCALE_TO_10CM.md`) moves the grid without retuning the
-player.
-FORBIDDEN: a size expressed directly in voxels, and any assumption that a voxel
-is 10 cm. That assumption is already wrong, and it once put a 1.8 m player at
-0.72 m tall.
+**`world_dims::VOXEL_METRES`** - how big a voxel is in metres, **0.10**. Every
+size that means something in the real world is written in SI and converted with
+`m_to_vox` (Rust) or `VOXELS_PER_METRE` (WGSL, emitted by `build.rs`), so the
+grid can move without retuning the player.
+FORBIDDEN: a size expressed directly in voxels. It compiles, renders and passes
+its tests while meaning something 2.5x smaller than it says - the 10 cm bump shed
+a list of them (`docs/SCALE_TO_10CM.md`): clouds 18 m across instead of 45, surf
+5 cm wide instead of 12.5, every biome above 3.6 m of altitude turned to bare
+rock, the light field's sun-tracking radius down to 6.4 m, multiplayer relay
+range down to 60 m. Two things are NOT lengths and correctly stay in voxels: a
+STEP COUNT against the grid (a probe that must not skip a one-voxel wall), and a
+sub-cell offset (the water plate's height inside its own cell).
+
+**`world_dims::DISPATCH_ROW_WGS` / `renderer::linear_dispatch`** - the one way to
+turn a workgroup count into `dispatch_workgroups` arguments. Tiles over x and y
+because every dimension caps at 65,535, which one workgroup per brick passes six
+times over at 10 cm.
+FORBIDDEN: `n.div_ceil(64)` straight into a dispatch for anything sized by the
+world - that is exactly how the GPU physics pass shipped as a validation abort.
+Shaders reached through it MUST bounds-check their own index; the tail row
+over-dispatches by design.
+
+## Per-voxel light field
+
+**`voxlight::light_record_idx` / `raymarch.wgsl::light_record_idx`** - the record
+index for an in-brick voxel. A record covers a `LIGHT_RECORD_STEP^3` CELL, so
+several voxels share one.
+FORBIDDEN: indexing the pool by `brick_voxel_idx`. It reads past the end of the
+block into the next tenant's records, and it shows up as a sun-visibility row
+alternating 0/255 down a straight shadow edge.
+
+**`raymarch.wgsl::vl_group_occ` / `vl_group_blocks` / `vl_cell_occluder`** - the
+three questions anything can ask about a record CELL: which of its voxels are
+occupied, does it hold a real opaque occluder (so light must not interpolate
+through it), and does it hold an ambient occluder (so it darkens its neighbours).
+All three answer the empty case in ONE storage load and only fetch materials for
+the bits that are set.
+FORBIDDEN: asking any of those about a single VOXEL when the lattice is coarser
+than the voxel. The cell holding a surface is dead by design, so the nearest live
+record is one or two voxels off the surface depending on parity, and a per-voxel
+probe silently answers for one parity and not the other. That cost a quarter of
+all surfaces their direct light and half of all flat ground its contact AO.
 
 ## Known gap
 
