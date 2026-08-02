@@ -430,6 +430,12 @@ pub struct World {
     /// previously it cloned active_bricks twice per tick (checklist: physics).
     pub phys_scratch: Vec<u32>,
     pub phys_touched: Vec<u32>,
+    /// The next tick's awake set, accumulated during the tick (see
+    /// `physics::retire_and_wake`). Lives here so the tick allocates nothing.
+    pub phys_wake: Vec<u32>,
+    /// `settle_sand`'s worklist, kept separate from `phys_touched` so the
+    /// per-tick CHANGED set is not consumed by the settle iteration.
+    pub phys_work: Vec<u32>,
     pub all_dirty: bool,
     pub chunk_meta: Vec<ChunkMeta>,
     pub seed: u64,
@@ -526,6 +532,8 @@ impl World {
             shell_seen: vec![0u64; (WORLD_BRICKS_TOTAL as usize).div_ceil(64)],
             phys_scratch: Vec::with_capacity(4096),
             phys_touched: Vec::with_capacity(8192),
+            phys_wake: Vec::with_capacity(8192),
+            phys_work: Vec::with_capacity(8192),
             all_dirty: true,
             chunk_meta: vec![ChunkMeta { generated: false }; WORLD_STORE_CHUNKS as usize],
             seed,
@@ -792,7 +800,7 @@ impl World {
     /// computed on the worker (SlotData::from_bricks), so the main thread only
     /// copies + sets mask bits — no 64-voxel rescans. This is what removes the
     /// chunk-load lag spike.
-    fn apply_slot_data(&mut self, slot_cx: u32, slot_cy: u32, slot_cz: u32, data: &SlotData) {
+    pub(crate) fn apply_slot_data(&mut self, slot_cx: u32, slot_cy: u32, slot_cz: u32, data: &SlotData) {
         let base_bx = slot_cx * STORAGE_CHUNK_BRICKS;
         let base_by = slot_cy * STORAGE_CHUNK_BRICKS;
         let base_bz = slot_cz * STORAGE_CHUNK_BRICKS;
@@ -811,6 +819,23 @@ impl World {
                     self.set_movable(bi, data.movable[idx]);
                     self.refresh_masks_for_brick(bx, by, bz);
                     self.mark_brick_dirty(bi);
+                }
+            }
+        }
+        // WAKE PATH (streaming). A slot arriving with fluid in it must wake, and
+        // so must the ALREADY-SETTLED bricks it now borders - a lake whose new
+        // neighbour turned into a hole has nothing of its own to notice, so this
+        // runs for EVERY installed brick, not only the movable ones.
+        // `wake_region` skips neighbours that hold nothing movable, so an
+        // all-stone chunk costs 512 mask reads and adds nothing to the set.
+        //
+        // Its own pass, because `wake_region` reads the neighbours' movable
+        // masks and half of them are still the previous tenant's until the loop
+        // above has finished.
+        for dz in 0..STORAGE_CHUNK_BRICKS {
+            for dy in 0..STORAGE_CHUNK_BRICKS {
+                for dx in 0..STORAGE_CHUNK_BRICKS {
+                    self.wake_region(brick_idx(base_bx + dx, base_by + dy, base_bz + dz));
                 }
             }
         }
@@ -840,6 +865,52 @@ impl World {
     pub fn mark_active(&mut self, bi: u32) {
         if let Err(pos) = self.active_bricks.binary_search(&bi) {
             self.active_bricks.insert(pos, bi);
+        }
+    }
+
+    /// The six FACE neighbours of `bi` that exist inside the window.
+    ///
+    /// Six faces is exactly the reach of every CA rule (water: -y gravity,
+    /// +y refill, +-x/+-z lateral; sand: -y; smoke: +y and +-x/+-z), so a
+    /// disturbance can never propagate diagonally in one tick and a diagonal
+    /// neighbour never needs waking.
+    #[inline]
+    pub fn face_neighbours(bi: u32) -> [Option<u32>; 6] {
+        let (bx, by, bz) = brick_coords(bi);
+        [
+            (bx > 0).then(|| brick_idx(bx - 1, by, bz)),
+            (bx + 1 < WORLD_BRICKS_X).then(|| brick_idx(bx + 1, by, bz)),
+            (by > 0).then(|| brick_idx(bx, by - 1, bz)),
+            (by + 1 < WORLD_BRICKS_Y).then(|| brick_idx(bx, by + 1, bz)),
+            (bz > 0).then(|| brick_idx(bx, by, bz - 1)),
+            (bz + 1 < WORLD_BRICKS_Z).then(|| brick_idx(bx, by, bz + 1)),
+        ]
+    }
+
+    /// THE wake primitive: put `bi` and its six face neighbours back in the
+    /// CA's awake set, so the next `physics::tick` re-evaluates them.
+    ///
+    /// `active_bricks` is the AWAKE set, not "every brick holding a fluid" — a
+    /// settled lake retires and costs nothing until something disturbs it. That
+    /// makes waking a CORRECTNESS obligation: every path that can disturb
+    /// settled material (player edit, explosion, a chunk streaming in, a
+    /// neighbour draining, sand landing in water) must come through here or
+    /// that material stops responding, which is far worse than a slow tick.
+    ///
+    /// WHY THE RING and not just `bi`: every transfer in the CA is decided by
+    /// the DONOR reading its own cells. A brick that changed re-evaluates
+    /// itself, but a SETTLED neighbour that suddenly has somewhere to flow has
+    /// nothing of its own to notice — it has to be told. Neighbours with no
+    /// movable voxel are skipped: they can only RECEIVE, and a receive is
+    /// always performed by the donor's own step.
+    pub fn wake_region(&mut self, bi: u32) {
+        if self.movable_mask[bi as usize] != 0 {
+            self.mark_active(bi);
+        }
+        for nb in Self::face_neighbours(bi).into_iter().flatten() {
+            if self.movable_mask[nb as usize] != 0 {
+                self.mark_active(nb);
+            }
         }
     }
 
@@ -1241,6 +1312,12 @@ impl World {
             self.refresh_masks_for_brick(bx, by, bz);
         }
         self.recompute_movable_for_brick(bi);
+        // WAKE PATH (edits, explosions, edit replay). `recompute_movable_for_brick`
+        // only touches `active_bricks` on the empty<->movable TRANSITION, which
+        // is blind to the case that matters: pulling the stone plug out from
+        // under a settled lake changes no movable bit in the edited brick and
+        // leaves the lake asleep forever. Every edit wakes its ring.
+        self.wake_region(bi);
         self.recompute_uniform_for_brick(bi);
         // The tile this brick lives in may have lost its uniform status.
         let ti = tile_idx(bx / 4, by / 4, bz / 4);

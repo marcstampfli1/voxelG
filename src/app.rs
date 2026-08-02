@@ -197,7 +197,7 @@ pub(crate) const JITTER_PATTERN: [[f32; 2]; 8] = [
 
 /// Expand a sphere-of-impact into the world (and its persistent edit log). Free
 /// function so it can run while the world Mutex guard is held (no &mut self).
-fn apply_sphere(world: &mut World, cx: i32, cy: i32, cz: i32, radius: u8, mat: u8) {
+pub(crate) fn apply_sphere(world: &mut World, cx: i32, cy: i32, cz: i32, radius: u8, mat: u8) {
     let r = radius as i32;
     let r2 = r * r;
     for dy in -r..=r {

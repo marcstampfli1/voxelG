@@ -1,0 +1,14 @@
+warning: unused variable: `output_tex`
+    --> src\renderer.rs:4153:13
+     |
+4153 |         let output_tex = _otex;
+     |             ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_output_tex`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `voxel` (lib test) generated 1 warning (run `cargo fix --lib -p voxel --tests` to apply 1 suggestion)
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.28s
+     Running unittests src\lib.rs (target\debug\deps\voxelg-0dcf7c375cba86f7.exe)
+
+running 1 test
+test renderer::gpu_render_tests::live_session_profile ... live_session_profile: init frame  sync_light_shell_all 563.3 ms, upload 6.6 ms, 1123509 blocks bound
