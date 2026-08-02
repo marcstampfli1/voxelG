@@ -129,6 +129,59 @@ milestone; see "Staging" at the end.
 - **Host authority.** There is a net/server split; gameplay state has to
   respect it or multiplayer diverges.
 
+## Infrastructure reality (surveyed 2026-08-02)
+
+What exists, and the design decisions it forces.
+
+**There is no local player.** The camera IS the position (`camera.rs:5`), a
+free noclip flycam at 80 voxels/sec with no gravity, grounding or collision.
+Remote players are interpolated pose history only (`net.rs:128`), purely
+visual, with no physics or solidity. So "player controller" means introducing a
+real player BODY, which is also the thing that damage-as-material-loss (19),
+encumbrance (5) and multiplayer collision will all need. Build it once, deliberately.
+
+**Collision is greenfield, and the obvious basis is the wrong one.** The only
+CPU solidity test today is `in_solid`, inline in `raycast` (`raycast.rs:72`),
+and that raycast walks voxel by voxel up to 4096 steps WITHOUT touching the
+L4/chunk/tile/brick pyramid the shaders use. A character AABB is roughly
+6x18x6 voxels; testing it a voxel at a time, per substep, is the naive design.
+The right one reuses the hierarchy: a brick's `occupancy` is a u64 covering
+4x4x4 voxels, so an AABB overlap is a handful of masked u64 tests, and empty
+tiles/chunks skip whole regions. That primitive does not exist on the CPU yet
+and should be built once and shared by collision, digging and any future
+entity (safe-primitives).
+
+**The CPU light query: async readback of ONE record, not a full readback and
+not a second implementation.** Three options were on the table:
+- Full GPU readback of the light pool. Rejected: the existing readback pattern
+  (`renderer.rs:3690`) uses `poll(wait_indefinitely())` and stalls the frame.
+- A separate CPU sun-visibility raycast. Rejected despite being easy: it is a
+  SECOND definition of "how lit is this point" that will silently drift from
+  the one the renderer uses, which is exactly the two-drifting-paths failure
+  the lighting rework just spent a week removing.
+- CHOSEN: the CPU already owns the brick -> block mapping (`LightField::block_of`),
+  so it can compute the exact word offset of the player's own light record and
+  copy 8 bytes into a staging buffer, mapped asynchronously and read a frame or
+  two later. One source of truth, no stall, and a 1-2 frame lag is irrelevant to
+  a body temperature that moves over seconds. Needs a defined fallback for a
+  player standing outside the lit shell.
+
+**Structural integrity (23) is fully greenfield.** Physics simulates falling
+sand, an 8-level water CA and smoke at 30 Hz on a worker thread
+(`physics.rs:29`, `app.rs:314`), but material falls only when the cell directly
+below is empty. There is no support relationship, no connectivity, nothing to
+extend. This is the hardest item in the document and it is not in the slice.
+
+**Gameplay must respect server authority.** `server.rs` owns an authoritative
+edit log replayed to joiners over TCP; edits already broadcast
+(`app.rs:464`). Any survival action that changes the world has to flow through
+that or multiplayer diverges.
+
+**Latent bug found while surveying:** the GPU physics path
+(`VOXELG_GPU_PHYSICS`) writes only the GPU buffer and never updates the CPU
+`World`, so raycast picking sees pre-physics state. Not caused by survival
+work, but it will bite anything that queries the world from the CPU.
+
 ## Staging
 
 Vertical slice first, chosen so the first playable loop already exercises BOTH
