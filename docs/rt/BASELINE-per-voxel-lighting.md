@@ -1074,6 +1074,318 @@ back), a counter, or a pixel diff of two images rendered by the same build.
 
 End-to-end fps is not quoted, for the reason round G gives.
 
+## Round I: the foliage hole closed, and the per-pixel path deleted
+
+Round H ended by declaring the per-pixel shadow cone and `compute_ao` permanent,
+on one measurement: the field answered for 96.6% of terrain pixels, 99.9% of
+water, and 45.6% of FOLIAGE, so "removing the fallback would render half a canopy
+black". That conclusion accepted a DESIGN FLAW as a property of canopies. It was
+neither, and round I is the correction.
+
+### The root cause, which was in the storage rule and not in the canopy
+
+Light lived in AIR voxels adjacent to solid, and `voxlight_sample` gated its
+eight trilinear taps on `is_voxel_solid`. Inside a canopy the cell against a leaf
+face is usually ANOTHER LEAF, which is occupied, so every tap was dropped and the
+sampler had nothing to return. Three separate rules enforced that, and all three
+were the same conflation - OCCUPIED read as OPAQUE:
+
+  - `World::brick_needs_light` refused a block to any FULLY OCCUPIED brick, so a
+    dense canopy interior got no storage at all;
+  - `cs_voxel_light_update` stamped epoch 0 on every occupied voxel, so leaves
+    that did have storage held no record;
+  - `voxlight_sample` dropped every occupied tap.
+
+But leaves are not walls. The gate exists to stop light interpolating through a
+one-voxel WALL, and the engine already draws that distinction everywhere else:
+`shadow_voxel_occludes` runs foliage through a sub-voxel cutout instead of
+blocking outright, and `ao_occluder` refuses to let decoration stamp AO squares.
+The light field never inherited it.
+
+### What changed
+
+FOLIAGE CARRIES LIGHT. A canopy is a semi-transparent volume, and a volume wants
+a value AT the sample point, not at an adjacent air cell that on canopy is
+another leaf.
+
+  - `brick_needs_light` binds a block for a fully occupied brick when it holds
+    foliage. On the demo world that is 3,729 extra bricks: 60,174 -> 63,903
+    blocks, 30.8 -> 32.7 MB of the 67.1 MB pool. The headroom assertion (under
+    half the pool) still holds.
+  - `cs_voxel_light_update` writes a real record for a foliage voxel and keeps
+    the epoch-0 stamp for genuinely opaque ones. It also reads occupancy and
+    material straight out of the brick it was dispatched for (`li` IS the brick
+    voxel index) instead of re-descending the hierarchy through `is_voxel_solid`.
+  - `voxlight_sample`'s gate becomes "is this a REAL OPAQUE OCCLUDER" via the new
+    `vl_tap`, which answers that and "where is the record" from ONE hierarchy
+    descent - the sampler used to pay two per tap, eight times per pixel.
+  - A gather must not occlude ITSELF (`shadow_skip_active`). A leaf voxel gathers
+    at its own centre, and both `trace_any` and `rt_brick_occludes` test the
+    origin cell first, so without this every leaf's sun visibility would be
+    decided by whether its own tuft cutout happened to sit in front of the block
+    centre. Air voxels are unaffected: an empty cell never occluded anything.
+
+The wall rule is intact and that is the check that says the gate was FIXED rather
+than removed: `voxlight_does_not_leak_through_a_one_voxel_wall` still passes, and
+`water_plate_height_does_not_move_the_light_sample` still passes because water is
+still opaque to the gate.
+
+### Coverage, same harness and same method as round H
+
+| segment | round H  | round I   | unanswered pixels |
+|---------|----------|-----------|-------------------|
+| terrain |  96.569% | 100.000%  |       0 of 1,401,797 |
+| water   |  99.949% |  99.996%  |      73 of 1,796,398 |
+| foliage |  45.644% |  99.992%  |     115 of 1,464,930 |
+
+Terrain is exactly complete. `LiveFrameRig::coverage` now also reports WHERE the
+unanswered pixels are, because a count cannot tell a structural seam from
+rounding at a corner. They are ISOLATED SINGLE PIXELS scattered over the frame
+(foliage x 340..1407, y 288..422; water x 494..1896, y 98..337) and never a
+contiguous region.
+
+What they are: shading points whose whole 2x2x2 trilinear neighbourhood is
+opaque. A sub-voxel foliage hit shades about the TUFT QUAD's normal, which can
+point in any direction, so `p_hit + n * 0.5` can land inside a tree trunk - a
+leaf card lying flat against wood, seen edge-on. The water cases are the same
+thing on a facet normal. For those points "no direct sun" is the correct answer
+rather than a missing one, so they are ACCEPTED rather than fixed: sampling a
+second time about the geometric face normal would answer them, and paying a
+second eight-tap fetch on every foliage pixel in the frame to move 0.008% of them
+is not a trade worth making.
+
+### The designed out-of-range term
+
+There is no fallback ray anywhere in the frame now, including
+`shade_water_top`'s, which was the last single-ray one. When `voxlight_sample`
+cannot answer, `shadow_term` is 0 and `ao` is 1: NO DIRECT SUN, full ambient and
+probe GI. That is a deliberate term, not a leftover default, and it covers the
+three remaining cases correctly:
+
+  - the neighbourhood is opaque (above): the point is buried, and 0 is right;
+  - the voxel is outside the streamed window: nothing renders there, because the
+    DDA is bounded by the same window;
+  - a block was bound or invalidated and the urgent list has not gathered it yet:
+    at most a frame or two, and it reads as shadow rather than as black. Measured
+    over 600 frames of real streaming with 393,216 dirty bricks, it never showed
+    up in the coverage numbers above at all.
+
+Pool exhaustion would be a fourth, and it does not occur: `overflow total 0` on
+the streamed session, with the shell at 63,903 of 131,072 blocks.
+
+The darkest foliage pixels prove the "not black" claim numerically rather than by
+eye. Over the green-led pixels of each lookdev still, before -> after:
+
+| view          | p0.1 luma   | p1 luma     | mean luma     |
+|---------------|-------------|-------------|---------------|
+| canopy_top    | 15.3 -> 15.6| 18.8 -> 21.5|  95.3 -> 104.8|
+| tree_close    | 15.3 -> 15.3| 17.5 -> 18.1| 125.4 -> 137.0|
+| forest_mid    | 15.3 -> 15.3| 18.1 -> 20.0| 134.6 -> 144.0|
+| leaffall      | 15.3 -> 15.3| 17.5 -> 18.1| 121.8 -> 132.2|
+| birch_close   | 15.9 -> 15.9| 24.9 -> 27.1| 152.1 -> 158.3|
+| pine_close    | 18.8 -> 17.3| 19.4 -> 19.5| 146.0 -> 150.6|
+
+The dark floor does not move, because it was never the shadow term that set it -
+it is ambient plus probe GI - and every canopy view came out BRIGHTER.
+
+### Perf: `live_session_profile`, whole shipped frame
+
+600 frames of the real session, then four camera segments at 1920x1080. Read the
+within-run controls first: `clouds`, `beam`, `probe` and `compose` are passes
+this change cannot touch, and across all four segments they moved -5% to 0%, so
+the after run is if anything marginally COOLER and the deltas below are
+conservative.
+
+| segment | pass    | before | after  | delta            |
+|---------|---------|--------|--------|------------------|
+| sky     | main    |  0.257 |  0.258 | +0.001 (flat)    |
+| terrain | main    |  3.169 |  2.432 | -0.737 (-23.3%)  |
+| foliage | main    | 11.273 |  7.228 | -4.045 (-35.9%)  |
+| water   | main    |  2.288 |  2.290 | +0.002 (flat)    |
+| water   | transp  |  0.816 |  0.793 | -0.023 (-2.8%)   |
+| sky     | vlight  |  0.325 |  0.357 | +0.032 (+9.8%)   |
+| terrain | vlight  |  0.328 |  0.358 | +0.030 (+9.1%)   |
+| foliage | vlight  |  0.328 |  0.353 | +0.025 (+7.6%)   |
+| water   | vlight  |  0.327 |  0.356 | +0.029 (+8.9%)   |
+| sky     | FRAME   |  1.949 |  1.916 | -0.033 (-1.7%)   |
+| terrain | FRAME   |  4.679 |  3.906 | -0.773 (-16.5%)  |
+| foliage | FRAME   | 12.665 |  8.636 | -4.029 (-31.8%)  |
+| water   | FRAME   |  4.607 |  4.575 | -0.032 (-0.7%)   |
+
+FOLIAGE IS THE ROW THAT MATTERS, because foliage is the scenario that had never
+once saved anything: rounds D, E, F and G all measured it between -0.04 and
++1.04 ms, i.e. nothing or a loss, and round H explained why - the field answered
+for under half the pixels, so it was a supplement paid for on top of the
+per-pixel path rather than a replacement for it. It is now -4.0 ms on cs_main and
+-4.0 ms on the whole frame.
+
+Sky and water are flat, and both are correct rather than disappointing: a
+sky-facing frame has no shaded pixels to save on, and water was already at 99.9%
+coverage so it was never tracing the cone this change deletes.
+
+The update pass costs +0.03 ms because foliage voxels now TRACE instead of
+early-outing on `is_voxel_solid`, against 2.5% more blocks (49,086 -> 50,306 on
+the streamed session). CPU is unchanged: `sync_light_shell_dirty` 0.049 -> 0.050
+ms mean (the `brick_has_foliage` scan is gated on `is_full`, so a normal brick
+still costs one word), `upload_voxlight` 0.041 -> 0.034 ms.
+
+### Perf: `rt_vs_software_timing`
+
+The within-run control here is `primary-trace-only`, the traversal with shading
+compiled out - a path this change does not touch. It moves at most 1.6% between
+the two runs (terrain SW 4.35 -> 4.37, RT 3.99 -> 4.02; foliage SW 4.52 -> 4.48,
+RT 5.01 -> 5.07; water-close RT 1.10 -> 1.07; terrain-covered RT 2.08 -> 2.16),
+which is what makes the shading column below readable.
+
+| scenario        | RT-prim+PROBE-GI  | derived SHADE    |
+|-----------------|-------------------|------------------|
+| terrain         | 12.69 -> 8.61 ms  | 7.94 -> 3.76 ms  |
+| foliage         | 15.02 -> 10.32 ms | 9.16 -> 4.57 ms  |
+| water-close     |  3.66 ->  3.76 ms | 1.04 -> 1.16 ms  |
+| terrain-covered |  7.69 ->  5.72 ms | 4.72 -> 2.84 ms  |
+
+Shading roughly HALVES on terrain and foliage. Water-close's +0.12 ms of shade is
+the honest cost of the change on a surface that was already fully covered: the
+tap gate now fetches a material as well as an occupancy bit.
+
+The update pass on this harness went the other way, 2.80 -> 2.64 ms whole-shell
+(0.73 -> 0.65 ms camera-aware) on 6.2% MORE blocks, because reading occupancy
+directly out of the dispatched brick is cheaper than the `is_voxel_solid`
+hierarchy descent it replaced, and five sixths of that world's shell voxels are
+solid. The live session's +0.03 ms and this -0.16 ms are both real: they are
+different mixes of foliage against terrain.
+
+### The FIELD A/B column is gone, and its replacement means something else
+
+`rt_vs_software_timing` used to print "FIELD A/B": the populated field against an
+empty one, i.e. the field against the per-pixel cone it was replacing, i.e. what
+the field SAVED. That comparison no longer exists, because the empty-field side
+no longer traces anything - it renders unlit. The line is now "SAMPLER COST" and
+reads +0.43 to +0.58 ms across the four scenarios, which is what the eight-tap
+fetch itself costs against a frame with no lighting in it. It is not a saving and
+must not be quoted as one; the saving is the before/after above.
+
+### The last per-pixel shadow ray: glass
+
+`shade_glass`'s specular sun glint traced its own binary `shadow_occluded`. It is
+not the cone and not `compute_ao`, so it was not on the brief, but it was a second
+per-pixel sun-visibility mechanism and it now reads `voxlight_sample(p_hit, n).sun`
+like everything else. Glass keeps its per-pixel MIRROR - that predates all of this
+and a pane is exactly where a true mirror is the whole effect - but it does not
+keep a private shadow test.
+
+The stills cannot demonstrate an improvement here and this does not claim one:
+`material_lab` is the only lookdev view with glass in it and its panes stand in
+FULL SUN, where a binary ray and a converged field record both read 1.0. It is
+bit-identical across the change (max 2/255). What changes is a pane at a shadow
+EDGE, where the highlight now fades across the penumbra instead of switching.
+
+Three `shadow_occluded` callers remain, and none of them is surface shading:
+`cs_voxel_light_update` (which is the field GATHERING, i.e. the mechanism itself),
+the god-ray march (participating-medium visibility at points in mid-air, most of
+them outside the lit shell), and the GI probe grid's own sun term (`gi_probes.wgsl`,
+world-space per-probe, plus the legacy per-pixel GI reference the shipped renderer
+does not run). Making the probe grid read the light field is a real question about
+a different subsystem with its own storage and its own out-of-shell sample points;
+it is NOT taken here and is not part of "one lighting mechanism" as this round
+scopes it.
+
+### Temporal stability: the smoothness claim, finally measured where it applies
+
+`flicker_probe_rt_views`, before and after, both runs with the field LIVE. The
+"before" half was taken by stashing this change and flipping `RigOpts::voxlight`
+to true on the HEAD tree, so it is the SHIPPED MIX - the field where it answered,
+the per-pixel cone where it did not - and not the cone running alone. Round H's
+table cannot be used for this: every non-`_field` line in it was taken with
+`voxlight: false`, i.e. against the cone by itself, which would overstate the
+change.
+
+| view          | before (field + cone mix) | after (field only) |        |
+|---------------|---------------------------|--------------------|--------|
+| terrain_trees |  41,366 (1.995%)          |    228 (0.011%)    | 181x   |
+| tree_shadow   |   1,116 (0.054%)          |    114 (0.005%)    | 9.8x   |
+| meadow        |     309 (0.015%)          |    233 (0.011%)    | 1.3x   |
+| underwater    |      22 (0.001%)          |      0 (0.000%)    | gone   |
+| water_top     |   6,004 (0.290%)          |  5,828 (0.281%)    | same   |
+| water_graze   |   3,797 (0.183%)          |  3,821 (0.184%)    | same   |
+| water_shadow  |   2,472 (0.119%)          |  2,477 (0.119%)    | same   |
+
+TERRAIN_TREES IS THE RESULT. That camera frames a canopy, which is where the
+field answered for 45.6% of pixels and the other 54.4% took ONE binary jittered
+ray per pixel per frame - a ray that re-randomises every frame and whose jitter
+phase freezes while the camera moves. Strongly flickering pixels fall 181x.
+
+The three water views are the CONTROL, and they are what make the row above
+readable: water was already at 99.9% coverage, so nothing there changed path, and
+all three agree with their before values to within 0.009 percentage points.
+
+This is the claim the plan opened with in July - "the softness EXISTS ONLY WHERE
+TAA CONVERGES", "choppy is the direct signature of binary per-pixel visibility" -
+measured on the view class it was actually about, which no round before this one
+could measure at all, because the fallback was still over half of it.
+
+### Harnesses that were measuring a path that no longer exists
+
+Deleting the fallback turned a soft failure into a loud one, and that had to be
+handled rather than absorbed:
+
+  - `render_rgba_full_opts` now ASSERTS that a world with geometry has a bound
+    light shell. It used to be a soft opt-in - an unsynced world bound nothing,
+    the sampler reported invalid, and shading fell back to the per-pixel cone, so
+    a harness that never opted in still produced a plausible frame and then
+    measured it. 32 still-image harnesses were in that state, including four real
+    tests; they now bind the shell. The assert found one the audit missed
+    (`leaf_occlusion_render`).
+  - `flicker_probe_rt_views` ran every view with `voxlight: false` and paired the
+    water views with a `_nofield` twin. `RigOpts::voxlight` now defaults to TRUE
+    and the twins are deleted: an A/B against a mechanism that does not exist is
+    not a measurement.
+  - `dump_lookdev_views` loses `water_graze_nofield` for the same reason. It was
+    the last survivor of the reflection A/B, which round F already ended.
+
+### Tests
+
+`cargo test --lib` is green at 91 passed, 0 failed (was 89). Two were rewritten
+because this change genuinely invalidates their premise, and both are stated
+rather than quietly edited:
+
+  - `the_demo_world_light_shell_fits_the_pool_and_still_covers_it` asserted that
+    a FULLY SOLID brick must hold no block. That is now true only of a brick with
+    no CARRIER voxel - no air and no foliage - and the test says so, derived from
+    what the sampler needs rather than copied from `brick_needs_light`. It also
+    now asserts the demo world actually contains fully occupied foliage bricks
+    (3,729 of them), so the new clause is exercised on real data.
+  - `water_foam_is_white_and_sits_at_crests_and_shores` and `water_terrace_ramp`
+    were not rewritten - they were the two that FAILED, correctly, because they
+    rendered a world with no light shell. They bind it now.
+
+Two were added:
+
+  - `a_canopy_carries_light_through_its_depth` is the pin for the whole round. A
+    solid 12-deep leaf slab (every interior brick fully occupied) must hold
+    blocks, its leaf voxels must hold real records rather than the opaque stamp,
+    its crown must read lit and its interior dark; and a SPARSE canopy beside it
+    must store a CONTINUUM - 1,200 of 6,000 records land strictly between dark
+    and lit. The solid slab's own falloff is one voxel wide and that is correct:
+    a leaf block covers its own cell, so a canopy with no gaps IS opaque.
+  - `the_foliage_material_sets_match_the_shader` parses `is_foliage_mat` and the
+    `MAT_*` constants out of raymarch.wgsl and compares the set against the CPU's.
+    The two halves of one decision now live in two languages - the shader decides
+    what may be interpolated through, the CPU decides what gets storage - and a
+    material in one list and not the other is a canopy the sampler reads from a
+    brick that was never allocated, invisible in every aggregate number.
+
+### What round I does NOT claim
+
+End-to-end fps is not quoted, for the reason round G gives. Every number above is
+a within-run control (the untouched passes in `live_session_profile`, the
+primary-trace-only column in `rt_vs_software_timing`), a counter, or a pixel
+statistic over two images rendered by the same build.
+
+The absolute frame times in the two `rt_vs_software_timing` runs are not
+comparable to rounds A-H: that harness's SOFTWARE column also shades through
+`shade`, so it moved with this change too and is not a control any more.
+
 ## Reproducing
 
     cargo test --lib live_session_profile -- --ignored --nocapture
@@ -1085,3 +1397,9 @@ End-to-end fps is not quoted, for the reason round G gives.
 
 Re-run on the SAME machine after the rework and compare against this table,
 not against docs/PERF.md.
+
+Round I's own numbers come from `live_session_profile` (coverage + whole-frame
+per-pass GPU), `rt_vs_software_timing` (the shading split), `flicker_probe_rt_views`
+(temporal), `dump_lookdev_views` (the stills) and `cargo test --lib`. The
+before/after halves of each were taken by `git stash`ing this change, so the two
+sides differ by nothing else.

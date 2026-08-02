@@ -3943,6 +3943,7 @@ mod gpu_render_tests {
         cam.pos.y = s.h as f32 + 30.0;
         cam.pitch = -0.35;
 
+        sync_voxlight_shells(&mut world);
         let rgba = render_rgba(&world, &cam, 320, 200)?;
         let mut min = 1.0f32;
         let mut max = 0.0f32;
@@ -4102,14 +4103,25 @@ mod gpu_render_tests {
         });
         // ---- per-voxel light field ----
         //
-        // Populated ONLY when the caller has already run the shell syncs on this
-        // world (`sync_voxlight_shells`, which `dump_lookdev_views` calls),
-        // because those need `&mut World` while this path holds a `&World`. An
-        // unsynced world binds nothing, `voxlight_sample` reports invalid and
-        // shading falls back to the per-pixel shadow ray - which is exactly what
-        // every still test here did before the field existed, so nothing that
-        // does not opt in changes.
+        // Populated ONLY when the caller has already run the shell sync on this
+        // world (`sync_voxlight_shells`), because that needs `&mut World` while
+        // this path holds a `&World`.
+        //
+        // FORGETTING IT IS NOW AN ERROR RATHER THAN A DARKER PICTURE. It used to
+        // be a soft opt-in: an unsynced world bound nothing, `voxlight_sample`
+        // reported invalid, and shading fell back to the per-pixel shadow cone,
+        // so a harness that never opted in still produced a plausible frame -
+        // and then measured it. There is no per-pixel path any more, so an
+        // unsynced world renders with no direct sun anywhere, and that must not
+        // be something a test can quietly assert against.
         let vl_count = upload_voxlight_fresh(&queue, &vl_bufs, world);
+        assert!(
+            vl_count > 0 || world.bricks.iter().all(|b| b.is_empty()),
+            "this world has geometry but no light shell bound. Call \
+             sync_voxlight_shells(&mut world) before rendering: the per-voxel light field is \
+             the frame's ONLY sun-visibility and AO mechanism, so without it every surface \
+             renders with no direct sun."
+        );
         if vl_count > 0 {
             let vl_pipe = |entry: &'static str| {
                 device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -4671,13 +4683,13 @@ mod gpu_render_tests {
         /// `Renderer::render` does: the update pass, one round per frame, on
         /// the frame counter.
         ///
-        /// Off by default because every number this rig recorded before the
-        /// field existed was taken against an empty `VoxLightBuffers` - the
-        /// sampler reports invalid and shading falls back to the per-pixel path
-        /// - so flipping it on globally would silently make those figures
-        /// incomparable. On, this measures the SHIPPED frame; off, the fallback
-        /// the field replaces. The pair is the A/B, and it is the only way this
-        /// rig can see the field at all.
+        /// ON by default, because it is the only way the frame HAS sun
+        /// visibility. It used to default off and every water view was run as a
+        /// field/no-field A/B, on the argument that the pair was the only way
+        /// this rig could see the field. That pair is gone with the per-pixel
+        /// path it compared against: "no field" is not a rendering the engine
+        /// can produce any more, it is an unlit one, and a flicker number taken
+        /// from it would describe nothing.
         voxlight: bool,
     }
 
@@ -4688,7 +4700,7 @@ mod gpu_render_tests {
                 sun_base: 30.0,
                 animate: true,
                 jit_freeze: false,
-                voxlight: false,
+                voxlight: true,
             }
         }
     }
@@ -5233,6 +5245,9 @@ mod gpu_render_tests {
         let mut cam = Camera::new();
         cam.pos = glam::Vec3::new(clamp_anchor(leaf_anchor.x), leaf_ground as f32 + 10.0, clamp_anchor(leaf_anchor.y) - 24.0);
         cam.pitch = -0.3;
+        // The field is the frame's only sun visibility, so it is bound BEFORE
+        // any probe rather than half way down as a second variant.
+        sync_voxlight_shells(&mut world);
         let day = RigOpts::default();
         let no_gi = RigOpts { gi_on: false, ..day };
         flicker_probe_rt(&world, &cam, "terrain_trees", day);
@@ -5261,41 +5276,22 @@ mod gpu_render_tests {
         wt.pos = glam::Vec3::new(px as f32 + 0.5, psurf as f32 + 6.0, pz as f32 - 10.0);
         wt.pitch = -0.75;
         flicker_probe_rt(&world, &wt, "water_top", day);
-        // GRAZING over the water, and the only view in this rig that judges the
-        // REFLECTION cache. Reflections are Fresnel-weighted, so a steep view
-        // shows the cache at ~2% of the pixel and a grazing one shows it at
-        // most of the pixel. Run as an A/B - once on the per-pixel fallback,
-        // once with the per-voxel fields live - because "the field flickers" is
-        // a claim about the DIFFERENCE, and every number this rig had ever
-        // produced was taken against an empty field.
+        // GRAZING over the water: the shallowest angle in the set, where the
+        // Fresnel sky blend is most of the pixel and the facet ladder is read
+        // almost edge-on.
         let mut wg = Camera::new();
         wg.pos = glam::Vec3::new(px as f32 + 0.5, psurf as f32 + 3.0, pz as f32 - 20.0);
         wg.pitch = -0.10;
-        flicker_probe_rt(&world, &wg, "water_graze_nofield", day);
-        sync_voxlight_shells(&mut world);
-        flicker_probe_rt(&world, &wg, "water_graze_field", RigOpts { voxlight: true, ..day });
-        // The steep view WITH THE FIELD, which is the A/B the water-shadow
-        // report needs and which this rig has never run. `water_top` above is
-        // the per-pixel fallback: every water number ever taken here was, so
-        // "the faceted surface and the light field are fighting" was untestable.
-        // Steep rather than grazing because at this angle Fresnel is near zero
-        // and almost the whole pixel is the lit/shadowed term the field feeds.
-        flicker_probe_rt(&world, &wt, "water_top_field", RigOpts { voxlight: true, ..day });
-        // SHADOWED OPEN WATER, both ways. This is the view the water-shadow
-        // report needs and the one no natural camera in the demo world provides:
-        // `water_top` above frames a pond in full sun, so `shade_water_top`'s
-        // lit/shadowed smoothstep is saturated at 1 and reads the SAME whether
-        // the light field answers or the per-pixel ray does - which is why those
-        // two lines agree to eleven pixels and settle nothing.
-        //
-        // Same crafted scene `dump_lookdev_views` uses for the still: a wall
-        // standing in a flat sheet, its shadow edge a line of constant x across
-        // the water.
+        flicker_probe_rt(&world, &wg, "water_graze", day);
+        // SHADOWED OPEN WATER, which no natural camera in the demo world
+        // provides: `water_top` above frames a pond in FULL SUN, where the
+        // lit/shadowed term is saturated and cannot move. Same crafted scene
+        // `dump_lookdev_views` uses for the still - a wall standing in a flat
+        // sheet, its shadow edge a line of constant x across the water.
         {
             let (mut sw, scam) = build_water_shadow_world(true);
-            flicker_probe_rt(&sw, &scam, "water_shadow_nofield", day);
             sync_voxlight_shells(&mut sw);
-            flicker_probe_rt(&sw, &scam, "water_shadow_field", RigOpts { voxlight: true, ..day });
+            flicker_probe_rt(&sw, &scam, "water_shadow", day);
         }
         // The primary symptom view: a lone tree's cast shadow on open grass,
         // camera aimed at the penumbra boundary. Sun at t=30 is at
@@ -5865,6 +5861,7 @@ mod gpu_render_tests {
         cam.yaw = 0.0;
         cam.pitch = -1.55; // straight down
         let (w, h) = (640usize, 400usize);
+        sync_voxlight_shells(&mut world);
         let Some(frame) = render_rgba_ext(
             &world, &cam, w as u32, h as u32,
             &[leaf(228.0), leaf(240.0), leaf(252.0)],
@@ -6165,6 +6162,7 @@ mod gpu_render_tests {
         cam.yaw = (-0.971f32).atan2(0.30);
         cam.pitch = 0.06;
         for (name, at) in [("godrays_f0", 30.000f32), ("godrays_f1", 30.033f32)] {
+            sync_voxlight_shells(&mut world);
             let Some(rgba) = render_rgba_time_sun(&world, &cam, 960, 540, at, 68.0) else {
                 eprintln!("no GPU â€” skipping");
                 return;
@@ -6222,6 +6220,7 @@ mod gpu_render_tests {
             cam.pos = pos;
             cam.yaw = yaw;
             cam.pitch = pitch;
+            sync_voxlight_shells(&mut world);
             let Some(rgba) = render_rgba_time_sun(&world, &cam, 1920, 1080, 30.0, 30.0) else {
                 eprintln!("no GPU - skipping");
                 return;
@@ -6267,6 +6266,7 @@ mod gpu_render_tests {
         cam.yaw = 0.35;
         cam.pitch = -0.28;
         std::fs::create_dir_all("target/lookdev").unwrap();
+        sync_voxlight_shells(&mut world);
         let Some(rgba) = render_rgba_time_sun(&world, &cam, 1920, 1080, 30.0, 30.0) else {
             eprintln!("no GPU - skipping");
             return;
@@ -6326,11 +6326,13 @@ mod gpu_render_tests {
 
         // Style 1: fine spikes (default env).
         std::env::remove_var("VOXELG_GRASS_CHUNKY");
+        sync_voxlight_shells(&mut platform);
         let Some(f) = render_rgba_full_opts(&platform, &walk, 1920, 1080, &[], 30.0, 30.0, true, false) else {
             eprintln!("no GPU - skipping");
             return;
         };
         save("style1_spikes_walk", &f);
+        sync_voxlight_shells(&mut demo);
         save("style1_spikes_meadow",
              &render_rgba_full_opts(&demo, &meadow, 1920, 1080, &[], 30.0, 66.0, true, false).unwrap());
 
@@ -6343,6 +6345,7 @@ mod gpu_render_tests {
         std::env::remove_var("VOXELG_GRASS_CHUNKY");
 
         // Style 2: voxel sprites only (raster field off).
+        sync_voxlight_shells(&mut sprite_world);
         save("style2_sprites_walk",
              &render_rgba_full_opts(&sprite_world, &walk, 1920, 1080, &[], 30.0, 30.0, false, false).unwrap());
         save("style2_sprites_meadow",
@@ -6366,6 +6369,7 @@ mod gpu_render_tests {
         cam.pos = glam::Vec3::new(225.0, 66.2, 218.0);
         cam.yaw = 0.6;
         cam.pitch = -0.10;
+        sync_voxlight_shells(&mut world);
         let Some(rgba) = render_rgba_full_opts(&world, &cam, 960, 540, &[], 0.0, 0.0, true, true) else {
             eprintln!("no GPU - skipping");
             return;
@@ -6404,6 +6408,7 @@ mod gpu_render_tests {
             cam.pos = pos;
             cam.yaw = yaw;
             cam.pitch = pitch;
+            sync_voxlight_shells(&mut world);
             let Some(rgba) = render_rgba_time_sun(&world, &cam, 1920, 1080, 30.0, sun_t) else {
                 eprintln!("no GPU - skipping");
                 return;
@@ -6461,13 +6466,14 @@ mod gpu_render_tests {
         };
 
         // ---- Stills on the carpet world (the look Marc judges). ----
-        let carpet_world = build(true);
+        let mut carpet_world = build(true);
         let views: [(&str, glam::Vec3, f32, f32); 3] = [
             ("flora_carpet_low", glam::Vec3::new(225.0, 66.2, 218.0), 0.6, -0.06),
             ("flora_carpet_walk", glam::Vec3::new(225.0, 67.5, 225.0), 0.8, -0.25),
             ("flora_carpet_vista", glam::Vec3::new(225.0, 74.0, 200.0), 0.5, -0.30),
         ];
         std::fs::create_dir_all("target/lookdev").unwrap();
+        sync_voxlight_shells(&mut carpet_world);
         for (name, pos, yaw, pitch) in views {
             let mut cam = Camera::new();
             cam.pos = pos;
@@ -6634,6 +6640,7 @@ mod gpu_render_tests {
             cam.pos = pos;
             cam.yaw = yaw;
             cam.pitch = pitch;
+            sync_voxlight_shells(&mut world);
             let Some(rgba) = render_rgba(&world, &cam, 1920, 1080) else {
                 eprintln!("no GPU - skipping");
                 return;
@@ -6662,6 +6669,7 @@ mod gpu_render_tests {
         cam.pos = glam::Vec3::new(280.5, 72.5, 400.0);
         cam.yaw = 2.9;
         cam.pitch = -0.12;
+        sync_voxlight_shells(&mut world);
         let Some(rgba) = render_rgba_time_sun(&world, &cam, 1920, 1080, 30.0, 66.0) else {
             eprintln!("no GPU - skipping");
             return;
@@ -6689,6 +6697,7 @@ mod gpu_render_tests {
         cam.pos = glam::Vec3::new(clamp_anchor(leaf_anchor.x) - 40.0, leaf_ground as f32 + 4.0, clamp_anchor(leaf_anchor.y) + 30.0);
         cam.yaw = 2.3;
         cam.pitch = -0.12;
+        sync_voxlight_shells(&mut world);
         let Some(rgba) = render_rgba_at_time(&world, &cam, 1920, 1080, 30.0) else {
             eprintln!("no GPU â€” skipping");
             return;
@@ -6722,6 +6731,7 @@ mod gpu_render_tests {
         cam.yaw = (wx - cam.pos.x).atan2(wz - cam.pos.z);
         cam.pitch = -0.10;
         for (name, t) in [("water_far_t0", 30.00f32), ("water_far_t1", 30.05f32)] {
+            sync_voxlight_shells(&mut world);
             let Some(rgba) = render_rgba_at_time(&world, &cam, 960, 540, t) else {
                 eprintln!("no GPU â€” skipping");
                 return;
@@ -6753,6 +6763,7 @@ mod gpu_render_tests {
         // s.y = sin(sun_t*0.025 + 1.20); horizon (~0) at sun_t ~= 77.7. Higher sun
         // first so there is enough light to see the bands form and sweep.
         for st in [40.0f32, 55.0, 64.0, 70.0, 74.0, 77.0] {
+            sync_voxlight_shells(&mut world);
             let Some(rgba) = render_rgba_time_sun(&world, &cam, 960, 540, 30.0, st) else {
                 eprintln!("no GPU â€” skipping");
                 return;
@@ -6782,6 +6793,7 @@ mod gpu_render_tests {
         cam.yaw = 0.0;
         cam.pitch = -1.55;
         for (name, t) in [("cloudshade_t0", 30.0f32), ("cloudshade_t1", 34.0f32)] {
+            sync_voxlight_shells(&mut world);
             let Some(rgba) = render_rgba_at_time(&world, &cam, 960, 540, t) else {
                 eprintln!("no GPU â€” skipping");
                 return;
@@ -6812,12 +6824,13 @@ mod gpu_render_tests {
     /// band 0.0052 -> 0.0031. Threshold 0.004 sits between.
     #[test]
     fn no_field_scale_luma_waves() {
-        let world = build_leaf_lab_world();
+        let mut world = build_leaf_lab_world();
         let mut cam = Camera::new();
         cam.pos = glam::Vec3::new(118.0, 79.0, 82.0);
         cam.yaw = 0.0;
         cam.pitch = -0.5;
         let (w, h) = (960usize, 540usize);
+        sync_voxlight_shells(&mut world);
         let Some(a) = render_rgba_full_opts(&world, &cam, w as u32, h as u32, &[], 30.0, 30.0, false, false) else {
             eprintln!("no GPU adapter â€” skipping luma-wave probe");
             return;
@@ -6864,13 +6877,14 @@ mod gpu_render_tests {
     #[test]
     #[ignore]
     fn dump_sky_views() {
-        let world = World::new();
+        let mut world = World::new();
         let mut cam = Camera::new();
         cam.pos = glam::Vec3::new(256.0, 70.0, 256.0);
         cam.yaw = 0.0;
         cam.pitch = 0.55;
         std::fs::create_dir_all("target/lookdev").unwrap();
         let views = [("sky_t20", 20.0f32, 0.55), ("sky_t30", 30.0, 0.55), ("sky_t44", 44.0, 0.55), ("sky_zenith_t30", 30.0, 1.25)];
+        sync_voxlight_shells(&mut world);
         for (name, t, pitch) in views {
             cam.pitch = pitch;
             let Some(rgba) = render_rgba_at_time(&world, &cam, 960, 540, t) else {
@@ -6925,6 +6939,7 @@ mod gpu_render_tests {
         cam.yaw = 0.0;
         cam.pitch = -1.5;
         let (w, h) = (960usize, 540usize);
+        sync_voxlight_shells(&mut world);
         let Some(a) = render_rgba_time_sun(&world, &cam, w as u32, h as u32, 30.0, 30.0) else {
             eprintln!("no GPU adapter â€” skipping cloud shadow test");
             return;
@@ -7035,6 +7050,7 @@ mod gpu_render_tests {
         cam.pos = glam::Vec3::new(104.0, 63.0, 104.0);
         cam.yaw = std::f32::consts::FRAC_PI_4;
         cam.pitch = -0.30;
+        sync_voxlight_shells(&mut world);
         let Some(rgba) = render_rgba(&world, &cam, 960, 540) else {
             eprintln!("no GPU â€” skipping");
             return;
@@ -7109,6 +7125,7 @@ mod gpu_render_tests {
                 crate::physics::tick(&mut world);
                 ticks += 1;
             }
+            sync_voxlight_shells(&mut world);
             let Some(rgba) = render_rgba(&world, &cam, 960, 540) else {
                 eprintln!("no GPU â€” skipping");
                 return;
@@ -7160,7 +7177,7 @@ mod gpu_render_tests {
     #[test]
     #[ignore]
     fn dump_transition_views() {
-        let world = build_transition_world();
+        let mut world = build_transition_world();
         std::fs::create_dir_all("target/lookdev").unwrap();
         let mut top = Camera::new();
         top.pos = glam::Vec3::new(110.0, 90.0, 111.0);
@@ -7170,6 +7187,7 @@ mod gpu_render_tests {
         angle.pos = glam::Vec3::new(96.0, 72.0, 96.0);
         angle.yaw = std::f32::consts::FRAC_PI_4;
         angle.pitch = -0.45;
+        sync_voxlight_shells(&mut world);
         for (name, cam) in [("transition_top", top), ("transition_angle", angle)] {
             let Some(rgba) = render_rgba(&world, &cam, 960, 540) else {
                 eprintln!("no GPU â€” skipping");
@@ -7224,6 +7242,7 @@ mod gpu_render_tests {
                 cam.yaw = 0.0;
                 cam.pitch = 0.0;
             }
+            sync_voxlight_shells(&mut world);
             render_rgba_at_time(&world, &cam, w, h, 30.0)
         };
         let a = render(0)?;
@@ -7289,13 +7308,14 @@ mod gpu_render_tests {
     #[test]
     #[ignore]
     fn dump_stone_probe() {
-        let world = build_material_lab_world();
+        let mut world = build_material_lab_world();
         let [_, _, (_, corner)] = material_lab_cams();
         let mut faceon = Camera::new();
         faceon.pos = glam::Vec3::new(94.0, 65.0, 98.0);
         faceon.yaw = 0.0;
         faceon.pitch = 0.0;
         std::fs::create_dir_all("target/lookdev").unwrap();
+        sync_voxlight_shells(&mut world);
         for (name, cam) in [("stone_probe_2x", corner), ("stone_probe_faceon", faceon)] {
             let Some(rgba) = render_rgba(&world, &cam, 1920, 1080) else {
                 eprintln!("no GPU â€” skipping");
@@ -7412,9 +7432,10 @@ mod gpu_render_tests {
     /// lands (fail-first proof recorded there).
     #[test]
     fn leaf_lab_reads_individual_leaves() {
-        let world = build_leaf_lab_world();
+        let mut world = build_leaf_lab_world();
         let [(_, side), _, _] = leaf_lab_cams();
         let (w, h) = (640usize, 400usize);
+        sync_voxlight_shells(&mut world);
         let Some(frame) = render_rgba(&world, &side, w as u32, h as u32) else {
             eprintln!("no GPU adapter â€” skipping leaf lab test");
             return;
@@ -7555,13 +7576,14 @@ mod gpu_render_tests {
     #[test]
     #[ignore]
     fn dump_terrace_angles() {
-        let (world, _) = build_water_terrace_world();
+        let (mut world, _) = build_water_terrace_world();
         // Higher (y 66.8 -> 72) and pushed to the -x side + a touch back, so
         // the fold is seen three-quarter instead of straight down the diagonal.
         let mut cam = Camera::new();
         cam.pos = glam::Vec3::new(98.0, 72.0, 104.0);
         cam.yaw = 0.62;
         cam.pitch = -0.55;
+        sync_voxlight_shells(&mut world);
         let Some(rgba) = render_rgba(&world, &cam, 960, 540) else {
             eprintln!("no GPU â€” skipping");
             return;
@@ -7613,8 +7635,9 @@ mod gpu_render_tests {
     /// must not go dark overall.
     #[test]
     fn water_terrace_corner_is_plates_not_a_gash() {
-        let (world, cam) = build_water_terrace_world();
+        let (mut world, cam) = build_water_terrace_world();
         let (w, h) = (960usize, 540usize);
+        sync_voxlight_shells(&mut world);
         let Some(frame) = render_rgba(&world, &cam, w as u32, h as u32) else {
             eprintln!("no GPU adapter - skipping water_terrace_corner_is_plates_not_a_gash");
             return;
@@ -7727,8 +7750,9 @@ mod gpu_render_tests {
     /// worse than saying so.
     #[test]
     fn water_foam_is_white_and_sits_at_crests_and_shores() {
-        let (world, cam) = build_water_foam_world();
+        let (mut world, cam) = build_water_foam_world();
         let (w, h) = (960usize, 540usize);
+        sync_voxlight_shells(&mut world);
         let Some(frame) = render_rgba(&world, &cam, w as u32, h as u32) else {
             eprintln!("no GPU adapter - skipping water_foam_is_white_and_sits_at_crests_and_shores");
             return;
@@ -7835,6 +7859,7 @@ mod gpu_render_tests {
         cam.yaw = 0.0; // looking along +z, the boundary runs away from the camera
         cam.pitch = -0.45;
         let (w, h) = (640usize, 400usize);
+        sync_voxlight_shells(&mut world);
         let Some(frame) = render_rgba(&world, &cam, w as u32, h as u32) else {
             eprintln!("no GPU adapter â€” skipping water_terrace_ramp");
             return;
@@ -7962,6 +7987,7 @@ mod gpu_render_tests {
         let mut wcam = Camera::new();
         wcam.pos = glam::Vec3::new(clamp_anchor(water_c.x), 86.0, clamp_anchor(water_c.y) - 40.0);
         wcam.pitch = -0.45;
+        sync_voxlight_shells(&mut world);
         let Some(wframe) = render_rgba(&world, &wcam, 320, 200) else {
             eprintln!("no GPU adapter â€” skipping water/foliage content test");
             return;
@@ -8007,11 +8033,14 @@ mod gpu_render_tests {
         };
 
         // GRAZING close-up over the water, the same camera the timing harness
-        // calls "water-close". Reflections are Fresnel-weighted, so a steep
-        // view shows the per-voxel reflection cache at ~2% of the pixel and a
-        // grazing one shows it at most of the pixel. This is therefore the view
-        // that actually judges the reflection decision
-        // (docs/VOXEL_LIGHTING_PLAN.md, "Reflections").
+        // calls "water-close": the shallowest angle in the set, where the
+        // Fresnel sky blend is most of the pixel.
+        //
+        // It used to be captured TWICE, once before the shells were bound, as
+        // the per-pixel A/B for the reflection decision. That companion frame is
+        // deleted: the per-voxel reflection field went in round F and the
+        // per-pixel shadow path went with this change, so an unbound render is
+        // not "the other implementation" any more, it is an unlit picture.
         let mut water_graze = Camera::new();
         water_graze.pos = glam::Vec3::new(
             clamp_anchor(water_c.x),
@@ -8020,21 +8049,9 @@ mod gpu_render_tests {
         );
         water_graze.pitch = -0.22;
 
-        // Captured BEFORE the shells are bound, so it is the per-pixel mirror
-        // the cache replaces. The reflection decision traded a true mirror for
-        // a view-independent cache and the plan says the stills are how that
-        // trade gets judged; without the two frames side by side there is
-        // nothing to judge it against, and every other still in this set is
-        // taken with the field live. Deliberately the ONLY view captured both
-        // ways: it is the only one where the cache is most of the pixel.
-        if let Some(rgba) = render_rgba(&world, &water_graze, w, h) {
-            write_png("water_graze_nofield", &rgba);
-        }
-
-        // The whole point of these stills is to judge the lighting, so every
-        // world captured below binds the per-voxel fields and the render helper
-        // converges them. Without this the frames show the per-pixel fallback
-        // and would look identical if the feature were deleted.
+        // The whole point of these stills is to judge the lighting, and the
+        // per-voxel field is now the only thing that produces any: without this
+        // every frame below renders with no direct sun at all.
         sync_voxlight_shells(&mut world);
 
         let save = |name: &str, cam: &Camera| {
@@ -8198,6 +8215,7 @@ mod gpu_render_tests {
                 clamp_anchor(c.y) - 24.0,
             );
             cam.pitch = -0.25;
+            sync_voxlight_shells(&mut world);
             let Some(frame) = render_rgba(&world, &cam, 320, 200) else {
                 eprintln!("no GPU adapter â€” skipping species content test");
                 return;
@@ -8553,18 +8571,28 @@ mod gpu_render_tests {
                 run_probe_on(u, m, t, c, (&bg, &bg_compose))
             };
             let rtpg_ms = run_probe(&prg_update, &rtpg_main, &rtpg_transp, &rtpg_compose);
-            // THE A/B: identical frame, identical pipelines, the populated field
-            // swapped for an empty one. Interleaved with the run above rather
-            // than measured in a separate phase, so both sides see the same GPU
-            // clock state. Printed on its own line; the columns below are
-            // untouched and stay comparable to the recorded baseline table.
+            // THE SAMPLER'S OWN COST: identical frame, identical pipelines, the
+            // populated field swapped for an empty one. Interleaved with the run
+            // above rather than measured in a separate phase, so both sides see
+            // the same GPU clock state.
+            //
+            // READ THIS DIFFERENTLY FROM ROUNDS D TO H. It used to be "FIELD
+            // A/B", the field against the per-pixel shadow cone and AO it was
+            // replacing, i.e. what the field SAVED. There is no per-pixel path
+            // any more, so the empty-field side no longer traces anything - it
+            // reads `valid = false` and shades with no direct sun - and the
+            // difference is now the cost of the eight-tap fetch itself against
+            // an unlit frame. It is worth having (it bounds what sampling costs)
+            // and it is NOT a saving: the saving is the before/after of removing
+            // the per-pixel path, which is in round I of
+            // docs/rt/BASELINE-per-voxel-lighting.md.
             let nofield_ms = run_probe_on(
                 &prg_update, &rtpg_main, &rtpg_transp, &rtpg_compose,
                 (&bg_nofield, &bg_compose_nofield),
             );
             let rtpg_again_ms = run_probe(&prg_update, &rtpg_main, &rtpg_transp, &rtpg_compose);
             eprintln!(
-                "  FIELD A/B [{name}]: populated {rtpg_ms:.2} / {rtpg_again_ms:.2} ms  vs  EMPTY field {nofield_ms:.2} ms  =>  {:+.2} ms ({:+.1}%)",
+                "  SAMPLER COST [{name}]: populated {rtpg_ms:.2} / {rtpg_again_ms:.2} ms  vs  UNLIT (empty field) {nofield_ms:.2} ms  =>  {:+.2} ms ({:+.1}%)",
                 (rtpg_ms + rtpg_again_ms) * 0.5 - nofield_ms,
                 ((rtpg_ms + rtpg_again_ms) * 0.5 - nofield_ms) / nofield_ms * 100.0,
             );
@@ -9707,7 +9735,12 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
         /// water surface writes a flat green or red and the counts are exact
         /// rather than inferred. Sky, and the few surfaces that never consult the
         /// field at all (glass), land in `unshaded`.
-        fn coverage(&self, device: &wgpu::Device, queue: &wgpu::Queue, vl_wgs: u32) -> (u64, u64, u64) {
+        fn coverage(
+            &self,
+            device: &wgpu::Device,
+            queue: &wgpu::Queue,
+            vl_wgs: u32,
+        ) -> (u64, u64, u64, Vec<(u32, u32)>) {
             let data = self.shade_and_read(device, queue, vl_wgs, true);
             // The probe writes exactly (0,1,0) or (1,0,0), and both survive f16
             // losslessly, so the classification is a BIT PATTERN comparison
@@ -9715,14 +9748,25 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
             // else in the frame can forge either triple.
             const ONE: u16 = 0x3C00;
             let (mut field, mut fallback, mut other) = (0u64, 0u64, 0u64);
-            for px in data.chunks_exact(4) {
+            // WHERE the unanswered pixels are, not just how many. With coverage
+            // effectively complete the residual is a handful of pixels, and a
+            // count alone cannot say whether they are a thin seam somewhere
+            // structural or a scattering of single pixels - which is the whole
+            // difference between a design gap and float rounding at a corner.
+            let mut misses = Vec::new();
+            for (i, px) in data.chunks_exact(4).enumerate() {
                 match (px[0], px[1], px[2]) {
                     (0, ONE, 0) => field += 1,
-                    (ONE, 0, 0) => fallback += 1,
+                    (ONE, 0, 0) => {
+                        fallback += 1;
+                        if misses.len() < 64 {
+                            misses.push((i as u32 % self.w, i as u32 / self.w));
+                        }
+                    }
                     _ => other += 1,
                 }
             }
-            (field, fallback, other)
+            (field, fallback, other, misses)
         }
 
         /// Run the light update, then cs_main + cs_transparent, and read the
@@ -10242,19 +10286,33 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
         // ---- WHAT THE FIELD ACTUALLY COVERS, which decides whether the
         // per-pixel fallback can be deleted at all.
         eprintln!(
-            "\nField coverage of SHADED pixels (green = field answered, red = fell back to the \
-             per-pixel path):"
+            "\nField coverage of SHADED pixels (green = the field answered, red = it did not and \
+             the pixel takes the designed no-direct-sun term):"
         );
         for (name, cam) in live_frame_segments(&world) {
             rig.look(&queue, &cam, wo_now);
-            let (f, b, o) = rig.coverage(&device, &queue, wgs_near);
+            let (f, b, o, misses) = rig.coverage(&device, &queue, wgs_near);
             let shaded = (f + b).max(1);
             eprintln!(
-                "  {name:<10} field {f:8} ({:6.3}% of shaded)  fallback {b:8} ({:6.3}%)  \
+                "  {name:<10} field {f:8} ({:6.3}% of shaded)  unanswered {b:8} ({:6.3}%)  \
                  unshaded (sky/glass) {o:8}",
                 100.0 * f as f64 / shaded as f64,
                 100.0 * b as f64 / shaded as f64,
             );
+            if !misses.is_empty() {
+                let xs: Vec<u32> = misses.iter().map(|&(x, _)| x).collect();
+                let ys: Vec<u32> = misses.iter().map(|&(_, y)| y).collect();
+                eprintln!(
+                    "    unanswered pixels span x {}..={}, y {}..={} of {}x{}; first: {:?}",
+                    xs.iter().min().unwrap(),
+                    xs.iter().max().unwrap(),
+                    ys.iter().min().unwrap(),
+                    ys.iter().max().unwrap(),
+                    rig.w,
+                    rig.h,
+                    &misses[..misses.len().min(12)],
+                );
+            }
         }
     }
 
@@ -11563,6 +11621,198 @@ fn cs_vl_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
              the estimate is noisy rather than converged: {}",
             pretty.join(" ")
         );
+    }
+
+    /// Two canopies over flat ground, because a canopy has two behaviours worth
+    /// pinning and one scene cannot show both.
+    ///
+    /// - A SOLID 12-deep slab at x 190..230. Every interior brick is FULLY
+    ///   OCCUPIED, which is exactly the case the shell rule used to refuse
+    ///   storage for, and a leaf block really is opaque (`leaf_bl_quads` spans
+    ///   2.3 x 2.0 blocks, so one leaf cell covers its own cell), so this is the
+    ///   storage and the lit-crown / dark-interior case.
+    /// - A SPARSE canopy at x 250..290, half its cells empty on a fixed hash.
+    ///   This is the shape a real tree has - a shell of leaf blocks around
+    ///   branches, with gaps the sun reaches through - and it is where the
+    ///   CONTINUOUS gradient the field exists to produce actually appears.
+    fn voxlight_canopy_world() -> World {
+        use crate::voxel::{MAT_DIRT, MAT_LEAVES};
+        let mut w = World::new();
+        for z in 190..230u32 {
+            for x in 190..290u32 {
+                w.set_voxel(x, 60, z, MAT_DIRT);
+            }
+            for x in 190..230u32 {
+                for y in 80..92u32 {
+                    w.set_voxel(x, y, z, MAT_LEAVES);
+                }
+            }
+            for x in 250..290u32 {
+                // FIVE voxels deep, not twelve: that is the thickness of a real
+                // crown's lit flank. At 50% density twelve voxels of anything is
+                // opaque by depth three, which measures the binomial and not the
+                // field.
+                for y in 87..92u32 {
+                    // Fixed integer hash, so the scene is identical every run.
+                    let h = x.wrapping_mul(73_856_093) ^ y.wrapping_mul(19_349_663) ^ z.wrapping_mul(83_492_791);
+                    if h % 2 == 0 {
+                        w.set_voxel(x, y, z, MAT_LEAVES);
+                    }
+                }
+            }
+        }
+        w
+    }
+
+    /// FOLIAGE CARRIES LIGHT, and a canopy reads as a volume rather than a hole.
+    ///
+    /// This is the test for the defect the whole rework exists to close. Light
+    /// used to live only in AIR voxels adjacent to solid, and `voxlight_sample`
+    /// dropped every tap that landed in an occupied cell. On canopy the cell
+    /// against a leaf face is usually ANOTHER leaf, so all eight taps were
+    /// dropped, the sampler answered `valid = false`, and 54.4% of a canopy view
+    /// shaded through a per-pixel fallback that no longer exists. Deleting that
+    /// fallback without this fix would have rendered half a canopy with no direct
+    /// sun at all.
+    ///
+    /// Four things are asserted, and each fails on a different regression:
+    ///  - the interior bricks, which are FULLY OCCUPIED, hold light blocks at all
+    ///    (`World::brick_needs_light`);
+    ///  - leaf voxels hold REAL records rather than the epoch-0 stamp the update
+    ///    pass writes for opaque voxels (`cs_voxel_light_update`);
+    ///  - the record falls off with depth, so the canopy is a volume and not a
+    ///    constant - which is what says the gather really sees the leaves above
+    ///    it, and would fail if `shadow_skip_active` were widened from the origin
+    ///    cell to "ignore foliage";
+    ///  - the crown is genuinely LIT, which is what would fail if the self-skip
+    ///    were missing and every leaf's own tuft cutout decided its sun ray.
+    #[test]
+    fn a_canopy_carries_light_through_its_depth() {
+        let mut world = voxlight_canopy_world();
+        let Some(rig) = VoxLightRig::new(&mut world, VL_SUN_TIME) else {
+            eprintln!("a_canopy_carries_light_through_its_depth: no GPU adapter, skipping");
+            return;
+        };
+        rig.converge(64);
+        let pool = rig.read_live_pool();
+
+        let (x, z) = (210i32, 210i32);
+        // Down through the canopy, plus the air just above and just below it.
+        // NOT the whole column: the open air between the canopy underside and
+        // the ground is 18 voxels of brick that touches nothing, so it is
+        // correctly outside the lit shell and has no storage - `vl_sun_vis`
+        // panics there rather than reporting a default, which is the point of it.
+        let column: Vec<(i32, u32)> = (78..=93)
+            .rev()
+            .map(|y| (y, vl_sun_vis(&pool, &world, glam::IVec3::new(x, y, z))))
+            .collect();
+        eprintln!(
+            "canopy column (y=sun_vis): {}",
+            column.iter().map(|(y, v)| format!("y{y}={v}")).collect::<Vec<_>>().join(" ")
+        );
+
+        let vis = |y: i32| column.iter().find(|&&(yy, _)| yy == y).unwrap().1;
+        // Open air above the canopy is fully lit: without this the rest is
+        // vacuous, because a scene that is dark everywhere passes any "the
+        // interior is dark" test.
+        assert!(vis(93) >= 250, "the open sky above the canopy is not lit: {}", vis(93));
+        // The crown leaf voxel itself is lit. It is a LEAF, i.e. occupied, and
+        // under the old rules it would have been stamped epoch 0.
+        assert!(
+            vis(91) >= 200,
+            "the top leaf voxel of the canopy is not lit ({}); a crown leaf sees the sun",
+            vis(91)
+        );
+        // ... and it holds a real record, not the opaque stamp.
+        for y in 80..=91 {
+            let w = vl_record_word(&world, glam::IVec3::new(x, y, z))
+                .unwrap_or_else(|| panic!("leaf voxel y={y} has no light block"));
+            assert_ne!(
+                (pool[w as usize] >> 16) & 0xFF,
+                0,
+                "leaf voxel y={y} carries no record; the update pass still treats foliage as opaque"
+            );
+        }
+        // The canopy is a VOLUME: light falls off with depth through it.
+        assert!(
+            vis(80) + 40 < vis(91),
+            "the canopy interior ({}) is no darker than its crown ({}); the gather is not \
+             seeing the leaves above it",
+            vis(80),
+            vis(91)
+        );
+        // Monotone down through the canopy, allowing a byte of rounding: a
+        // gradient that wobbles is noise, not a converged volume.
+        let canopy: Vec<u32> = (80..=91).rev().map(vis).collect();
+        let rises = canopy.windows(2).filter(|w| w[1] > w[0] + 1).count();
+        assert_eq!(rises, 0, "sun visibility rises going DOWN into the canopy: {canopy:?}");
+
+        // AND A REAL CANOPY IS A SMOOTH VOLUME, not a two-level slab.
+        //
+        // Straight down the middle of the SOLID slab the falloff is one voxel
+        // wide, and correctly so: a leaf block covers its own cell, so a canopy
+        // with no gaps in it IS opaque, and no amount of interpolation should
+        // pretend otherwise. The gradient belongs to the SPARSE canopy, which is
+        // the shape a tree actually has. Measured down its depth, sun visibility
+        // must come out CONTINUOUS - a ladder of intermediate values - because a
+        // per-voxel field that only ever stored 0 or 255 inside foliage would
+        // reproduce the blocky per-pixel dapple this whole rework removes.
+        //
+        // Measured over the WHOLE sparse canopy rather than one column, so the
+        // number describes the canopy and not whichever lottery of gaps happens
+        // to sit above one x,z.
+        let mut hist = [0usize; 3]; // dark (<8) / intermediate / lit (>247)
+        let mut sample = Vec::new();
+        for xx in 250..290i32 {
+            for yy in 87..92i32 {
+                for zz in 195..225i32 {
+                    let Some(w) = vl_record_word(&world, glam::IVec3::new(xx, yy, zz)) else {
+                        continue;
+                    };
+                    let r = pool[w as usize];
+                    if (r >> 16) & 0xFF == 0 {
+                        continue; // an opaque voxel, or a record never gathered
+                    }
+                    let v = r & 0xFF;
+                    hist[if v < 8 { 0 } else if v > 247 { 2 } else { 1 }] += 1;
+                    if sample.len() < 12 && (8..=247).contains(&v) {
+                        sample.push(v);
+                    }
+                }
+            }
+        }
+        let total: usize = hist.iter().sum();
+        eprintln!(
+            "sparse canopy records: {} dark, {} INTERMEDIATE, {} lit (of {total}); e.g. {sample:?}",
+            hist[0], hist[1], hist[2]
+        );
+        assert!(
+            hist[1] * 5 >= total,
+            "sun visibility inside a sparse canopy is effectively binary ({} of {total} records \
+             are intermediate); the field is storing a canopy as lit-or-black, which is exactly \
+             the per-pixel dapple this rework removes",
+            hist[1]
+        );
+
+        // Finally through the sampler, which is what shading actually calls: a
+        // leaf face must get an answer. This is the number that read 45.6%.
+        let probes = [
+            (glam::Vec3::new(x as f32 + 0.5, 92.0, z as f32 + 0.5), glam::Vec3::Y), // crown top face
+            (glam::Vec3::new(x as f32 + 0.5, 86.0, z as f32 + 0.5), glam::Vec3::Y), // buried in canopy
+            (glam::Vec3::new(x as f32 + 0.5, 61.0, z as f32 + 0.5), glam::Vec3::Y), // ground under it
+        ];
+        let got = rig.sample(&probes);
+        eprintln!("canopy sampled: {got:?}");
+        assert!(
+            got.iter().all(|s| s.valid),
+            "voxlight_sample found no record inside the canopy: {got:?}"
+        );
+        assert!(got[0].sun >= 200, "the crown samples as shadowed: {got:?}");
+        assert!(
+            got[1].sun + 40 < got[0].sun,
+            "the canopy interior samples as bright as its crown: {got:?}"
+        );
+        assert!(got[2].sun <= 40, "the ground under 12 voxels of leaves is not shaded: {got:?}");
     }
 
     /// A sealed room must stay dark while the outside stays bright, with one

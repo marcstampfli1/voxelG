@@ -164,6 +164,27 @@ pub fn is_leaf_mat(m: u8) -> bool {
 pub fn is_wood_mat(m: u8) -> bool {
     m == MAT_WOOD || m == MAT_WOOD_BIRCH || m == MAT_WOOD_PINE
 }
+
+/// Leaf blocks AND ground decoration: everything that occupies a cell without
+/// being an opaque wall.
+///
+/// The CPU mirror of `is_foliage_mat` in shaders/raymarch.wgsl, and it has to
+/// stay one set with it: the shader decides which voxels the light field may
+/// interpolate through, and this decides which bricks get storage for them, so a
+/// material in one list and not the other is a foliage cell with a record no
+/// sampler will read, or a sampler reading a record nothing wrote. Pinned by
+/// `the_foliage_material_sets_match_the_shader`.
+#[inline(always)]
+pub fn is_foliage_mat(m: u8) -> bool {
+    is_leaf_mat(m)
+        || m == MAT_FLOWER
+        || m == MAT_TALL_GRASS
+        || m == MAT_LEAF_FRINGE
+        || m == MAT_TALL_GRASS_DRY
+        || m == MAT_TURF
+        || m == MAT_BUSH
+        || m == MAT_TREE_TEST
+}
 pub const MAX_WATER_LEVEL: u8 = 8;
 
 #[inline(always)]
@@ -1112,33 +1133,43 @@ impl World {
         }
     }
 
-    /// A brick needs light storage when it can hold air next to solid: it holds
-    /// at least one AIR voxel, and either it is non-empty (so it holds both) or
-    /// it touches a non-empty brick (the open air directly above a surface).
-    /// Conservative by one brick on the air side, which is exactly what keeps
-    /// the sampler's eight-tap neighbourhood populated right at a surface
-    /// instead of falling off the edge of the allocated region.
+    /// A brick needs light storage when it can hold a voxel that CARRIES a light
+    /// record next to geometry: it holds at least one carrier, and either it is
+    /// non-empty (so it holds both) or it touches a non-empty brick (the open air
+    /// directly above a surface). Conservative by one brick on the air side,
+    /// which is exactly what keeps the sampler's eight-tap neighbourhood
+    /// populated right at a surface instead of falling off the edge of the
+    /// allocated region.
     ///
-    /// A FULLY SOLID brick is excluded, and that exclusion is the difference
-    /// between a shell and a volume. Light lives in air: the update pass writes
-    /// epoch 0 for every solid voxel and `voxlight_sample` drops every tap that
-    /// lands in one, so a block bound to a brick with no air holds 64 records
-    /// that nothing can ever read - while still costing 512 bytes of pool and a
-    /// workgroup of update work every time its slice of the work list comes
-    /// round. On the demo world that is 310,545 of the 370,719 bricks the old
-    /// rule asked for (measured), i.e. five sixths of the storage and of the
-    /// update dispatch, and it is what made the pool overflow by 3x and strand
-    /// whole cameras on the per-pixel fallback.
+    /// A CARRIER is an air voxel OR a FOLIAGE voxel. Foliage carries its own
+    /// light because a canopy is a semi-transparent volume rather than a wall:
+    /// storing light only in the adjacent air cell is exactly what left over half
+    /// of a canopy view with no record to read, because on canopy that adjacent
+    /// cell is usually another leaf. See `vl_tap` in shaders/raymarch.wgsl.
     ///
-    /// Excluding them changes nothing the sampler can observe: every voxel of a
-    /// full brick is solid, so every tap into it was already dropped. That is an
-    /// argument, so it was also measured - benchmarking both rules side by side
-    /// moves every FIELD A/B delta by at most 0.05 ms while saving 134 MB of
+    /// A brick with NO carrier is excluded, and that exclusion is the difference
+    /// between a shell and a volume. The update pass writes epoch 0 for every
+    /// opaque voxel and `voxlight_sample` drops every tap that lands in one, so a
+    /// block bound to a brick of solid stone holds 64 records that nothing can
+    /// ever read - while still costing 512 bytes of pool and a workgroup of
+    /// update work every time its slice of the work list comes round. On the demo
+    /// world that is 310,545 of the 370,719 bricks the pre-shell rule asked for
+    /// (measured), i.e. five sixths of the storage and of the update dispatch,
+    /// and it is what made the pool overflow by 3x and strand whole cameras on
+    /// the old per-pixel path.
+    ///
+    /// Excluding them changes nothing the sampler can observe: every voxel of
+    /// such a brick is opaque, so every tap into it was already dropped. That is
+    /// an argument, so it was also measured - benchmarking both rules side by
+    /// side moves every FIELD A/B delta by at most 0.05 ms while saving 134 MB of
     /// pool and 0.22 ms of update per frame (docs/rt/BASELINE-per-voxel-
     /// lighting.md, round D).
     fn brick_needs_light(&self, bi: u32) -> bool {
         let brick = &self.bricks[bi as usize];
-        if brick.is_full() {
+        // The ONLY case where the material matters is a brick with no air at
+        // all: anything else already holds a carrier. Gating the 64-byte scan on
+        // `is_full` keeps the common brick at one word of work.
+        if brick.is_full() && !Self::brick_has_foliage(brick) {
             return false;
         }
         if !brick.is_empty() {
@@ -1151,6 +1182,16 @@ impl World {
             }
         }
         false
+    }
+
+    /// Does this brick hold at least one foliage voxel?
+    ///
+    /// Only asked of FULLY OCCUPIED bricks (see `brick_needs_light`), which in a
+    /// forested world means "is this a canopy interior or a rock". A dense canopy
+    /// brick is full and every voxel of it carries light, so it needs a block;
+    /// a stone brick is full and carries nothing, so it must not get one.
+    fn brick_has_foliage(brick: &Brick) -> bool {
+        brick.materials.iter().any(|&m| is_foliage_mat(m))
     }
 
     /// The face-adjacent storage bricks. x/z wrap toroidally (the storage

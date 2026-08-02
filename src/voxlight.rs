@@ -658,23 +658,31 @@ mod tests {
         );
 
         // Coverage, brick by brick, stated from what the SAMPLER needs rather
-        // than copied from `brick_needs_light`: every air voxel that touches a
-        // solid voxel must lie in a brick that has a block, or shading there
-        // silently falls back to the per-pixel path.
+        // than copied from `brick_needs_light`: every voxel that can be a usable
+        // trilinear tap must lie in a brick that has a block, or shading there
+        // has no light to read at all.
         //
-        // An air voxel's solid neighbour is either in its own brick (then that
-        // brick is non-empty and, holding air, not full) or in a face-adjacent
-        // one (then that neighbour is non-empty), so these two cases are the
-        // whole requirement.
+        // A usable tap is a CARRIER voxel - air, or foliage - next to geometry.
+        // Foliage joined that set when the field stopped treating a canopy as a
+        // wall (`vl_tap` in shaders/raymarch.wgsl); before that, a fully leafy
+        // brick was "solid" and got nothing, which is why over half a canopy view
+        // had no record.
+        //
+        // A carrier's occupied neighbour is either in its own brick (then that
+        // brick is non-empty) or in a face-adjacent one (then that neighbour is
+        // non-empty), so these two cases are the whole requirement.
         let mut missing = Vec::new();
         let mut stray = Vec::new();
         for bi in 0..WORLD_BRICKS_TOTAL {
             let b = &w.bricks[bi as usize];
             let has_block = w.light.block_of(bi).is_some();
-            if b.is_full() {
-                // No air at all: every tap into it is dropped by the sampler's
-                // solidity gate, so a block here is 512 bytes and a workgroup
-                // of update work that nothing can ever read.
+            let has_carrier =
+                !b.is_full() || b.materials.iter().any(|&m| crate::voxel::is_foliage_mat(m));
+            if !has_carrier {
+                // Every voxel is an opaque occluder: the update pass stamps them
+                // all epoch 0 and the sampler drops every tap into them, so a
+                // block here is 512 bytes and a workgroup of update work that
+                // nothing can ever read.
                 if has_block && stray.len() < 8 {
                     stray.push(bi);
                 }
@@ -688,11 +696,76 @@ mod tests {
         }
         assert!(
             missing.is_empty(),
-            "bricks holding lit air voxels have no light block (first few: {missing:?})"
+            "bricks holding lit carrier voxels have no light block (first few: {missing:?})"
         );
         assert!(
             stray.is_empty(),
-            "fully solid bricks hold light blocks nothing can read (first few: {stray:?})"
+            "bricks with no carrier voxel hold light blocks nothing can read (first few: {stray:?})"
+        );
+
+        // A FULLY LEAFY brick is the case this rule exists for, and it is worth
+        // asserting the world actually contains some - otherwise the clause above
+        // is untested on real data and could be deleted without anything failing.
+        let leafy = (0..WORLD_BRICKS_TOTAL)
+            .filter(|&bi| {
+                let b = &w.bricks[bi as usize];
+                b.is_full() && b.materials.iter().any(|&m| crate::voxel::is_foliage_mat(m))
+            })
+            .count();
+        eprintln!("demo world: {leafy} fully occupied bricks carry foliage and now hold a block");
+        assert!(leafy > 0, "the demo world has no dense canopy, so this rule is untested here");
+    }
+
+    /// The CPU and shader foliage sets must be the SAME set, read out of the
+    /// shader rather than trusted.
+    ///
+    /// They are two halves of one decision: `is_foliage_mat` in raymarch.wgsl
+    /// decides which voxels the light field may interpolate through and which
+    /// carry a record, and `crate::voxel::is_foliage_mat` decides which bricks get
+    /// storage for them. A material in the shader's set but not the CPU's is a
+    /// canopy the sampler will read from a brick that was never allocated - i.e.
+    /// exactly the hole this rework closed, re-opened for one material and
+    /// invisible in every aggregate number.
+    #[test]
+    fn the_foliage_material_sets_match_the_shader() {
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/shaders/raymarch.wgsl"
+        ))
+        .expect("the shader source must be readable");
+
+        // MAT_NAME -> value, from the shader's own constant declarations.
+        let mut values = std::collections::HashMap::new();
+        for line in src.lines() {
+            let line = line.trim();
+            let Some(rest) = line.strip_prefix("const MAT_") else { continue };
+            let Some((name, tail)) = rest.split_once(':') else { continue };
+            let Some((_, val)) = tail.split_once('=') else { continue };
+            let digits: String = val.trim().chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(v) = digits.parse::<u32>() {
+                values.insert(format!("MAT_{}", name.trim()), v);
+            }
+        }
+        assert!(values.len() > 10, "failed to parse the shader's material constants");
+
+        let start = src.find("fn is_foliage_mat(m: u32) -> bool {").expect("shader has no is_foliage_mat");
+        let body = &src[start..start + src[start..].find('}').expect("unterminated is_foliage_mat")];
+        let mut shader_set = std::collections::BTreeSet::new();
+        for tok in body.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+            if let Some(&v) = values.get(tok) {
+                assert!(v <= 255, "material {tok} = {v} does not fit the CPU u8 material");
+                shader_set.insert(v as u8);
+            }
+        }
+        // Water levels are a RANGE in the shader (`is_water_mat`), and no water
+        // material appears by name in is_foliage_mat, so a plain name scan is
+        // complete for this function specifically.
+        let cpu_set: std::collections::BTreeSet<u8> =
+            (0u8..=255).filter(|&m| crate::voxel::is_foliage_mat(m)).collect();
+        assert_eq!(
+            shader_set, cpu_set,
+            "the shader's foliage set and the CPU's disagree; the light field would allocate \
+             storage for one set of materials and interpolate through another"
         );
     }
 

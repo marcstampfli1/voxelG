@@ -212,15 +212,41 @@ fn cs_voxel_light_update(@builtin(workgroup_id) wg: vec3<u32>,
     let wv = vl_brick_world_base(brick) + vec3<i32>(lx, ly, lz);
     let word = block * VL_BLOCK_WORDS + li * VL_RECORD_WORDS;
 
-    // Light lives in AIR. A solid voxel keeps epoch 0 so the sampler's
-    // validity check drops it even before the solidity gate does.
-    if (is_voxel_solid(wv)) {
-        vl_pool[word] = 0u;
-        vl_pool[word + 1u] = 0u;
-        return;
+    // WHO CARRIES A RECORD: air, and FOLIAGE.
+    //
+    // An OPAQUE voxel keeps epoch 0 so the sampler's validity check drops it
+    // even before the opacity gate does. Foliage is not opaque - a canopy is a
+    // semi-transparent volume, and a volume wants a value AT the sample point,
+    // not at some adjacent air cell that on canopy is usually another leaf. That
+    // conflation is what left `voxlight_sample` with nothing to return for 54%
+    // of a canopy view; see `vl_tap`.
+    //
+    // Read straight out of the brick rather than through `is_voxel_solid`: this
+    // invocation already knows its storage brick and its in-brick voxel index
+    // (`li` IS the brick voxel index), so the whole hierarchy descent the old
+    // gate paid - bounds, toroidal fold, chunk mask, tile mask, brick index -
+    // was re-deriving what it was handed. The masks are not needed here either:
+    // only a brick that currently holds a light block is ever dispatched, and a
+    // recycled slot releases its block before the next upload.
+    let bi = i32(brick);
+    let vi = i32(li);
+    var is_foliage = false;
+    if (brick_voxel_solid(bi, vi)) {
+        if (!is_foliage_mat(brick_voxel_material(bi, vi))) {
+            vl_pool[word] = 0u;
+            vl_pool[word + 1u] = 0u;
+            return;
+        }
+        is_foliage = true;
     }
 
     let p = vec3<f32>(wv) + vec3<f32>(0.5);
+    // A foliage cell gathers at its own centre, so its own tuft must not be
+    // allowed to shadow it. See `shadow_skip_active` in raymarch.wgsl.
+    if (is_foliage) {
+        shadow_skip_active = true;
+        shadow_skip_voxel = wv;
+    }
 
     let prev = vl_pool[word];
     let prev_valid = ((prev >> 16u) & 0xFFu) != 0u;

@@ -432,23 +432,71 @@ fn vl_pack_rgb9e5(c: vec3<f32>) -> u32 {
     return u32(q.x) | (u32(q.y) << 9u) | (u32(q.z) << 18u) | (u32(e) << 27u);
 }
 
-/// First pool word of a WORLD voxel's record, or VL_NONE when the voxel is
-/// outside the window or its brick has no light block.
-fn vl_record_word(world_v: vec3<i32>) -> u32 {
+/// One trilinear tap: where its record lives, and whether it must be dropped.
+///
+/// The two questions share an ENTIRE hierarchy descent - bounds test, toroidal
+/// fold, brick index, in-brick voxel index - so they are answered together. This
+/// used to be `vl_record_word` plus a separate `is_voxel_solid`, i.e. two full
+/// descents per tap, eight times per shaded pixel.
+struct VlTap {
+    /// First pool word of the record, or VL_NONE when the voxel is outside the
+    /// window or its brick has no light block.
+    word: u32,
+    /// True when the voxel is a REAL OPAQUE OCCLUDER, so light must not be
+    /// interpolated through it. See `vl_tap`.
+    blocks: bool,
+};
+
+fn vl_tap(world_v: vec3<i32>) -> VlTap {
+    var o: VlTap;
+    o.word = VL_NONE;
+    o.blocks = false;
     let rel = world_v - camera.world_origin;
     if (rel.x < 0 || rel.x >= WORLD_VOXELS_X
      || rel.y < 0 || rel.y >= WORLD_VOXELS_Y
      || rel.z < 0 || rel.z >= WORLD_VOXELS_Z) {
-        return VL_NONE;
+        return o;
     }
     let v = world_to_slot_voxel(world_v);
     let bp = v >> vec3<u32>(2u);
     let bi = world_brick_idx(bp.x, bp.y, bp.z);
     let block = vl_block_of_brick[u32(bi)];
-    if (block == VL_NONE) { return VL_NONE; }
+    if (block == VL_NONE) { return o; }
     let local = v - bp * BRICK_DIM;
     let vi = brick_voxel_idx(local.x, local.y, local.z);
-    return block * VL_BLOCK_WORDS + u32(vi) * VL_RECORD_WORDS;
+    o.word = block * VL_BLOCK_WORDS + u32(vi) * VL_RECORD_WORDS;
+
+    // OCCUPANCY, through the same mask hierarchy `is_voxel_solid` walks. The
+    // tile and chunk masks are cleared the frame a streaming slot is recycled
+    // while its brick occupancy words are not, so reading `brick_voxel_solid`
+    // without them would see a recycled slot's stale geometry as solid.
+    let tp = v >> vec3<u32>(4u);
+    let cp = v >> vec3<u32>(6u);
+    let ci = world_chunk_idx(cp.x, cp.y, cp.z);
+    let tile_lin = (tp.x & 3) + (tp.z & 3) * 4 + (tp.y & 3) * 16;
+    if (!chunk_has_child(ci, tile_lin)) { return o; }
+    let ti = world_tile_idx(tp.x, tp.y, tp.z);
+    let brick_lin = (bp.x & 3) + (bp.z & 3) * 4 + (bp.y & 3) * 16;
+    if (!tile_has_child(ti, brick_lin)) { return o; }
+    if (!brick_voxel_solid(bi, vi)) { return o; }
+    // OCCUPIED IS NOT THE SAME AS OPAQUE, and conflating them is what left over
+    // half of a canopy view without a light record.
+    //
+    // The gate exists to stop light interpolating through a one-voxel WALL. A
+    // canopy is not a wall: it is a semi-transparent volume that light passes
+    // through, and the engine already draws that distinction everywhere else -
+    // `shadow_voxel_occludes` runs foliage through a sub-voxel cutout instead of
+    // blocking outright, and `ao_occluder` refuses to let decoration stamp AO.
+    // The light field never inherited it, so on canopy - where the cell against a
+    // leaf face is usually ANOTHER leaf - all eight taps were dropped and the
+    // sampler had nothing to return.
+    //
+    // So foliage CARRIES a record (see `cs_voxel_light_update`) and never vetoes
+    // a tap. Stone, water and glass still do: they are opaque, they occlude
+    // shadow rays, and they are what the wall-leak rule was written for
+    // (`voxlight_does_not_leak_through_a_one_voxel_wall`).
+    o.blocks = !is_foliage_mat(brick_voxel_material(bi, vi));
+    return o;
 }
 
 struct VoxLight {
@@ -470,11 +518,13 @@ fn vl_load(word: u32) -> VoxLight {
     return o;
 }
 
-/// Solidity-gated trilinear fetch of the light field for a surface point.
+/// Opacity-gated trilinear fetch of the light field for a surface point.
 ///
 /// This is the whole point of the rework: `sun` comes back as a CONTINUOUS
 /// value, so no binary visibility test survives into the pixel and the
-/// penumbra is smooth by construction rather than by TAA convergence.
+/// penumbra is smooth by construction rather than by TAA convergence. It is
+/// also the ONLY sun-visibility and AO mechanism in the frame - there is no
+/// per-pixel path underneath it any more.
 fn voxlight_sample(p_world: vec3<f32>, n: vec3<f32>) -> VoxLight {
     var o: VoxLight;
     o.sun = 0.0;
@@ -487,11 +537,13 @@ fn voxlight_sample(p_world: vec3<f32>, n: vec3<f32>) -> VoxLight {
     // MEASURED: with an unpopulated field the full eight-tap loop cost 1.25 ms
     // per frame at 1920x1080 on the terrain scene (shade 9.24 -> 10.01 ms) just
     // to discover there was nothing to read. Any voxel outside the lit shell -
-    // open sky, deep interior, or anything past the pool ceiling - now answers
-    // in ONE table lookup instead of sixteen, which is what stops the fallback
-    // path paying for a feature it is not using.
+    // open sky, deep interior, or anything past the pool ceiling - answers in
+    // ONE table lookup instead of eight.
+    //
+    // `vl_tap` returns before the occupancy walk when the brick has no block, so
+    // this miss costs exactly what the old `vl_record_word` cost.
     let centre = vec3<i32>(floor(p_world + n * 0.5));
-    if (vl_record_word(centre) == VL_NONE) { return o; }
+    if (vl_tap(centre).word == VL_NONE) { return o; }
 
     // Step into the air voxel against the face, then place the lattice on
     // voxel CENTRES so the eight taps straddle the surface.
@@ -510,13 +562,13 @@ fn voxlight_sample(p_world: vec3<f32>, n: vec3<f32>) -> VoxLight {
         let w = fw.x * fw.y * fw.z;
         if (w <= 0.0) { continue; }
         let c = base + off;
-        // Light lives in AIR. Interpolating through a solid cell is exactly
-        // how light leaks across a one-voxel wall, so solid taps are dropped
-        // and the surviving weights renormalised below.
-        if (is_voxel_solid(c)) { continue; }
-        let rw = vl_record_word(c);
-        if (rw == VL_NONE) { continue; }
-        let s = vl_load(rw);
+        // Light lives in AIR and in FOLIAGE. Interpolating through an OPAQUE
+        // cell is exactly how light leaks across a one-voxel wall, so those taps
+        // are dropped and the surviving weights renormalised below; a leaf or a
+        // grass tuft carries its own record and is read like any other.
+        let tap = vl_tap(c);
+        if (tap.blocks || tap.word == VL_NONE) { continue; }
+        let s = vl_load(tap.word);
         if (!s.valid) { continue; }
         acc_sun = acc_sun + s.sun * w;
         acc_ao = acc_ao + s.ao * w;
@@ -845,7 +897,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let indirect = indirect_light(gi_p, hit.normal, pix_jitter,
                                           vec2<i32>(i32(gid.x), i32(gid.y)), hit.t_hit, dir);
             var out_light = vec2<f32>(0.0);
-            col = shade(hit, camera.origin, dir, pix_jitter, vl_unknown(), indirect,
+            col = shade(hit, camera.origin, dir, vl_unknown(), indirect,
                         &out_light);
             // Only stable cube faces go in the G-buffer. An oblique sub-voxel hit
             // (grass or flower cross-quad) has no well-defined face position to
@@ -1082,6 +1134,24 @@ fn wind_dir_now() -> vec2<f32> {
 // still drifts with the SUN, it just stops boiling. Set around the cutout
 // tests in shadow_voxel_occludes only.
 var<private> shadow_wind_freeze: bool = false;
+
+// The voxel a light-field gather ORIGINATES in, so its own contents cannot
+// occlude it (`shadow_voxel_occludes`).
+//
+// Only foliage needs this, and only since foliage started carrying records. An
+// air voxel can never occlude a ray leaving it, but a leaf voxel gathers at its
+// OWN centre, and `trace_any` (and `rt_brick_occludes`) test the origin cell
+// first - so without this every leaf's sun ray would be decided by whether the
+// tuft cutout happens to sit in front of the block centre, and a canopy would
+// gather a hash pattern instead of light. A record is a property of the cell's
+// NEIGHBOURHOOD; its own contents are what the record describes, not an occluder
+// of it.
+//
+// Guarded by a bool rather than an impossible sentinel coordinate: `&&`
+// short-circuits, so the render path pays one bool test per occluding candidate
+// and never the coordinate compare.
+var<private> shadow_skip_active: bool = false;
+var<private> shadow_skip_voxel: vec3<i32> = vec3<i32>(0);
 
 fn wind_time() -> f32 {
     return select(camera.time, 41.7, shadow_wind_freeze);
@@ -3632,24 +3702,16 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>, facet_code: u32)
     // in this look. Sampled about world +Y, not the facet normal, because the
     // record that matters is the one directly over the cell.
     //
-    // The fallback is ONE shadow ray from just above the cell's top face (the
-    // column above a surface water cell is air by construction), which is what
-    // the specular glint used to trace on its own. Worlds with no bound field -
-    // every crafted test scene - therefore still get a correct shadow, and the
-    // glint below reuses this instead of tracing a second ray.
+    // There is NO fallback. This used to trace one shadow ray from just above the
+    // cell's top face whenever the field had no record, which made water the last
+    // surface in the frame carrying a second, disagreeing shadow mechanism. The
+    // field answers 100.000% of water pixels (`LiveFrameRig::coverage`), and 0.0
+    // for the rest is the designed term: see the same note in `shade`.
     let vlf = voxlight_sample(p_hit, vec3<f32>(0.0, 1.0, 0.0));
     if (PROF_VLF_COVERAGE > 0.5) {
         return select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), vlf.valid);
     }
-    var sun_vis: f32;
-    if (vlf.valid) {
-        sun_vis = vlf.sun;
-    } else if (s_int > 0.0) {
-        let sky_origin = vec3<f32>(p_hit.x, floor(p_hit.y) + 1.001, p_hit.z);
-        sun_vis = select(1.0, 0.0, shadow_occluded(sky_origin, s, SHADOW_MAX_DIST));
-    } else {
-        sun_vis = 0.0;
-    }
+    let sun_vis = vlf.sun;
     // USED DIRECTLY, exactly as terrain uses it, and that is the fix.
     //
     // `sun_vis` is a CONTINUOUS fraction of the sun disc. Terrain multiplies its
@@ -3707,8 +3769,7 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>, facet_code: u32)
                 // the surface: mean 1.3/255, 0.018% of pixels > 10/255;
                 // identical below. Look signed off 2026-07-23). The shadow
                 // term stays the proven constant 0.
-                let jit = fract(p_hit.x * 17.0 + p_hit.z * 23.0);
-                under_col = shade(under, refr_origin, refr_dir, jit,
+                under_col = shade(under, refr_origin, refr_dir,
                                   KnownLight(0.0, 0.4, true), vec3<f32>(0.0), &scratch_light);
             }
         } else {
@@ -3918,13 +3979,12 @@ fn vl_unknown() -> KnownLight {
 
 /// Shade one opaque hit.
 ///
-/// Sun visibility and AO come from ONE place: the per-voxel light field, or - for
-/// the surfaces it cannot answer for, which is 54% of a canopy view and 3% of a
-/// terrain view (`LiveFrameRig::coverage`) - the per-pixel cone and `compute_ao`
-/// underneath it. `known` short-circuits both for callers that can prove the
-/// answer.
+/// Sun visibility and AO come from ONE place and there is no second one: the
+/// per-voxel light field. `known` overrides it for the one caller that can PROVE
+/// the answer (the refracted hit below a water surface), which is a constant
+/// rather than a rival derivation.
 fn shade(
-    hit: Hit, origin: vec3<f32>, dir: vec3<f32>, pix_jit: f32,
+    hit: Hit, origin: vec3<f32>, dir: vec3<f32>,
     known: KnownLight, indirect: vec3<f32>,
     out_light: ptr<function, vec2<f32>>,
 ) -> vec3<f32> {
@@ -3972,19 +4032,17 @@ fn shade(
     if (PROF_VLF_COVERAGE > 0.5) {
         return select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), vlf.valid);
     }
-    var ao: f32;
+    // AO comes from the field and nowhere else. `voxlight_sample` returns 1.0
+    // (unoccluded) when it has no record, so an unanswered surface is lit by
+    // ambient rather than blackened by a guess.
+    //
+    // NOTE: the old sky_access() hack (a straight-up + 4 side shadow rays to fake
+    // sky occlusion) is GONE, and so is the per-pixel `compute_ao` that stood
+    // under this. The sky is not a hard overhead light - it is the sun scattered
+    // by the atmosphere, a dim diffuse area source, and the world-space probe GI
+    // models exactly that.
+    var ao = select(vlf.ao, 1.0, skip_ao);
     if (known.known) { ao = known.ao; }
-    else if (vlf.valid && !skip_ao) { ao = vlf.ao; }
-    else {
-        ao = select(compute_ao(hit, origin, dir), 1.0, skip_ao);
-        // NOTE: the old sky_access() hack (a straight-up + 4 side shadow rays to
-        // fake sky occlusion) is GONE. The sky is not a hard overhead light - it
-        // is the sun scattered by the atmosphere, a dim diffuse area source. The
-        // world-space probe GI models exactly that: it integrates the sun-lit sky
-        // over the whole hemisphere, so under-canopy goes softly dim without the
-        // harsh straight-down leaf shadows sky_access projected. Only geometric
-        // contact AO (compute_ao) remains here.
-    }
 
     // ---- swaying foliage ----
     // Leaves and grass-tops flutter their shading normal with a wind-advected
@@ -4064,7 +4122,6 @@ fn shade(
 
     let s = sun_dir();
     let s_int = sun_intensity(s);
-    let p_off = p_hit + n * 0.001;
     var n_dot_l = max(0.0, dot(n, s));
     // Foliage light response: leaf cards catch the sun on wildly-varied
     // (often sun-facing) normals, so raw n.l swings from 0 to 1 and leaves
@@ -4075,49 +4132,23 @@ fn shade(
     if (is_foliage_mat(hit.mat)) {
         n_dot_l = mix(n_dot_l, max(0.0, s.y), 0.45);
     }
-    var shadow_term = 0.0;
-    if (known.known) {
-        shadow_term = known.sun;
-    } else if (vlf.valid) {
-        // CONTINUOUS sun visibility straight from the field. This is the
-        // smooth-shadow fix: no binary occlusion test survives into the pixel,
-        // so the penumbra is a real gradient rather than a dither pattern that
-        // only resolves once TAA converges (and never resolved at all while
-        // the camera moved, because jit_phase froze).
-        shadow_term = vlf.sun;
-    } else if (n_dot_l > 0.0 && s_int > 0.0) {
-        // ONE jittered shadow ray (was 2). The per-pixel + per-frame jitter
-        // (pix_jit rotates each frame) plus the TAA history accumulation average
-        // the single sample into a soft penumbra over time — at half the cost.
-        // Shadows are the single most expensive per-pixel term, so this is the
-        // biggest shading win.
-        // THE FALLBACK, and it is a fallback now rather than the main path:
-        // it runs only where `voxlight_sample` cannot answer, which is 3.4% of
-        // shaded pixels on terrain, 0.05% on water and 54.4% inside a canopy
-        // (`LiveFrameRig::coverage`). The canopy figure is why it still exists:
-        // the air cell against a leaf face is usually ANOTHER leaf voxel, so the
-        // sampler's solidity gate drops every tap and the field has nothing to
-        // give. Deleting this would render half a canopy black.
-        //
-        // ONE jittered ray, softened by TAA over time. The jitter phase freezes
-        // while the camera moves, so during motion this is a hard binary edge -
-        // which is exactly the choppiness the field exists to remove, and exactly
-        // why the field answering 96.6% of terrain matters.
-        let golden = 2.39996323; // 137.5 degrees in radians
-        let cone = 0.07;
-        let theta = pix_jit * golden;
-        let radius = cone * sqrt(pix_jit * 0.5);
-        // Offset in the plane perpendicular to the sun so the penumbra is
-        // uniform regardless of sun azimuth.
-        var tangent = normalize(cross(s, vec3<f32>(0.0, 1.0, 0.0)));
-        if (length(cross(s, vec3<f32>(0.0, 1.0, 0.0))) < 0.01) {
-            tangent = vec3<f32>(1.0, 0.0, 0.0);
-        }
-        let bitangent = cross(s, tangent);
-        let off = (tangent * cos(theta) + bitangent * sin(theta)) * radius;
-        let ss = normalize(s + off);
-        shadow_term = select(0.0, 1.0, !shadow_occluded(p_off, ss, SHADOW_MAX_DIST));
-    }
+    // CONTINUOUS sun visibility straight from the field, and from nothing else.
+    // No binary occlusion test survives into the pixel, so the penumbra is a real
+    // gradient rather than a dither pattern that only resolves once TAA converges
+    // (and never resolved at all while the camera moved, because jit_phase
+    // froze). There is no second path underneath: the jittered per-pixel cone
+    // that used to sit here is deleted.
+    //
+    // `voxlight_sample` returns 0.0 when it cannot answer, and that is a DESIGNED
+    // term rather than a leftover default. What is left unanswered, once foliage
+    // carries records, is a point whose whole trilinear neighbourhood is opaque -
+    // i.e. a surface buried inside geometry, for which "no direct sun" is the
+    // correct answer and not a guess - plus the one or two frames between a brick
+    // being edited or streamed in and the urgent list gathering it. Neither goes
+    // black: ambient and probe GI still light the surface exactly as they light
+    // anything else in shadow.
+    var shadow_term = vlf.sun;
+    if (known.known) { shadow_term = known.sun; }
     // Report the terms so cs_main can put them in the G-buffer the grass pass
     // reads. PURELY an output now - nothing feeds them back in.
     *out_light = vec2<f32>(shadow_term, ao);
@@ -4178,7 +4209,7 @@ fn shade_glass(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     var refl_col: vec3<f32>;
     let refl_hit = trace(refl_origin, refl_dir);
     if (refl_hit.hit) {
-        refl_col = shade(refl_hit, refl_origin, refl_dir, jit, vl_unknown(), vec3<f32>(0.0), &scratch_light);
+        refl_col = shade(refl_hit, refl_origin, refl_dir, vl_unknown(), vec3<f32>(0.0), &scratch_light);
     } else {
         refl_col = sky(refl_dir);
     }
@@ -4211,7 +4242,7 @@ fn shade_glass(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
         // Near head-on: dispersion invisible — single trace, save 2/3 cost.
         let under = trace_secondary(refr_origin, refr_dir_g, SECONDARY_MAX_T);
         var under_col: vec3<f32>;
-        if (under.hit) { under_col = shade(under, refr_origin, refr_dir_g, jit, vl_unknown(), vec3<f32>(0.0), &scratch_light); }
+        if (under.hit) { under_col = shade(under, refr_origin, refr_dir_g, vl_unknown(), vec3<f32>(0.0), &scratch_light); }
         else { under_col = sky(refr_dir_g); }
         let depth = max(0.0, under.t_hit);
         let tint = vec3<f32>(0.05, 0.02, 0.02) * depth;
@@ -4220,9 +4251,9 @@ fn shade_glass(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
         let ur = trace_secondary(refr_origin, refr_dir_r, SECONDARY_MAX_T);
         let ug = trace_secondary(refr_origin, refr_dir_g, SECONDARY_MAX_T);
         let ub = trace_secondary(refr_origin, refr_dir_b, SECONDARY_MAX_T);
-        var cr = select(sky(refr_dir_r).r, shade(ur, refr_origin, refr_dir_r, jit, vl_unknown(), vec3<f32>(0.0), &scratch_light).r, ur.hit);
-        var cg = select(sky(refr_dir_g).g, shade(ug, refr_origin, refr_dir_g, jit, vl_unknown(), vec3<f32>(0.0), &scratch_light).g, ug.hit);
-        var cb = select(sky(refr_dir_b).b, shade(ub, refr_origin, refr_dir_b, jit, vl_unknown(), vec3<f32>(0.0), &scratch_light).b, ub.hit);
+        var cr = select(sky(refr_dir_r).r, shade(ur, refr_origin, refr_dir_r, vl_unknown(), vec3<f32>(0.0), &scratch_light).r, ur.hit);
+        var cg = select(sky(refr_dir_g).g, shade(ug, refr_origin, refr_dir_g, vl_unknown(), vec3<f32>(0.0), &scratch_light).g, ug.hit);
+        var cb = select(sky(refr_dir_b).b, shade(ub, refr_origin, refr_dir_b, vl_unknown(), vec3<f32>(0.0), &scratch_light).b, ub.hit);
         let depth_g = max(0.0, ug.t_hit);
         let tint = vec3<f32>(0.05, 0.02, 0.02) * depth_g;
         glass_col = vec3<f32>(cr, cg, cb) * exp(-tint);
@@ -4234,7 +4265,15 @@ fn shade_glass(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     let spec = pow(max(0.0, dot(n, h_vec)), 200.0);
     var shadow = 0.0;
     if (spec > 0.002 && sun_intensity(s) > 0.0 && dot(n, s) > 0.0) {
-        shadow = select(1.0, 0.0, shadow_occluded(refl_origin, s, SHADOW_MAX_DIST));
+        // FROM THE FIELD, like every other sun-visibility question on a surface.
+        // This was the last per-pixel shadow ray left in the frame: one binary
+        // test for the glint, which switched a pane's highlight on and off at a
+        // shadow edge instead of fading it across one. Glass keeps its per-pixel
+        // MIRROR - it predates all of this, and a pane is exactly where a true
+        // mirror is the whole effect - but it does not keep a private shadow
+        // mechanism. Still gated on the glint being visible at all, so a pane
+        // facing away from the sun pays for no fetch.
+        shadow = voxlight_sample(p_hit, n).sun;
     }
 
     let cos_theta = clamp(dot(-dir, n), 0.0, 1.0);
@@ -4436,6 +4475,8 @@ fn cs_godrays(@builtin(global_invocation_id) gid: vec3<u32>) {
 // distance along the ray. Shared by trace_any (software) and rt_brick_occludes
 // (hardware RT) - the ONE source of the shadow occluder rule.
 fn shadow_voxel_occludes(voxel: vec3<i32>, m: u32, t_cur: f32, origin: vec3<f32>, dir: vec3<f32>) -> bool {
+    // A light-field gather never occludes itself: see `shadow_skip_active`.
+    if (shadow_skip_active && all(voxel == shadow_skip_voxel)) { return false; }
     if (m == MAT_LEAF_FRINGE || m == MAT_TURF) {
         // Invisible canopy fringe never occludes shadow rays; turf blades
         // are below shadow scale (their root-dark ramp is the self-shadow)
@@ -4532,55 +4573,6 @@ fn trace_any(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> bool {
     return false;
 }
 
-// Bit-packed AO. We project the hit point onto the face we entered through,
-// compute fractional (fa, fb) coords on that face, sample 4 corner AOs, and
-// bilinear-interpolate. Each corner samples 3 neighbours (two side voxels
-// and the diagonal) — classic "Minecraft" AO formula, but every lookup is a
-// hierarchical bit test rather than a struct fetch.
-
-fn compute_ao(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> f32 {
-    let p_hit = origin + dir * hit.t_hit;
-    let v = hit.voxel;
-    let na = hit.last_axis;
-    if (na < 0) { return 1.0; }
-    // n_dir is +1 or -1 — the outward-facing component of the normal axis.
-    let n_dir = i32(hit.normal[na]);
-    var n_off = vec3<i32>(0);
-    if (na == 0) { n_off.x = n_dir; }
-    else if (na == 1) { n_off.y = n_dir; }
-    else { n_off.z = n_dir; }
-
-    var da_pos: vec3<i32>;
-    var db_pos: vec3<i32>;
-    var fa: f32;
-    var fb: f32;
-    let local_frac = p_hit - vec3<f32>(f32(v.x), f32(v.y), f32(v.z));
-    if (na == 0) {
-        da_pos = vec3<i32>(0, 1, 0); db_pos = vec3<i32>(0, 0, 1);
-        fa = local_frac.y; fb = local_frac.z;
-    } else if (na == 1) {
-        da_pos = vec3<i32>(1, 0, 0); db_pos = vec3<i32>(0, 0, 1);
-        fa = local_frac.x; fb = local_frac.z;
-    } else {
-        da_pos = vec3<i32>(1, 0, 0); db_pos = vec3<i32>(0, 1, 0);
-        fa = local_frac.x; fb = local_frac.y;
-    }
-    let da_neg = -da_pos;
-    let db_neg = -db_pos;
-    let base = v + n_off;
-
-    let ao00 = ao_corner(base, da_neg, db_neg);
-    let ao10 = ao_corner(base, da_pos, db_neg);
-    let ao01 = ao_corner(base, da_neg, db_pos);
-    let ao11 = ao_corner(base, da_pos, db_pos);
-
-    let fa_c = clamp(fa, 0.0, 1.0);
-    let fb_c = clamp(fb, 0.0, 1.0);
-    let ao_x0 = mix(ao00, ao10, fa_c);
-    let ao_x1 = mix(ao01, ao11, fa_c);
-    return mix(ao_x0, ao_x1, fb_c);
-}
-
 // A cell occludes ambient light only if it holds an actually-solid block:
 // grass tufts, flowers, dry straw and the invisible canopy fringe occupy
 // their cells (the DDA must find them) but must NOT stamp AO squares onto
@@ -4590,16 +4582,6 @@ fn compute_ao(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> f32 {
 fn ao_occluder(c: vec3<i32>) -> bool {
     if (!is_voxel_solid(c)) { return false; }
     return !is_decoration_mat(voxel_material_at(c));
-}
-
-fn ao_corner(face_base: vec3<i32>, da: vec3<i32>, db: vec3<i32>) -> f32 {
-    let s1 = ao_occluder(face_base + da);
-    let s2 = ao_occluder(face_base + db);
-    let cd = ao_occluder(face_base + da + db);
-    // Full occlusion if both side voxels are solid (corner case).
-    if (s1 && s2) { return 0.35; }
-    let cnt = i32(s1) + i32(s2) + i32(cd);
-    return 1.0 - f32(cnt) * 0.22;
 }
 
 fn axis_select(v: vec3<f32>, ax: i32) -> f32 {

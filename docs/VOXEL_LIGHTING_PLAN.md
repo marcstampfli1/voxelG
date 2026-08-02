@@ -27,22 +27,39 @@ per-pixel visibility that depends on temporal accumulation for its gradient.
 A per-voxel visibility FIELD, continuous in [0,1] and interpolated at sample
 time, is smooth by construction: no binary test survives into the pixel.
 
-## Where light lives: the air shell
+## Where light lives: the shell of everything that is not opaque
 
-Light is stored in AIR voxels that touch at least one solid voxel. A surface
-hit on voxel `v` with face normal `n` reads the field around `v + n`, the air
-voxel against that face.
+Light is stored in every voxel that is NOT A REAL OPAQUE OCCLUDER and that
+touches geometry: air, and FOLIAGE. A surface hit on voxel `v` with face normal
+`n` reads the field around `v + n`, the cell against that face.
 
 This beats per-face storage on both counts:
-- One record serves all faces touching that air voxel, so no 6x duplication.
-- The four air voxels straddling a face edge interpolate into each other, so
+- One record serves all faces touching that cell, so no 6x duplication.
+- The four cells straddling a face edge interpolate into each other, so
   gradients are continuous ACROSS faces and around corners, not just within a
   face. This is what removes the blockiness that a naive per-voxel scheme
   would introduce.
 
-It is the same arrangement the existing AO already implies: `compute_ao`
-(`raymarch.wgsl:4417`) evaluates its four corners from `base = v + n_off`,
-the adjacent air voxel.
+FOLIAGE CARRIES ITS OWN RECORD, and not storing it there was the single largest
+defect in this design. Light originally lived in AIR ONLY, on the
+reasonable-sounding rule that it lives in the space between solids. Inside a
+canopy there is no such space: the cell against a leaf face is usually ANOTHER
+LEAF, so all eight trilinear taps were dropped as solid and the sampler answered
+`valid = false` for 54.4% of a canopy view. That was recorded for a whole round
+as a property of canopies, and it was a property of the storage rule.
+
+A canopy is a semi-transparent VOLUME, and a volume wants a value AT the sample
+point rather than at an adjacent cell that does not exist. The engine already
+drew this distinction everywhere else - `shadow_voxel_occludes` runs foliage
+through a sub-voxel cutout instead of blocking outright, `ao_occluder` refuses to
+let decoration stamp AO squares onto the ground - and the light field simply
+never inherited it. It does now, from ONE predicate (`is_foliage_mat`, read by
+`vl_tap`, by `cs_voxel_light_update` and by `World::brick_needs_light`, and
+pinned across the CPU/shader boundary by
+`the_foliage_material_sets_match_the_shader`).
+
+Water and glass are NOT in that set. They are opaque to this gate, they occlude
+shadow rays, and they are what the one-voxel-wall rule was written for.
 
 ## The record: 8 bytes per air voxel
 
@@ -52,8 +69,9 @@ the adjacent air voxel.
 - `sun_vis` is CONTINUOUS soft visibility in [0,1], the fraction of the sun
   disc reaching the voxel. 8 bits is ample once trilinear interpolation
   dithers the steps.
-- `ao` is the neighbour-occupancy term, unchanged in spirit from
-  `compute_ao`, just evaluated once per voxel instead of once per pixel.
+- `ao` is the neighbour-occupancy term, evaluated once per voxel. It is what is
+  left of the deleted per-pixel `compute_ao`, and it is not the same formula -
+  see stage 2 below.
 - `epoch` drives the deterministic direction cycling (below) and doubles as
   the "converged yet" marker after an invalidation.
 - `flags` records validity and whether the voxel is in the lit shell.
@@ -71,10 +89,15 @@ MEASURED against the demo world (`World::fill_demo_terrain`, a fully
 generated 512x256x512 window), not estimated:
 
     1,048,576 bricks   699,991 empty   38,040 partial   310,545 fully solid
-    lit shell bound     60,174 blocks = 30.8 MB, 46% of the pool
+    lit shell bound     63,903 blocks = 32.7 MB, 49% of the pool
 
-So the whole streamed window is covered with 2.18x headroom and nothing falls
-back to the per-pixel path for want of storage. Pinned by the test
+3,729 of those are FULLY OCCUPIED bricks that hold foliage - dense canopy
+interior - which the shell rule refused until foliage started carrying light.
+That is the entire storage price of closing the canopy hole: +6.2% of blocks,
++1.9 MB.
+
+So the whole streamed window is covered with 2.05x headroom and nothing is left
+without a record for want of storage. Pinned by the test
 `the_demo_world_light_shell_fits_the_pool_and_still_covers_it`
 (`src/voxlight.rs`), which asserts both halves: it fits, AND it still covers
 every air voxel that touches solid.
@@ -86,9 +109,9 @@ requests were refused. Because `allocate` hands out blocks in brick-index
 order and `brick_idx` is z-major, that did not thin out evenly: it filled a
 solid slab over world z 0..192 of 512 and left every camera past it on the
 old per-pixel path, a hard geographic cliff rather than graceful degradation.
-A block on a fully solid brick is dead by construction - the update pass
-writes epoch 0 for every solid voxel and `voxlight_sample` drops every tap
-that lands in one - so those 310,545 blocks were five sixths of the storage
+A block on a brick with NO CARRIER VOXEL is dead by construction - the update
+pass writes epoch 0 for every opaque voxel and `voxlight_sample` drops every
+tap that lands in one - so those blocks were five sixths of the storage
 and five sixths of the update dispatch, buying nothing any pixel could read.
 The fix was to stop binding them, not to buy a bigger buffer.
 
@@ -157,9 +180,10 @@ redesign. `LightField::overflow_total` now makes the trigger for it visible.
 The REFRESH half of that idea is already there (`World::set_light_focus`, round
 G), and it deliberately stops short of bounding ALLOCATION: a block outside the
 radius keeps its storage and its converged record and is only revisited more
-rarely, so nothing falls back to the per-pixel path and no boundary is visible.
-Bounding allocation would put a ring in the world where the two shading paths
-meet, and that is a different, larger decision.
+rarely, so no shell voxel ever loses its record and no boundary is visible.
+Bounding allocation would put a ring in the world beyond which surfaces shade
+with no direct sun, and that is a different, larger decision. It matters MORE
+now, not less: there is no per-pixel path for such a ring to degrade into.
 
 ## Update pass: DEMAND-DRIVEN, amortized and deterministic
 
@@ -173,7 +197,7 @@ all: no compute pass, no uniform write, nothing.
 
 1. THE URGENT LIST (`LightField::urgent`). Bricks whose block has no readable
    record - newly bound, or just invalidated by an edit. Their pixels are shading
-   through the fallback until they are gathered, so they are dispatched IN FULL
+   with no direct sun until they are gathered, so they are dispatched IN FULL
    on the next frame, up to `LIGHT_URGENT_BUDGET` per dispatch so a chunk install
    cannot turn into one enormous launch. One visit converges them exactly (a
    reset record has no history, so it takes the fresh estimate outright). Cost
@@ -216,11 +240,18 @@ changes path. It is DISTANCE ONLY, deliberately - scoping it by the view frustum
 as well was built and measured and rejected, because it doubles the peak error on
 the frame you turn around for 8-12% of one pass. See `World::set_light_focus` and
 round H.
-- Per air voxel in the block:
+- Per CARRIER voxel in the block (air or foliage; an opaque voxel keeps epoch 0
+  and is skipped before anything is traced):
   - AO from neighbour occupancy. Purely geometric, so it is written once and
     only recomputed when the brick's voxels change.
   - `sun_vis` from K rays across the sun DISC, over a COMPLETE sunflower
-    stratification of it, evaluated in full on every visit.
+    stratification of it, evaluated in full on every visit. A FOLIAGE voxel
+    gathers at its own centre with its own cell excluded from occlusion
+    (`shadow_skip_active`): both `trace_any` and `rt_brick_occludes` test the
+    origin cell first, so otherwise every leaf's sun visibility would be decided
+    by whether its own tuft cutout happened to sit in front of the block centre.
+    A record describes the light arriving at a cell; the cell's own contents are
+    what the record is ABOUT, not an occluder of it.
 
     IT USED TO CYCLE A QUARTER OF THE SET PER VISIT over epochs, exactly as the
     probe grid cycles its 8 rays (`gi_probes.wgsl:248`), on the claim that "a
@@ -241,23 +272,35 @@ re-samples against the CURRENT sun direction, so the field tracks the sun
 continuously at the cost of a small lag, instead of flipping scattered
 individual pixels.
 
-## Sampling: solidity-gated trilinear
+## Sampling: OPACITY-gated trilinear
 
 Shading replaces the shadow ray, the AO call and the reprojection lookup with
 one fetch:
 
-    light = sample_voxel_light(p_hit, n)
+    light = voxlight_sample(p_hit, n)
 
 - Sample point `q = p_hit + n * 0.5`, so the trilinear lattice straddles the
   face rather than sitting on it.
 - Trilinear over the 8 surrounding records.
-- SOLIDITY GATING: any of the 8 that is solid, unallocated or invalid is
-  dropped and the remaining weights are renormalised. Without this a
+- OPACITY GATING: any of the 8 that is a REAL OPAQUE OCCLUDER, unallocated or
+  invalid is dropped and the remaining weights are renormalised. Without this a
   one-voxel wall leaks light from its lit side to its shadowed side. This is
   the same failure the probe grid solves with its Chebyshev visibility test
   (`gi_probes.wgsl:106`); at voxel resolution the occupancy bit answers it
   exactly and more cheaply.
-- If all 8 are unusable, fall back to the probe grid term alone.
+
+  IT GATES ON OPACITY, NOT ON OCCUPANCY, and the difference is the whole of the
+  canopy fix. Stone, water and glass veto a tap; leaves, tufts, flowers and the
+  invisible fringe do not, because they carry records of their own. The wall rule
+  is unchanged and is asserted rather than trusted:
+  `voxlight_does_not_leak_through_a_one_voxel_wall` is the test that says the
+  gate was FIXED rather than deleted.
+- If all 8 are unusable, `sun` is 0 and `ao` is 1: no direct sun, full ambient
+  and probe GI. See "What this REPLACES".
+
+One tap is ONE hierarchy descent (`vl_tap`), which answers "where is the record"
+and "is this opaque" together. It used to be two - `vl_record_word` plus
+`is_voxel_solid` - repeated eight times per shaded pixel.
 
 ## Reflections: BUILT, MEASURED, AND DELETED
 
@@ -394,18 +437,40 @@ them is performance:
 reprojection source and the grass pass's blade lighting. Only the history it was
 copied into, and everything that read it, is gone.
 
-KEPT: the per-pixel jittered shadow cone and the per-pixel `compute_ao` call, as
-a FALLBACK for the voxels the field cannot answer for. Measured coverage of
-shaded pixels: terrain 96.6%, water 99.9%, FOLIAGE 45.6%. The air cell against a
-leaf face is usually another leaf voxel, so the sampler's solidity gate drops all
-eight taps and the field has nothing to give for over half a canopy view -
-deleting the fallback would render it black. It costs nothing when unused (both
-branches sit behind `vlf.valid`), which is the condition this document set for
-keeping it. It also explains round D's "foliage saves nothing": on that camera
-the field answers for under half the pixels.
+ALSO REMOVED, and this is round I: the per-pixel jittered shadow cone, the
+per-pixel `compute_ao` call, `compute_ao` and `ao_corner` themselves, the
+`pix_jit` parameter that existed only to rotate the cone, and the single shadow
+ray `shade_water_top` fell back to. There is no per-pixel sun visibility and no
+per-pixel AO anywhere in the frame.
 
-So the frame carries ONE lighting mechanism plus a fallback for what that
-mechanism cannot see, rather than two mechanisms that overlap and disagree.
+This document previously said the opposite - "KEPT ... deleting the fallback
+would render it black" - on one measurement: the field answered for 96.6% of
+terrain pixels, 99.9% of water and 45.6% of FOLIAGE. That number was real and the
+conclusion drawn from it was wrong. It was not a limit of per-voxel lighting; it
+was the air-only storage rule described under "Where light lives", and once
+foliage carries records the same harness reads:
+
+    terrain 100.000%   water 99.996%   foliage 99.992%
+
+What is left unanswered is 115 pixels of a canopy frame and 73 of a water frame,
+isolated and scattered, never a region: shading points whose whole 2x2x2
+neighbourhood is opaque, e.g. a leaf card lying flat against a tree trunk and
+shaded about the tuft quad's normal. "No direct sun" is the CORRECT answer there,
+not a missing one.
+
+`shade_glass`'s specular glint went with them. It was a separate binary
+`shadow_occluded` for the sun highlight on a pane, and it now reads the field.
+Glass keeps its per-pixel MIRROR, which predates all of this; it does not keep a
+private shadow test.
+
+So the frame carries ONE lighting mechanism. Not one plus a fallback: the
+fallback was never free in the way this document claimed - it was 54% of the work
+on a canopy - and while it existed the field could only ever earn its SUPPLEMENT
+value. Round I is where it earns its replacement value: cs_main -35.9% on foliage
+and -23.3% on terrain, and 181x fewer strongly flickering pixels on the canopy
+view, because a binary jittered ray that re-randomises every frame is gone from
+it. Round I of `docs/rt/BASELINE-per-voxel-lighting.md` has the numbers and the
+within-run controls.
 
 Secondary rays gain the most: refraction and glass hits re-shade fully and
 deliberately bypass the cache ("secondary rays don't use the reprojection
@@ -426,8 +491,9 @@ gain anything (see "Reflections: BUILT, MEASURED, AND DELETED").
 
 Nothing here is judged by eye alone or declared done off a compile.
 
-- AO: the cached value must match the current per-pixel formula. Pixel-diff
-  against the existing path before the switch-over.
+- AO: there is no per-pixel formula left to diff against (round I deleted
+  `compute_ao`), so the value is pinned directly instead - ground probes read
+  ao 201, which is `1 - 0.85 * (6/24)` to the byte.
 - Shadows: the smoothness claim is measured, not asserted. Penumbra gradient
   width sampled across a known shadow edge, plus the existing
   `flicker_probe_rt_views` rig for temporal stability.
@@ -458,7 +524,8 @@ Nothing here is judged by eye alone or declared done off a compile.
    than fudged. Verified instead by pinning the value: ground probes read
    ao 201, which is `1 - 0.85 * (6/24)` to the byte.
 3. DONE - soft `sun_vis` with deterministic sun-disc sampling over 8 epochs.
-4. DONE - solidity-gated trilinear sampling wired into `shade`.
+4. DONE - opacity-gated trilinear sampling wired into `shade`, and it is the
+   ONLY sun-visibility and AO mechanism in the frame. Round I.
 5. PARTIAL - point lights are gathered by the update pass, uploaded, and
    surfaced through `Renderer::set_point_lights`. Nothing in the game calls it
    yet, and there is no test covering a lit point light.
@@ -473,7 +540,7 @@ Nothing here is judged by eye alone or declared done off a compile.
    (`raymarch.wgsl`, search `let vlf =`), so a secondary hit pays one field
    fetch instead of a shadow ray plus an AO evaluation. Water's own surface now
    reads the field DIRECTLY, in `shade_water_top`, for its lit/shadowed term.
-8. DONE - rounds A through H in `docs/rt/BASELINE-per-voxel-lighting.md`,
+8. DONE - rounds A through I in `docs/rt/BASELINE-per-voxel-lighting.md`,
    including the populated-field A/B that rounds A-C could not measure, the live
    session round G could not see, and the sky-facing frame and pixel-coverage
    fraction round H added.
@@ -566,15 +633,17 @@ Point lights (stage 5) are gathered, uploaded and surfaced through
 `Renderer::set_point_lights`, and nothing in the game calls it. There is no test
 covering a lit point light.
 
-Everything else this section used to list is closed by round H, and the closure
-is a measurement rather than a claim: the screen-space reprojection cache is
-gone, the per-pixel cone and `compute_ao` stay as a fallback because the field
-answers for only 45.6% of a canopy view, and the field's coverage is now reported
-by `LiveFrameRig::coverage` on every run of the live-session profiler rather than
-assumed.
+That is the whole list. Everything else this section used to carry is closed by
+rounds H and I, and each closure is a measurement rather than a claim: the
+screen-space reprojection cache is gone, the per-pixel cone and `compute_ao` are
+gone, the field's coverage is reported by `LiveFrameRig::coverage` on every run of
+the live-session profiler rather than assumed, and it reads 100.000 / 99.996 /
+99.992 percent on terrain, water and foliage.
 
-Water is the one surface where that fallback is a SINGLE binary ray rather than
-the cone: `shade_water_top` takes `vlf.sun` when the field answers and one
-`shadow_occluded` from just above the cell's top face when it does not. The
-crafted test scenes bind no shell, so that path is exercised on every run rather
-than left to rot.
+One consequence is worth stating because it changed several harnesses: a world
+whose lit shell was never bound now renders with NO DIRECT SUN, where it used to
+degrade quietly into the per-pixel cone and produce a plausible frame that
+someone could then measure. `render_rgba_full_opts` asserts against that, 32
+still-image harnesses now bind the shell, `flicker_probe_rt_views` defaults
+`voxlight` to true, and the `_nofield` A/B views are deleted - an A/B against a
+mechanism that no longer exists is not a measurement.
