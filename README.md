@@ -164,12 +164,15 @@ cargo run --release -- --server 7878        # headless server
 cargo run --release -- --connect host:7878  # join a server
 cargo run --release -- --freeze-time 40     # pin sun/water/wind at t=40s (value optional)
 cargo run --release -- --speed 4            # 4x fly speed
+cargo run --release -- --flycam             # start in the noclip flycam (F toggles it)
 VOXELG_RT=1 cargo run --release             # hardware-RT occlusion (ray-query GPU only; see below)
 ```
 
-Controls: WASD + Space/Shift to fly, Alt to sprint, mouse to look. Left click destroys a sphere, right
-click places the selected material; keys 1, 0 select stone, sand, water, wood, leaves, glass, lava, ice,
-snow or smoke. Esc releases the cursor.
+Controls: WASD to move, mouse to look, Shift to sprint, Ctrl to crouch. Space jumps; held while pressed
+into a low ledge it vaults, and against a tall wall it climbs. F toggles the noclip flycam (WASD +
+Space/Ctrl, Shift for 4x), which is what the look-dev harnesses use; dropping back out of it puts the
+body where the camera was. Left click destroys a sphere, right click places the selected material; keys
+1, 0 select stone, sand, water, wood, leaves, glass, lava, ice, snow or smoke. Esc releases the cursor.
 
 ## Status
 

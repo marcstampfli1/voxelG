@@ -156,12 +156,22 @@ pub const MAT_BUSH: u8 = 36;
 /// marches one shared 128^3 wood+leaf volume - real 3D voxel leaves.
 pub const MAT_TREE_TEST: u8 = 37;
 
+/// One past the highest material id in use. Material ids are a dense u8 space,
+/// and `voxquery::MatSet` is a u64 bitset over them, so this MUST stay <= 64;
+/// `voxquery::mat_count_matches_the_last_material` pins it to the constant above
+/// so adding a material without extending the collision classification is a test
+/// failure rather than a voxel that silently behaves like stone.
+pub const MAT_COUNT: u8 = MAT_TREE_TEST + 1;
+
+// The material predicates are `const fn` because `voxquery::MatSet` folds them
+// into u64 bitsets at compile time - the per-voxel material test in collision is
+// then one shift-and-mask instead of a chain of comparisons.
 #[inline(always)]
-pub fn is_leaf_mat(m: u8) -> bool {
+pub const fn is_leaf_mat(m: u8) -> bool {
     m == MAT_LEAVES || m == MAT_LEAVES_BIRCH || m == MAT_LEAVES_PINE || m == MAT_LEAVES_AUTUMN
 }
 #[inline(always)]
-pub fn is_wood_mat(m: u8) -> bool {
+pub const fn is_wood_mat(m: u8) -> bool {
     m == MAT_WOOD || m == MAT_WOOD_BIRCH || m == MAT_WOOD_PINE
 }
 
@@ -175,7 +185,7 @@ pub fn is_wood_mat(m: u8) -> bool {
 /// sampler will read, or a sampler reading a record nothing wrote. Pinned by
 /// `the_foliage_material_sets_match_the_shader`.
 #[inline(always)]
-pub fn is_foliage_mat(m: u8) -> bool {
+pub const fn is_foliage_mat(m: u8) -> bool {
     is_leaf_mat(m)
         || m == MAT_FLOWER
         || m == MAT_TALL_GRASS
@@ -188,7 +198,7 @@ pub fn is_foliage_mat(m: u8) -> bool {
 pub const MAX_WATER_LEVEL: u8 = 8;
 
 #[inline(always)]
-pub fn is_water_mat(m: u8) -> bool {
+pub const fn is_water_mat(m: u8) -> bool {
     m >= MAT_WATER_L1 && m <= MAT_WATER_L8
 }
 

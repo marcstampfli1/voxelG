@@ -26,6 +26,26 @@ some backends signed `%` is undefined - see the `wgsl-gpu-correctness` rule),
 or any hand-rolled wrap. The CPU mirror in `raycast.rs` must match this exactly;
 a mismatch is silent and position-dependent.
 
+## CPU world queries
+
+**`voxquery::overlap_mat` / `overlaps` / `sweep` / `any_in_voxel_range`**
+(`voxquery.rs`) - the ONE way to ask the CPU world a spatial question. Descends
+the brick/tile/chunk/L4 pyramid (a brick's `occupancy` is a u64 over 4x4x4, an
+empty tile skips 16^3), folds toroidally exactly as the shaders do, and treats
+the MASKS as the authority so a recycled streaming slot reads as the sky it is
+rendered as. `sweep` tests the whole swept region as one query before bisecting,
+so it is exact and cannot tunnel at any speed.
+FORBIDDEN: a per-voxel loop at a call site, a hand-rolled `world - origin`
+mapping, and reading `Brick::occupancy` without checking the tile bit above it.
+Pinned against a naive per-voxel reference on randomised worlds, including
+3.2M voxels from spawn across a slot seam.
+
+**`voxquery::MatSet`** (`voxquery.rs`) - a u64 bitset over material ids, folded
+from `const fn` predicates at compile time. `SOLID` is the single definition of
+"this blocks a body".
+FORBIDDEN: an ad-hoc chain of `mat != MAT_WATER && !is_foliage_mat(mat) && ...`
+at a call site; extend the predicate instead, so every consumer moves together.
+
 ## GPU upload
 
 **`upload_spans`** (`renderer.rs`) - coalesces a sorted dirty list into
@@ -95,9 +115,20 @@ FORBIDDEN: creating a pipeline with `cache: None` on the raymarch module. A
 cold driver compile of `cs_transparent` alone is 98 s software / 162 s RT, which
 presents as a hung launch.
 
-## Pending
+## Scale
 
-The CPU AABB voxel-query primitive for collision is being built now (see
-`docs/SURVIVAL_PLAN.md`). Until it lands, the only CPU solidity test is
-`in_solid` inline in `raycast.rs`, which walks voxel by voxel and does NOT use
-the occupancy pyramid. Do not copy that pattern into new code.
+**`world_dims::VOXEL_METRES`** - how big a voxel is in metres, 0.25 today. All
+gameplay sizes are written in SI and converted with `m_to_vox`, so the planned
+10 cm change (`docs/SCALE_TO_10CM.md`) moves the grid without retuning the
+player.
+FORBIDDEN: a size expressed directly in voxels, and any assumption that a voxel
+is 10 cm. That assumption is already wrong, and it once put a 1.8 m player at
+0.72 m tall.
+
+## Known gap
+
+`raycast.rs` still reads brick occupancy WITHOUT checking the tile bit above
+it, so picking can target a voxel in a recycled streaming slot that is not
+rendered. `voxquery` treats the masks as the authority and does not have this
+bug. Do not copy `raycast`'s pattern into new code; it is the one to fix, not
+the one to follow.

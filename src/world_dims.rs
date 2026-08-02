@@ -9,6 +9,36 @@
 pub const BRICK_DIM: u32 = 4;
 pub const BRICK_VOXELS: u32 = BRICK_DIM * BRICK_DIM * BRICK_DIM;
 
+// ---- physical scale ----
+// The SINGLE SOURCE OF TRUTH for "how big is a voxel in the real world".
+//
+// Everything the renderer and worldgen do is in voxel units, which is right for
+// them - they never need metres. GAMEPLAY does: a player is 1.8 m tall, gravity
+// is 9.81 m/s^2 and a step you can walk up is ~0.35 m, and those numbers must
+// not silently change meaning when the voxel does. So body sizes and movement
+// tuning are written in SI and converted here, exactly once.
+//
+// Today one voxel is 25 cm: WORLD_VOXELS_X = 512 spans the "~128 m world" of
+// docs/IMPLEMENTED.md, and docs/SCALE_TO_10CM.md is the (not yet executed) plan
+// to shrink the voxel to 10 cm by tripling the dims below. When that lands,
+// THIS constant changes to 0.10 and the player stays 1.8 m tall - which is the
+// whole point of routing gameplay through it instead of hardcoding voxel counts.
+pub const VOXEL_METRES: f32 = 0.25;
+pub const VOXELS_PER_METRE: f32 = 1.0 / VOXEL_METRES;
+
+/// Metres -> voxels. Use at every gameplay constant so the SI value stays
+/// visible in the source (`m_to_vox(1.8)` reads as "1.8 metres", `7.2` does not).
+#[inline(always)]
+pub const fn m_to_vox(metres: f32) -> f32 {
+    metres * VOXELS_PER_METRE
+}
+
+/// Voxels -> metres. For reporting/measuring a simulated quantity back in SI.
+#[inline(always)]
+pub const fn vox_to_m(voxels: f32) -> f32 {
+    voxels * VOXEL_METRES
+}
+
 pub const WORLD_BRICKS_X: u32 = 128;
 pub const WORLD_BRICKS_Y: u32 = 64;
 pub const WORLD_BRICKS_Z: u32 = 128;

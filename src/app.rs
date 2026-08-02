@@ -16,6 +16,7 @@ use glam::Vec3;
 
 use crate::camera::Camera;
 use crate::net;
+use crate::player::{self, PlayerSim};
 use crate::physics;
 use crate::raycast;
 use crate::renderer::Renderer;
@@ -215,15 +216,38 @@ struct Keys {
     back: bool,
     left: bool,
     right: bool,
+    /// Space. Fly up in the flycam; jump / vault / climb on foot.
     up: bool,
+    /// Ctrl. Fly down in the flycam; crouch on foot.
     down: bool,
+    /// Shift. Fly faster in the flycam; sprint on foot. (Shift also flew DOWN
+    /// before the player existed; Ctrl still does, so that muscle memory is
+    /// intact and Shift now means "go faster" in both modes.)
     sprint: bool,
+}
+
+/// Who owns the camera position.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ViewMode {
+    /// A real body walks the world and the camera is its eye.
+    Play,
+    /// The original noclip flycam: the camera IS the position. Kept because
+    /// look-dev, the scripted benchmark and several harnesses drive the camera
+    /// directly, and because flying is genuinely the fastest way to inspect a
+    /// world. Toggled with F.
+    Fly,
 }
 
 pub struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
+    /// The VIEW. In Play mode its position is derived from the player's eye
+    /// every frame; only yaw/pitch (mouse look) are owned here. In Fly mode it
+    /// is the position, exactly as it always was.
     camera: Camera,
+    /// The local body, stepped at a fixed 60 Hz and interpolated for rendering.
+    player: PlayerSim,
+    view_mode: ViewMode,
     /// Shared with the physics worker thread. Streaming, edits, upload and the
     /// physics tick all lock this; physics no longer runs synchronously inside
     /// the frame (checklist: physics on a worker thread).
@@ -285,6 +309,7 @@ pub struct App {
 
 impl App {
     pub fn new(net: Option<net::NetClient>, server_addr: Option<String>, opts: ClientOpts) -> Self {
+        let bench = BenchState::from_env();
         let mut world = World::new();
         world.fill_demo_terrain();
         // Spawn above the surface at the spawn column. The default y (80) is
@@ -295,6 +320,17 @@ impl App {
         let s = voxel::sample_terrain(camera.pos.x, camera.pos.z, world.seed);
         let surface = s.h.max(s.water_top) as f32;
         camera.pos.y = surface + 10.0;
+        // The body spawns just above the same column and falls the last step
+        // onto the ground, so it starts settled rather than clipped into it.
+        let mut player = PlayerSim::new(Vec3::new(camera.pos.x, surface + 2.0, camera.pos.z));
+        // The scripted benchmark drives the camera itself, so it must start in
+        // the flycam or the body would fight it for the view every frame.
+        let view_mode = if bench.is_some() || opts.flycam { ViewMode::Fly } else { ViewMode::Play };
+        if view_mode == ViewMode::Play {
+            camera.pos = player.eye();
+        } else {
+            player.teleport(Vec3::new(camera.pos.x, camera.pos.y, camera.pos.z));
+        }
 
         // Hand the world to a physics worker thread. It runs the fixed-step CA
         // at 30 Hz behind the shared mutex; the render thread only takes the
@@ -327,6 +363,8 @@ impl App {
             window: None,
             renderer: None,
             camera,
+            player,
+            view_mode,
             world,
             phys_stop,
             keys: Keys::default(),
@@ -336,7 +374,7 @@ impl App {
             frame_counter: 0,
             cpu_prof: [0.0; 4],
             cpu_prof_n: 0,
-            bench: BenchState::from_env(),
+            bench,
             refresh_phase: 0,
             opts,
             leaf_sim: std::env::var("VOXELG_NO_LEAVES")
@@ -487,8 +525,22 @@ impl App {
             KeyCode::KeyA => self.keys.left = pressed,
             KeyCode::KeyD => self.keys.right = pressed,
             KeyCode::Space => self.keys.up = pressed,
-            KeyCode::ShiftLeft | KeyCode::ControlLeft => self.keys.down = pressed,
-            KeyCode::AltLeft => self.keys.sprint = pressed,
+            KeyCode::ControlLeft => self.keys.down = pressed,
+            KeyCode::ShiftLeft | KeyCode::AltLeft => self.keys.sprint = pressed,
+            // Toggle the noclip flycam. Dropping back in puts the body where
+            // the camera is, so you can fly somewhere and land there.
+            KeyCode::KeyF if pressed => {
+                self.view_mode = match self.view_mode {
+                    ViewMode::Play => ViewMode::Fly,
+                    ViewMode::Fly => {
+                        let eye = self.camera.pos;
+                        let feet = eye - Vec3::Y * self.player.player.eye_offset;
+                        self.player.teleport(feet);
+                        ViewMode::Play
+                    }
+                };
+                log::info!("view mode: {:?}", self.view_mode);
+            }
             KeyCode::Digit1 if pressed => self.current_material = MAT_STONE,
             KeyCode::Digit2 if pressed => self.current_material = MAT_SAND,
             KeyCode::Digit3 if pressed => self.current_material = MAT_WATER,
@@ -573,11 +625,32 @@ impl App {
         self.poll_net(now);
         self.maybe_send_pose(now);
 
-        let speed = if self.keys.sprint { 4.0 } else { 1.0 };
         let f = (self.keys.forward as i32 - self.keys.back as i32) as f32;
         let r = (self.keys.right as i32 - self.keys.left as i32) as f32;
         let u = (self.keys.up as i32 - self.keys.down as i32) as f32;
-        self.camera.translate_local(dt, f * speed, r * speed, u * speed);
+        match self.view_mode {
+            ViewMode::Fly => {
+                let speed = if self.keys.sprint { 4.0 } else { 1.0 };
+                self.camera.translate_local(dt, f * speed, r * speed, u * speed);
+            }
+            ViewMode::Play => {
+                // The body simulates at a fixed 60 Hz behind the world lock and
+                // the camera reads its INTERPOLATED eye, so the view is smooth
+                // at any frame rate while the physics stays rate-independent.
+                let input = player::Input {
+                    move_axis: glam::Vec2::new(r, f),
+                    yaw: self.camera.yaw,
+                    jump: self.keys.up,
+                    sprint: self.keys.sprint,
+                    crouch: self.keys.down,
+                };
+                {
+                    let world = self.world.lock().unwrap_or_else(|e| e.into_inner());
+                    self.player.advance(&world, input, dt);
+                }
+                self.camera.pos = self.player.eye();
+            }
+        }
         // Benchmark mode: the script owns the camera (input overridden).
         if let Some(mut b) = self.bench.take() {
             if let Some(r) = self.renderer.as_ref() {
@@ -941,11 +1014,14 @@ pub struct ClientOpts {
     pub freeze_time: Option<f32>,
     /// Fly-speed multiplier applied to the camera's base move speed.
     pub speed: f32,
+    /// Start in the noclip flycam instead of on foot (--flycam). For look-dev:
+    /// F toggles it at any time.
+    pub flycam: bool,
 }
 
 impl Default for ClientOpts {
     fn default() -> Self {
-        Self { freeze_time: None, speed: 1.0 }
+        Self { freeze_time: None, speed: 1.0, flycam: false }
     }
 }
 

@@ -44,6 +44,8 @@ fn parse_args() -> (Mode, ClientOpts) {
                 }
                 opts.freeze_time = Some(val.unwrap_or(0.0));
             }
+            // Start in the noclip flycam rather than on foot (F toggles it).
+            "--flycam" => opts.flycam = true,
             // Fly-speed multiplier (e.g. --speed 3).
             "--speed" => {
                 if let Some(m) = args.get(i + 1).and_then(|s| s.parse::<f32>().ok()) {

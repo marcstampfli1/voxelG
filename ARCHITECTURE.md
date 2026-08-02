@@ -6,7 +6,11 @@ and this file is updated in the same commit as the change it describes.
 
 ## What this is
 
-A from-scratch GPU-raymarched voxel engine. Voxels are ~10 cm. There is no mesh
+A from-scratch GPU-raymarched voxel engine. A voxel is **25 cm today**
+(`world_dims::VOXEL_METRES`); 10 cm is a planned change, not the current state
+(`docs/SCALE_TO_10CM.md`, and the roadmap section of `docs/IMPLEMENTED.md`).
+Gameplay sizes are written in SI and converted through `VOXEL_METRES`, so that
+bump moves the grid without moving the player. There is no mesh
 and no rasterised terrain: the world is a hierarchical occupancy pyramid in GPU
 storage buffers, and a compute shader marches rays through it per pixel.
 Optional hardware ray tracing traces the same world through an acceleration
@@ -25,11 +29,20 @@ structure of per-brick AABBs.
     src/physics.rs      Falling sand, an 8-level water CA, smoke. 30 Hz.
     src/raycast.rs      CPU DDA raycast for picking. Mirrors the shader's
                         toroidal mapping.
+    src/voxquery.rs     THE CPU world-query primitive: AABB overlap and exact
+                        swept tests over the same brick/tile/chunk/L4 pyramid
+                        the shaders traverse. Collision uses it today; digging
+                        and entities are meant to.
+    src/player.rs       The local player body and controller: fixed 60 Hz steps,
+                        swept per-axis collision, step assist, slopes, crouch,
+                        vault and climb. Reads the world, never writes it.
     src/accel.rs        Hardware-RT acceleration structure build/rebuild.
     src/renderer.rs     wgpu device, all pipelines, bind groups, the frame.
                         By far the largest module.
     src/shader_cache.rs Persistent pipeline cache (see "Cold start" below).
-    src/camera.rs       Camera state and sun direction.
+    src/camera.rs       Camera state and sun direction. In play mode the camera
+                        is a VIEW derived from the player's eye; the noclip
+                        flycam behind F still owns it directly.
     src/app.rs          Window, input, frame loop, physics thread, streaming.
     src/net.rs          Wire protocol and client/server sockets.
     src/server.rs       Dedicated server: authoritative edit log, interest fan-out.
@@ -50,7 +63,8 @@ its own thread spawned from `app`, not from the frame loop.
 
 ## Dependency direction and boundaries
 
-    world_dims  <-  voxel  <-  physics / raycast / accel / renderer
+    world_dims  <-  voxel  <-  physics / raycast / voxquery / accel / renderer
+                    voxquery  <-  player
                                renderer  <-  app  ->  net  <-  server
 
 `world_dims` depends on nothing and everything geometric depends on it.
@@ -74,6 +88,10 @@ Waypoint chains, greppable in order.
 
 **Frame:** `app::render_frame` -> `Renderer::render` -> clouds -> beam -> probe
 -> vlight -> `cs_main` -> transparent -> compose -> grass -> post -> taa -> blit.
+
+**Player movement:** `app::render_frame` -> `PlayerSim::advance` (fixed 60 Hz,
+input latched) -> `Player::step` -> `probe_ground` / `move_and_collide` ->
+`voxquery::sweep` -> `camera.pos = PlayerSim::eye()` (interpolated).
 
 **Player edit:** click queued -> `raycast::raycast` -> `apply_sphere` or
 `World::apply_edit` -> `World::set_voxel` -> `refresh_masks_for_brick` +
@@ -189,7 +207,20 @@ CPU physics on a worker thread, which does update the world.
   output.
 - **The toroidal mapping in `raycast.rs` must match the shaders.** NOT ENFORCED
   by any test today. A mismatch is silent and position-dependent. This is a
-  known gap, not a claim of safety.
+  known gap, not a claim of safety. `voxquery.rs` performs the same fold and
+  IS enforced, against a naive per-voxel reference 3.2M voxels from spawn with
+  ranges straddling a slot seam - so new CPU world queries should go through
+  `voxquery`, not through a fresh copy of the mapping.
+- **The mask hierarchy, not `Brick::occupancy`, says whether a region exists.**
+  Recycling a streaming slot zeroes its tile/chunk/L4 bits and leaves the brick
+  bytes behind, so the GPU renders sky there. ENFORCED for CPU queries by
+  `voxquery`'s `a_cleared_mask_hides_its_bricks_at_every_level`; `raycast.rs`
+  still reads bricks directly and can therefore pick a voxel that is not
+  rendered, at the streaming edge.
+- **Movement feel is a property of the game, not the frame rate.** The body
+  steps at a fixed 60 Hz with interpolated rendering. ENFORCED by
+  `player::the_simulation_is_frame_rate_independent`, which runs the same input
+  at 60, 144 and 400 fps and requires identical jump height and velocity.
 - **Every render pass needs its own `GPU_PROFILE_LABELS` entry.** NOT ENFORCED.
   A pass that shares another's label is invisible in the profiler, which has
   already hidden a pass eating 18-32 percent of frame time.
